@@ -1,4 +1,4 @@
-import type { Config } from './index.js'
+import type { Config } from './config.js'
 
 type Credentials = { resolve?: (ref: string) => Promise<{ value?: string } | undefined> }
 
