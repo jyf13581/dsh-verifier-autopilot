@@ -29,6 +29,7 @@
     "build:host": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build:client": "tsdown",
+    "check:architecture": "node scripts/check-architecture.mjs",
     "test": "node scripts/test.mjs",
     "eval": "node eval/run.mjs"
   },

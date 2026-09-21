@@ -1,9 +1,14 @@
+import type { AutopilotMode, CandidateModelStrategy } from '../config.js'
+import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
 import type { SelectionRecord } from './candidates.js'
-import type { TrajectoryEvent } from './trajectory.js'
+import { boundText, type TrajectoryEvent } from './trajectory.js'
 
-export type AutopilotMode = 'off' | 'auto' | 'always'
+// Compatibility exports: these policy types are now owned by config so the
+// shared configuration layer does not depend back on selection internals.
+export type { AutopilotMode, CandidateModelStrategy } from '../config.js'
+export { boundCandidateHandoff } from './trajectory.js'
+
 export type AutopilotDepth = 'standard' | 'deep'
-export type CandidateModelStrategy = 'quality-first' | 'exploration'
 
 export interface AutopilotPolicyConfig {
   mode: AutopilotMode
@@ -191,13 +196,6 @@ function conversationLine(event: TrajectoryEvent): { role: 'USER' | 'ASSISTANT';
   return null
 }
 
-function boundText(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text
-  const head = Math.floor(maxChars * 0.35)
-  const tail = maxChars - head
-  return text.slice(0, head) + '\n[... bounded ...]\n' + text.slice(-tail)
-}
-
 export function buildAutopilotContext(
   events: readonly TrajectoryEvent[],
   currentTask: string,
@@ -233,10 +231,6 @@ export function buildAutopilotContext(
   return boundText(sections.join('\n'), maxChars + currentTask.length + 800)
 }
 
-export function boundCandidateHandoff(text: string, maxChars = 14_000): string {
-  return boundText(text.trim(), maxChars)
-}
-
 export function selectionSeparation(record: SelectionRecord): { label: 'single-survivor' | 'unresolved' | 'leaning' | 'clear'; margin: number | null } {
   const ranking = record.ranking ?? []
   if (ranking.length < 2) return { label: 'single-survivor', margin: null }
@@ -244,8 +238,11 @@ export function selectionSeparation(record: SelectionRecord): { label: 'single-s
   const second = record.scores?.[ranking[1]]
   if (typeof first !== 'number' || typeof second !== 'number') return { label: 'unresolved', margin: null }
   const margin = Math.abs(first - second)
-  if (margin >= 0.08) return { label: 'clear', margin }
-  if (margin >= 0.025) return { label: 'leaning', margin }
+  const threshold = typeof record.marginThreshold === 'number' && Number.isFinite(record.marginThreshold)
+    ? Math.max(0, Math.min(0.5, record.marginThreshold))
+    : DEFAULT_SELECTION_MARGIN_THRESHOLD
+  if (margin >= threshold) return { label: 'clear', margin }
+  if (margin >= threshold / 2) return { label: 'leaning', margin }
   return { label: 'unresolved', margin }
 }
 
@@ -272,7 +269,7 @@ export function buildAutopilotRelay(record: SelectionRecord): string {
   if (record.margin !== undefined) {
     lines.push('Margin gate: margin=' + record.margin.toFixed(6)
       + ' threshold=' + (record.marginThreshold ?? 'n/a')
-      + (record.marginProvisional ? ' (provisional, uncalibrated)' : '')
+      + (record.marginProvisional ? ' (provisional calibration)' : '')
       + ' condition=' + (record.marginCondition ?? 'n/a'))
   }
   if (record.noSearchSpace) lines.push('Flag: no-search-space (all survivor diffs identical; deduped before the verifier)')

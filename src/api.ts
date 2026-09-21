@@ -7,10 +7,44 @@
 import {
   buildVerifierPrompt, verifyFive, verifyRoute,
 } from './verifier.js'
+import type { Config } from './config.js'
 import { SelectionApiError } from './selection/host.js'
-import { VERIFICATION_HISTORY_LIMIT, VerifierHost, VerifyAbortedError } from './host.js'
-import { API_PREFIX, type HeaderValue, type WebRequest, type WebResponse, type WebRoute } from './protocol.js'
-import { normalizeBaseUrl, resolveKey } from './util.js'
+import type { SelectionRecord } from './selection/candidates.js'
+import { VERIFICATION_HISTORY_LIMIT, VerifyAbortedError } from './host.js'
+import {
+  API_PREFIX,
+  type ConfigResponse, type HeaderValue, type SelectionActionResponse,
+  type SelectionItemResponse, type SelectionReleaseResponse,
+  type SelectionSnapshot, type SelectionStartRequest, type SelectionStartResponse,
+  type SelectionsListResponse, type StateResponse, type VerificationRecord,
+  type VerifyResponse, type WebRequest, type WebResponse, type WebRoute,
+} from './protocol.js'
+import { normalizeBaseUrl, resolveKey, type Credentials } from './util.js'
+
+/** Structural domain seam consumed by the transport. VerifierHost satisfies it
+ * at the composition root, while API tests can use a focused fake without
+ * importing lifecycle implementation details. */
+export interface SelectionApiService {
+  start(body: SelectionStartRequest & { trigger?: 'manual' }): Promise<SelectionRecord>
+  activeSelectionId(): string | null
+  snapshot(): SelectionSnapshot
+  listSelections(): SelectionRecord[]
+  getSelection(selectionId: string): SelectionRecord | undefined
+  cancel(selectionId: string): boolean
+  releaseWinner(selectionId: string): Promise<'released' | 'not-retained'>
+  discardWinner(selectionId: string): Promise<boolean>
+}
+
+export interface VerifierApiHost {
+  snapshot(): StateResponse
+  setConfig(patch: Partial<Config>): void
+  getConfig(): Config
+  getCredentials(): Credentials | undefined
+  verifySession(sessionId: string): Promise<VerificationRecord | undefined>
+  queryRecords(filter?: { sessionId?: string; status?: string; turn?: number }): VerificationRecord[]
+  subscribe(listener: () => void): () => void
+  readonly selections: SelectionApiService
+}
 
 export function json(res: WebResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
@@ -56,7 +90,7 @@ export function createRateLimiter(limit: number, windowMs: number, now: () => nu
 }
 
 /** Exported for regression tests: builds the Host API routes for this host. */
-export function apiRoutes(host: VerifierHost): WebRoute[] {
+export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   const evalLimiter = createRateLimiter(API_RATE_LIMITS.evalPerMinute, 60_000)
   const probeLimiter = createRateLimiter(API_RATE_LIMITS.probePerMinute, 60_000)
   const verifyLimiter = createRateLimiter(API_RATE_LIMITS.verifyPerMinute, 60_000)
@@ -73,7 +107,7 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
     if (!headerText(req.headers['content-type']).toLowerCase().startsWith('application/json')) return json(res, 415, { ok: false, error: 'json-required' })
-    try { host.setConfig(await readJson(req)); json(res, 200, { ok: true, config: host.getConfig() }) } catch (error) { json(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) }) }
+    try { host.setConfig(await readJson(req)); json(res, 200, { ok: true, config: host.getConfig() } satisfies ConfigResponse) } catch (error) { json(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) }) }
   } }
   const verify: WebRoute = { kind: 'exact', path: API_PREFIX + '/verify', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
@@ -91,7 +125,7 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
     try {
       const record = await host.verifySession(sessionId)
       if (!record) return json(res, 404, { ok: false, error: 'session-not-found-or-no-completed-turn' })
-      json(res, 200, { ok: true, record })
+      json(res, 200, { ok: true, record } satisfies VerifyResponse)
     } catch (error) {
       if (error instanceof VerifyAbortedError) return json(res, 503, { ok: false, error: 'verification-aborted' })
       json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
@@ -223,14 +257,20 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
       return json(res, 400, { ok: false, error: 'invalid-json-body' })
     }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { ok: false, error: 'json-object-required' })
+    // trigger/policy/taskKind are trusted Host orchestration metadata, not
+    // public knobs: accepting them here could give a manual caller autopilot's
+    // retention and relay lifecycle.
+    if (['trigger', 'policy', 'taskKind'].some(key => Object.prototype.hasOwnProperty.call(body, key))) {
+      return json(res, 400, { ok: false, error: 'reserved-selection-field' })
+    }
     // Peek before admission, commit only after the host actually accepted the
     // run: a busy or invalid /select spawns zero candidates and must not spend
     // one of the 12/hour provider-spend slots.
     if (!selectLimiter.peek()) return json(res, 429, { ok: false, error: 'rate-limited' })
     try {
-      const selection = await host.selections.start(body)
+      const selection = await host.selections.start({ ...(body as SelectionStartRequest), trigger: 'manual' })
       selectLimiter.commit()
-      json(res, 202, { ok: true, selection })
+      json(res, 202, { ok: true, selection } satisfies SelectionStartResponse)
     } catch (error) {
       if (error instanceof SelectionApiError) return json(res, error.status, { ok: false, error: error.code, message: error.message })
       json(res, 500, { ok: false, error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240) })
@@ -243,9 +283,9 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
     if (selectionId) {
       const selection = host.selections.getSelection(selectionId)
       if (!selection) return json(res, 404, { ok: false, error: 'selection-not-found' })
-      return json(res, 200, { ok: true, selection })
+      return json(res, 200, { ok: true, selection } satisfies SelectionItemResponse)
     }
-    json(res, 200, { ok: true, active: host.selections.activeSelectionId(), retainedWinners: host.selections.snapshot().retainedWinners, selections: host.selections.listSelections().slice(0, 20) })
+    json(res, 200, { ok: true, active: host.selections.activeSelectionId(), retainedWinners: host.selections.snapshot().retainedWinners, selections: host.selections.listSelections().slice(0, 20) } satisfies SelectionsListResponse)
   } }
   const cancelSelectionRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/cancel', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
@@ -259,7 +299,7 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
     const selectionId = typeof body.selectionId === 'string' ? body.selectionId.trim() : ''
     if (!selectionId) return json(res, 400, { ok: false, error: 'selection-id-required' })
     if (!host.selections.cancel(selectionId)) return json(res, 404, { ok: false, error: 'selection-not-active' })
-    json(res, 200, { ok: true })
+    json(res, 200, { ok: true } satisfies SelectionActionResponse)
   } }
   const releaseWinnerRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/release', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
@@ -277,7 +317,7 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
     // Manual winners release at settlement; autopilot winners release when the
     // source turn settles. The route stays idempotent for stale GUI panels.
     const released = await host.selections.releaseWinner(selectionId)
-    json(res, 200, { ok: true, state: released })
+    json(res, 200, { ok: true, state: released } satisfies SelectionReleaseResponse)
   } }
   const discardWinnerRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/discard', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
@@ -291,7 +331,7 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
     const selectionId = typeof body.selectionId === 'string' ? body.selectionId.trim() : ''
     if (!selectionId) return json(res, 400, { ok: false, error: 'selection-id-required' })
     if (!(await host.selections.discardWinner(selectionId))) return json(res, 404, { ok: false, error: 'no-discardable-winner' })
-    json(res, 200, { ok: true })
+    json(res, 200, { ok: true } satisfies SelectionActionResponse)
   } }
   return [state, config, verify, recordsRoute, evalRoute, probe, events, selectRoute, selectionsRoute, cancelSelectionRoute, releaseWinnerRoute, discardWinnerRoute]
 }

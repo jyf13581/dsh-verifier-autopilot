@@ -5,11 +5,14 @@
  * client build. A field change here must typecheck both producer and consumer.
  */
 
+import { PLUGIN_NAME, SETTINGS_NAMESPACE_ID } from './constants.js'
 import type { Config } from './config.js'
 import type { AggregateResult } from './verifier.js'
-import type { SelectionRecord } from './selection/candidates.js'
+import type { BridgeSelectRequest } from './selection/bridge.js'
+import type { ObjectiveCheck, SelectionRecord } from './selection/candidates.js'
 
-export const API_PREFIX = '/@dsh-external/dsh-verifier-autopilot/api'
+export const API_PREFIX = `/${PLUGIN_NAME}/api` as const
+export { SETTINGS_NAMESPACE_ID }
 
 export interface VerificationRecord {
   id: string
@@ -69,6 +72,18 @@ export interface SelectionItemResponse {
   selection: SelectionRecord
 }
 
+export interface SelectionStartResponse {
+  ok: true
+  selection: SelectionRecord
+}
+
+export interface SelectionActionResponse { ok: true }
+
+export interface SelectionReleaseResponse {
+  ok: true
+  state: 'released' | 'not-retained'
+}
+
 export interface ConfigResponse {
   ok: true
   config: Config
@@ -84,6 +99,32 @@ export interface VerifyRequest { sessionId: string }
 export interface VerifyResponse { ok: true; record: VerificationRecord }
 export interface ConfigRequest extends Partial<Config> {}
 export interface SelectionIdRequest { selectionId: string }
+
+/** Public/manual selection admission contract. Runtime validation stays in
+ * SelectionHost; internal autopilot metadata extends this shape only inside the
+ * domain layer. */
+export interface SelectionStartRequest {
+  sourceSessionId?: string
+  problem?: string
+  candidateCount?: number
+  criteria?: BridgeSelectRequest['criteria']
+  progressGuard?: unknown
+  groundTruthNote?: string | null
+  checks?: ObjectiveCheck[]
+  nEvaluations?: number
+  pivots?: number
+  algorithmSeed?: number
+  agentPreset?: string
+  candidateTimeoutMs?: number
+  selectTimeoutMs?: number
+  candidateModel?: string
+  candidateProvider?: string
+  candidateOptions?: unknown
+  candidateInstructions?: unknown
+  useSourceSeed?: boolean
+  sourceCwd?: string
+  marginThreshold?: number
+}
 
 export type HeaderValue = string | readonly string[] | undefined
 export type HeaderMap = Record<string, HeaderValue>

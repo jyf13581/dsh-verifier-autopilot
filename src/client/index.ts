@@ -1,9 +1,13 @@
-import { MODEL_OPTIONS, type SelectionView, type SelectionsListResponse, type State } from '../protocol.js'
+import {
+  API_PREFIX, MODEL_OPTIONS, SETTINGS_NAMESPACE_ID,
+  type ApiErrorResponse, type ConfigResponse, type SelectionView,
+  type SelectionsListResponse, type State, type VerifyResponse,
+} from '../protocol.js'
 
 declare const require: (name: string) => any
 
 type SlotsService = { inject(name: string, callback: () => void | (() => void)): void; register(options: any, component: any): () => void }
-type SettingsValue = { enabled?: boolean; autoFeedback?: boolean; model?: string; selectionMode?: 'off' | 'auto' | 'always'; selectionModelStrategy?: 'quality-first' | 'exploration' }
+type SettingsValue = Partial<Pick<State['config'], 'enabled' | 'autoFeedback' | 'model' | 'selectionMode' | 'selectionModelStrategy'>>
 type SettingsScope = { getSnapshot(): { value?: SettingsValue; status?: string }; subscribe(listener: () => void): () => void; set(field: string, value: unknown): Promise<void> }
 type SettingsBinder = { bind(spec: { namespace: string }): SettingsScope }
 type ClientContext = { slots: SlotsService; get(name: string): unknown; settingsScope?: SettingsBinder }
@@ -16,8 +20,8 @@ type ReactApi = {
 const { createElement: h, useEffect, useState } = require('react') as ReactApi
 
 export const inject = ['slots', 'sessions', 'settingsScope']
-const API = '/@dsh-external/dsh-verifier-autopilot/api'
-const SETTINGS_NAMESPACE = 'dsh-verifier-autopilot'
+const API = API_PREFIX
+const SETTINGS_NAMESPACE = SETTINGS_NAMESPACE_ID
 const panelStyle = { padding: 12, display: 'grid', gap: 8, fontSize: 12, borderTop: '1px solid var(--border-color, #ddd)' }
 const rowStyle = { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }
 
@@ -280,8 +284,8 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
         for (const [field, value] of Object.entries(patch)) await scope.set(field, value)
       } else {
         const response = await fetch(API + '/config', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) })
-        const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string }
-        if (!response.ok || result.ok !== true) throw new Error(result.error ?? 'HTTP ' + response.status)
+        const result = await response.json().catch(() => ({ ok: false, error: 'invalid-response' })) as ConfigResponse | ApiErrorResponse
+        if (!response.ok || !result.ok) throw new Error(result.ok ? 'HTTP ' + response.status : result.error)
       }
       const nextState = await refresh()
       const actual = nextState?.config as Record<string, unknown> | undefined
@@ -300,8 +304,8 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
     setStatus('五路验证中...')
     try {
       const response = await fetch(API + '/verify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: props.sessionId }) })
-      const result = await response.json() as { ok?: boolean; error?: string }
-      if (!response.ok || !result.ok) throw new Error(result.error ?? 'HTTP ' + response.status)
+      const result = await response.json() as VerifyResponse | ApiErrorResponse
+      if (!response.ok || !result.ok) throw new Error(result.ok ? 'HTTP ' + response.status : result.error)
       await refresh()
     } catch (error) {
       setStatus('验证失败: ' + String(error).slice(0, 160))

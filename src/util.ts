@@ -35,5 +35,9 @@ export function redactSecrets(text: string, extraLiterals: readonly string[] = [
     .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, '[REDACTED-KEY]')
     .replace(/\bxox[baprs]-[A-Za-z0-9-]{16,}\b/g, '[REDACTED-KEY]')
     .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED-KEY]')
-    .replace(/\b(?:Bearer|token|password|passwd|secret|api[-_]?key)\s*[:=]\s*["']?([A-Za-z0-9._+/=-]{16,})["']?/gi, (match, value: string) => match.slice(0, match.length - value.length) + '[REDACTED]')
+    .replace(
+      /\b((?:Bearer\s+)|(?:(?:token|password|passwd|secret|api[-_]?key)\s*[:=]\s*))(["']?)([A-Za-z0-9._+/=-]{16,})(["']?)/gi,
+      (_match, prefix: string, opening: string, _value: string, closing: string) =>
+        prefix + opening + '[REDACTED]' + (closing === opening ? closing : ''),
+    )
 }

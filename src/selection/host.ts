@@ -33,7 +33,7 @@ import { IsolatedWorkspaceManager, gitDiffStat, gitDiffFull, gitRepoState, makeL
 import type { TrajectoryEvent } from './trajectory.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
 import { appendJsonlLedger, atomicWriteFile, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from '../ledger.js'
-import type { SelectionSnapshot } from '../protocol.js'
+import type { SelectionSnapshot, SelectionStartRequest } from '../protocol.js'
 
 export interface SelectionsAgentProvider {
   list(): Array<{ id: string }>
@@ -126,40 +126,12 @@ function safeHost(baseURL: string): string | null {
   try { return new URL(baseURL).host } catch { return null }
 }
 
-export interface StartSelectionBody {
-  sourceSessionId?: string
-  problem?: string
-  candidateCount?: number
-  criteria?: BridgeSelectRequest['criteria']
-  /** Opt-in online hopeless-rollout abandonment (HANDOFF §2.3). */
-  progressGuard?: unknown
-  groundTruthNote?: string | null
-  checks?: ObjectiveCheck[]
-  nEvaluations?: number
-  pivots?: number
-  algorithmSeed?: number
-  agentPreset?: string
-  candidateTimeoutMs?: number
-  selectTimeoutMs?: number
-  candidateModel?: string
-  candidateProvider?: string
-  /** Heterogeneous pool: one entry per candidate; entries fall back to
-   *  candidateProvider/candidateModel. When present without candidateCount,
-   *  the array length is the candidate count. */
-  candidateOptions?: unknown
-  candidateInstructions?: unknown
-  useSourceSeed?: boolean
-  /** Explicit Git source workspace for a manual run. Requires an existing
-   *  directory that resolves to a Git root; candidates get isolated
-   *  worktrees under it. Without this (and without a source session) a real
-   *  run is refused rather than executed in the host process directory. */
-  sourceCwd?: string
+/** The public/manual request is canonical in protocol.ts. These fields are
+ * internal orchestration metadata and are never accepted from HTTP callers. */
+export interface StartSelectionBody extends SelectionStartRequest {
   trigger?: 'manual' | 'autopilot'
   policy?: SelectionRecord['policy']
-  /** Task-kind lane decided at admission (autopilot sets policy.taskKind). */
   taskKind?: string
-  /** Override the provisional margin gate for this run (0..0.5). */
-  marginThreshold?: number
 }
 
 export class SelectionApiError extends Error {
@@ -189,6 +161,14 @@ export function normalizeSelectionTimeoutMs(value: unknown, fallback?: number): 
   const parsed = value === undefined ? (fallback ?? DEFAULT_SELECTION_TIMEOUT_MS) : Number(value)
   if (!Number.isFinite(parsed)) return DEFAULT_SELECTION_TIMEOUT_MS
   return Math.max(MIN_SELECTION_TIMEOUT_MS, Math.min(MAX_SELECTION_TIMEOUT_MS, Math.floor(parsed)))
+}
+
+export function normalizeMarginThreshold(value: unknown, fallback = PROVISIONAL_MARGIN_THRESHOLD): number {
+  const parsed = Number(value === undefined ? fallback : value)
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 0.5) {
+    throw new SelectionApiError(400, 'margin-threshold-invalid', 'marginThreshold must be a finite number in [0,0.5]')
+  }
+  return parsed
 }
 
 /** Explicit per-request candidate timeout wins; otherwise the host-level config
@@ -262,9 +242,14 @@ function normalizeLoadedSelection(record: SelectionRecord): SelectionRecord {
   return { ...record, status: 'failed', error: 'interrupted-by-reload', finishedAt: record.finishedAt ?? Date.now() }
 }
 
+const SAFE_SELECTION_ID = /^sel-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
 function isSelectionRecord(value: unknown): value is SelectionRecord {
-  return Boolean(value && typeof value === 'object'
-    && typeof (value as Partial<SelectionRecord>).selectionId === 'string')
+  if (!value || typeof value !== 'object') return false
+  const record = value as Partial<SelectionRecord>
+  return typeof record.selectionId === 'string'
+    && SAFE_SELECTION_ID.test(record.selectionId)
+    && typeof record.status === 'string'
 }
 
 function safeChecks(input: unknown): ObjectiveCheck[] | undefined {
@@ -525,9 +510,10 @@ export class SelectionHost {
     if (!sourceCwd && !injectedHarness) {
       throw new SelectionApiError(400, 'source-cwd-required', 'candidate selection requires a resolvable Git source session or workspace: without it candidates run in the host process directory and can overwrite host files')
     }
-    const marginThreshold = body.marginThreshold === undefined
-      ? (this.deps.marginThresholdDefault?.() ?? PROVISIONAL_MARGIN_THRESHOLD)
-      : Math.max(0, Math.min(0.5, Number(body.marginThreshold)))
+    const marginThreshold = normalizeMarginThreshold(
+      body.marginThreshold,
+      this.deps.marginThresholdDefault?.() ?? PROVISIONAL_MARGIN_THRESHOLD,
+    )
     const key = this.deps.resolveKey ? await this.deps.resolveKey(verifierConf.apiKeyEnv) : undefined
     if (!key) throw new SelectionApiError(400, 'missing-api-key', 'verifier credential is not configured: ' + verifierConf.apiKeyEnv)
 
@@ -821,7 +807,7 @@ export class SelectionHost {
 
   private writeArtifact(record: SelectionRecord, artifacts?: SelectionRunResult['artifacts']): void {
     const dir = this.artifactDir()
-    if (!dir) return
+    if (!dir || !SAFE_SELECTION_ID.test(record.selectionId)) return
     try {
       const selDir = path.join(dir, record.selectionId)
       mkdirSync(path.join(selDir, 'traces'), { recursive: true })

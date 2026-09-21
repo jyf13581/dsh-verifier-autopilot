@@ -6,7 +6,14 @@
 
 import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import z from 'schemastery'
-import type { AutopilotMode, CandidateModelStrategy } from './selection/autopilot.js'
+import { DEFAULT_SELECTION_MARGIN_THRESHOLD, SETTINGS_NAMESPACE_ID } from './constants.js'
+
+export { DEFAULT_SELECTION_MARGIN_THRESHOLD, SETTINGS_NAMESPACE_ID } from './constants.js'
+
+/** Configuration-owned policy primitives. Selection consumes these types;
+ * config must never depend back on the selection implementation. */
+export type AutopilotMode = 'off' | 'auto' | 'always'
+export type CandidateModelStrategy = 'quality-first' | 'exploration'
 
 export interface Config {
   enabled: boolean
@@ -54,8 +61,8 @@ export interface Config {
   selectionPivots: number
   selectionCandidateTimeoutMs: number
   selectionSelectTimeoutMs: number
-  /** Provisional top-2 margin gate for the winner state machine (ruling I.1);
-   *  replaced by the calibrated quantile once the I.4 experiment lands. */
+  /** Calibrated-but-provisional top-2 margin gate for the winner state machine
+   *  (ruling I.1/I.4); records retain the exact threshold used. */
   selectionMarginThreshold: number
   /** Probe candidate models for liveness before planning (default true):
    *  catalog membership is not availability (ruling 6.4 kimi-k3 window). */
@@ -127,7 +134,7 @@ export const Config = z.object({
   // 临时噪声门限（ruling I.1）：top-2 margin 低于它一律 abstain。2026-09-08
   // 校准首轮（C0 24 次同文复跑）噪声 q95=0.0123、最大 0.0135、位置偏差≈0；
   // 0.03 = 观测噪声上限的 2.2 倍，仍标 provisional 待多 fixture 复核。
-  selectionMarginThreshold: z.number().min(0).max(0.5).default(0.03),
+  selectionMarginThreshold: z.number().min(0).max(0.5).default(DEFAULT_SELECTION_MARGIN_THRESHOLD),
   selectionProbeEnabled: z.boolean().default(true),
   // 后置审计可选测试命令（G-4）：空 = 绝不自动跑用户仓库的测试，delivered
   // 只可能到 unknown/no。
@@ -141,30 +148,13 @@ export const Config = z.object({
   verifierSmallModel: z.string().max(200).default(''),
 })
 
-export const SETTINGS_NAMESPACE = settingsNamespace('dsh-verifier-autopilot')
+export const SETTINGS_NAMESPACE = settingsNamespace(SETTINGS_NAMESPACE_ID)
 
-export const DEFAULT_CONFIG: Readonly<Config> = Object.freeze({
-  enabled: true, autoFeedback: false, routes: 5, scoreThreshold: 0.62, disagreementThreshold: 0.12,
-  maxFeedbackPerSession: 1, timeoutMs: 180000, maxTokens: 64000, temperature: 0.2,
-  baseURL: 'https://chat.holisthoom.top/v1', model: 'nvidia/nemotron-3-super-120b-a12b', apiKeyEnv: 'KIMI_API_KEY',
-  verifierEffort: 'low',
-  allowLabelFallback: false,
-  divergenceGuard: true, divergenceGuardMedian: 0.75,
-  skipStatusContinuation: true,
-  selectionNotify: true,
-  selectionMode: 'auto', selectionModelStrategy: 'quality-first', selectionProvider: 'kimi',
-  selectionModels: 'nvidia/nemotron-3-super-120b-a12b',
-  selectionStandardCandidates: 2, selectionDeepCandidates: 3, selectionEvaluations: 1,
-  selectionPivots: 0,
-  selectionCandidateTimeoutMs: 600000,
-  selectionSelectTimeoutMs: 600000,
-  selectionMarginThreshold: 0.03,
-  selectionProbeEnabled: true,
-  selectionPostAuditTestCommand: '',
-  selectionVerifierWorkers: 0,
-  verifierMinIntervalMs: 0,
-  verifierSmallModel: '',
-})
+/** One authoritative default source: Schemastery owns field defaults and this
+ * immutable snapshot is derived from it for non-settings composition paths. */
+export const DEFAULT_CONFIG: Readonly<Config> = Object.freeze({ ...Config({}) } as Config)
+
+const CONFIG_KEYS = new Set<keyof Config>(Object.keys(DEFAULT_CONFIG) as Array<keyof Config>)
 
 /** Bridge the settings service's source/change callbacks to the live Host config. */
 export function createSettingsSourceHooks(host: { replaceConfig(next: Config): void }): {
@@ -185,10 +175,9 @@ export function cleanConfig(config: Config): Config {
 export function validateConfigPatch(value: unknown): Partial<Config> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('config-object-required')
   const input = value as Record<string, unknown>
-  const allowed = new Set<keyof Config>(['enabled', 'autoFeedback', 'routes', 'scoreThreshold', 'disagreementThreshold', 'maxFeedbackPerSession', 'timeoutMs', 'maxTokens', 'temperature', 'baseURL', 'model', 'apiKeyEnv', 'verifierEffort', 'allowLabelFallback', 'divergenceGuard', 'divergenceGuardMedian', 'skipStatusContinuation', 'selectionNotify', 'selectionMode', 'selectionModelStrategy', 'selectionProvider', 'selectionModels', 'selectionStandardCandidates', 'selectionDeepCandidates', 'selectionEvaluations', 'selectionPivots', 'selectionCandidateTimeoutMs', 'selectionSelectTimeoutMs', 'selectionMarginThreshold', 'selectionProbeEnabled', 'selectionPostAuditTestCommand', 'selectionVerifierWorkers', 'verifierMinIntervalMs', 'verifierSmallModel'])
   const output: Partial<Config> = {}
   for (const key of Object.keys(input) as Array<keyof Config>) {
-    if (!allowed.has(key)) throw new Error('unknown-config-key:' + key)
+    if (!CONFIG_KEYS.has(key)) throw new Error('unknown-config-key:' + key)
     const item = input[key]
     if (key === 'enabled' || key === 'autoFeedback' || key === 'allowLabelFallback' || key === 'divergenceGuard' || key === 'skipStatusContinuation' || key === 'selectionNotify' || key === 'selectionProbeEnabled') {
       if (typeof item !== 'boolean') throw new Error('config-boolean-required:' + key)

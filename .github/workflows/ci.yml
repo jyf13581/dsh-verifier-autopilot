@@ -13,14 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       # Published DSH release-candidate peers currently disagree on two
@@ -28,6 +28,8 @@ jobs:
       # set; --force tells npm to honor that pinned set deterministically.
       - name: Install locked dependencies
         run: npm ci --force --ignore-scripts
+      - name: Check architecture boundaries
+        run: npm run check:architecture
       - name: Build Host and declarations
         run: npm run build:host
       - name: Build Web client
@@ -38,5 +40,14 @@ jobs:
         run: npm test
       - name: Run sidecar offline gates
         run: python3 bridge/self_test.py
-      - name: Check patch whitespace
-        run: git diff --check
+      - name: Check committed patch whitespace
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ -n "${BASE_SHA:-}" && ! "$BASE_SHA" =~ ^0+$ ]] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            base="$BASE_SHA"
+          else
+            base="$(git merge-base origin/main "$HEAD_SHA")"
+          fi
+          git diff --check "$base" "$HEAD_SHA"

@@ -115,6 +115,7 @@ export class VerifierHost {
   private readonly listeners = new Set<() => void>()
   private readonly disposers: Array<() => void> = []
   private readonly coordinator: VerificationCoordinator<Agent, RecordState | undefined>
+  private started = false
   private disposed = false
   /** null disables persistence (tests/embedded use); the injected Host enables it */
   private readonly recordsFile: string | null
@@ -138,7 +139,9 @@ export class VerifierHost {
   }
 
   constructor(private readonly ctx: HostContext, config: Config, options: { recordsFile?: string | null; feedbackTimeoutMs?: number; selectionsFile?: string | null; selectionsTesting?: ConstructorParameters<typeof SelectionHost>[0]['testing'] } = {}) {
-    this.config = config
+    // Own the mutable reference: settings callers and embedded consumers must
+    // not be able to alter live behavior by retaining the constructor object.
+    this.config = { ...config }
     this.recordsFile = options.recordsFile === undefined ? null : options.recordsFile
     this.feedbackTimeoutMs = Number.isFinite(options.feedbackTimeoutMs)
       ? Math.max(1, Math.floor(options.feedbackTimeoutMs as number))
@@ -430,6 +433,8 @@ export class VerifierHost {
   }
 
   start(): void {
+    if (this.started || this.disposed) return
+    this.started = true
     this.loadHistory()
     for (const agent of this.ctx.agents?.list() ?? []) this.attach(agent)
     const events = this.ctx as unknown as { on: (name: string, handler: (...args: any[]) => any, options?: { prepend?: boolean }) => (() => void) | void }
@@ -492,7 +497,7 @@ export class VerifierHost {
     this.emit()
   }
 
-  getConfig(): Config { return this.config }
+  getConfig(): Config { return { ...this.config } }
 
   getCredentials(): Credentials | undefined { return this.ctx.credentials }
 

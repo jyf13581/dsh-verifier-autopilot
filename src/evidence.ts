@@ -4,6 +4,7 @@
  * dependency and can therefore be exercised independently.
  */
 
+import { PLUGIN_NAME } from './constants.js'
 import type { AggregateResult } from './verifier.js'
 
 export type EventRecord = { type: string; seq?: number; time?: number; data?: any }
@@ -58,7 +59,7 @@ export function renderEventTexts(events: readonly EventRecord[]): string[] {
  *  source.kind='plugin' with this name and form='notice', so detection never
  *  depends on the forgeable '[Verifier feedback]' text prefix. Legacy durable
  *  logs without source metadata keep working through the prefix fallback. */
-export const PLUGIN_SOURCE_NAME = '@dsh-external/dsh-verifier-autopilot'
+export const PLUGIN_SOURCE_NAME = PLUGIN_NAME
 const FEEDBACK_PREFIX = '[Verifier feedback]'
 
 function isVerifierFeedback(event: EventRecord): boolean {

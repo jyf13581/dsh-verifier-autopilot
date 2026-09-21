@@ -17,11 +17,11 @@
 import { randomUUID } from 'node:crypto'
 import { rmdir } from 'node:fs/promises'
 import path from 'node:path'
-import { renderTrajectory, type TrajectoryEvent } from './trajectory.js'
+import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
+import { boundCandidateHandoff, renderTrajectory, type TrajectoryEvent } from './trajectory.js'
 import { runChecks, type CheckResult, type ObjectiveCheck } from './checks.js'
 export type { CheckResult, ObjectiveCheck } from './checks.js'
 import { BridgeError, type BridgeProgressRequest, type BridgeProgressResult, type BridgeSelectRequest, type BridgeSelectResult, type BridgeUsage } from './bridge.js'
-import { boundCandidateHandoff } from './autopilot.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
 
 export type CandidateStatus =
@@ -73,7 +73,7 @@ export type SelectionOutcome =
   | 'objective_only_result'     // verifier absent; strict deterministic order
   | 'single_candidate_fallback' // exactly one survivor; never compared
   | 'insufficient_evidence'     // survivors produced no verifiable work
-  | 'abstain'                   // margin inside the (uncalibrated) noise band
+  | 'abstain'                   // margin inside the provisional calibrated noise band
   | 'verifier_unavailable'      // ranking infrastructure failed after retries
 
 export interface SelectionRecord {
@@ -120,7 +120,7 @@ export interface SelectionRecord {
   margin?: number
   marginThreshold?: number
   marginCondition?: string
-  /** Threshold is provisional until the calibration experiment (ruling I.4). */
+  /** Threshold remains provisional until the graduation invoice clears (I.4). */
   marginProvisional?: boolean
   /** At least one candidate's checks were shell-level failures (B-10). */
   checksUnreliable?: boolean
@@ -337,7 +337,7 @@ export function evaluateDelivery(input: {
  *  pinning; oracle-separated pairs land at margin 0.31..0.46 with 12/12
  *  correct signs. 0.03 = 2.2× the observed noise ceiling. Stays provisional
  *  until the multi-fixture replication (≥5 fixtures) confirms stability. */
-export const PROVISIONAL_MARGIN_THRESHOLD = 0.03
+export const PROVISIONAL_MARGIN_THRESHOLD = DEFAULT_SELECTION_MARGIN_THRESHOLD
 
 function clampCandidateCount(n: number): number {
   if (!Number.isInteger(n) || n < 1) throw new Error('candidate-count-invalid')
@@ -855,7 +855,7 @@ export class SelectionRunner {
               record.criteriaCount = criteriaCount
               record.expectedVerifierCalls = selectResult.nComparisons * criteriaCount * nEvaluations
               // Margin gate (ruling I.1/I.4, B-8): a verifier preference inside
-              // the uncalibrated noise band — exact ties included — abstains.
+              // the provisional calibrated noise band — exact ties included — abstains.
               // Evidence base (rounds 1-5, two model families): the measured
               // noise ceiling stayed <= 0.014 throughout (n=240 zero-hypothesis
               // frames, max=0.01377); 0.03 sits 2.17x above it (the earlier

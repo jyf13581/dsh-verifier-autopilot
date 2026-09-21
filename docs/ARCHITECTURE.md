@@ -31,7 +31,8 @@ implementation code.
 | Module | Responsibility |
 | --- | --- |
 | `src/index.ts` | Public package entry, plugin metadata, dependency injection, settings and route registration. |
-| `src/config.ts` | Config schema, defaults, validation, and settings-source hooks. No runtime lifecycle. |
+| `src/constants.ts` | Dependency-free cross-layer invariant constants. |
+| `src/config.ts` | Config schema, schema-derived defaults, validation, settings-source hooks, and config-owned policy primitives. No selection/runtime lifecycle dependency. |
 | `src/protocol.ts` | Canonical Host/client wire types, structural web transport types, API prefix, and model catalog. |
 | `src/util.ts` | Dependency-light boundary helpers: credentials, API-key resolution, base-URL normalization, and secret redaction. |
 | `src/ledger.ts` | Shared versioned JSONL reading/appending/compaction and same-directory atomic replacement. |
@@ -54,7 +55,7 @@ implementation code.
 | `src/selection/autopilot.ts` | Admission policy and bounded task/context planning for automatic selection. |
 | `src/selection/candidates.ts` | Candidate runner and selection state machine. |
 | `src/selection/live.ts` | Live DSH candidate adapters and isolated Git-worktree management. |
-| `src/selection/trajectory.ts` | Candidate trajectory rendering and bounded evidence. |
+| `src/selection/trajectory.ts` | Candidate trajectory rendering plus shared context/handoff bounding. The candidate runner depends here rather than back on autopilot orchestration. |
 | `src/selection/checks.ts` | Objective repository/check execution and normalization. |
 | `src/selection/bridge.ts` | Framed subprocess client for the Python verifier sidecar. |
 | `src/selection/retry.ts` | Bounded retry policy for transient bridge failures. |
@@ -99,20 +100,27 @@ Follow these rules:
 3. **`protocol.ts` must not import Host, API, or browser runtime modules.** Its
    domain imports are type-only so the browser cannot pull Node code into the
    bundle.
-4. **`util.ts`, `ledger.ts`, and `evidence.ts` remain dependency-light.** They
-   are reusable boundaries, not alternate composition roots.
+4. **`constants.ts`, `util.ts`, `ledger.ts`, and `evidence.ts` remain
+   dependency-light.** They are reusable boundaries, not alternate composition
+   roots.
 5. **Selection implementation must not depend on legacy-verifier scheduling or
    feedback internals.** Integration happens through `VerifierHost` ownership,
    shared utilities/persistence, and typed snapshots.
 6. **Use `import type` across domain boundaries whenever only shape is needed.**
    An erased type edge must not become an accidental runtime cycle.
 7. **The client consumes the protocol, not server classes.** Never recreate
-   `State`, `LaneView`, `SelectionView`, request, or response interfaces in the
-   browser module.
+   the API prefix, `State`, `LaneView`, `SelectionView`, request, or response
+   interfaces in the browser module.
+8. **Config owns config policy types and defaults.** Selection may consume
+   `AutopilotMode` and `CandidateModelStrategy`; config must not import the
+   selection implementation. `DEFAULT_CONFIG` is derived from the Schemastery
+   schema so defaults cannot drift between composition and settings paths.
 
 A cycle is a design signal. Move a shared shape to `protocol.ts`, a generic
 boundary helper to `util.ts`, or a persistence primitive to `ledger.ts` rather
-than introducing a reciprocal import.
+than introducing a reciprocal import. `npm run check:architecture` parses the
+TypeScript module graph, rejects runtime **and type-only** cycles, and enforces
+these layer restrictions in CI.
 
 ## 4. Evidence boundary: verification is not selection
 
@@ -164,7 +172,7 @@ separate record types, ledgers, gates, and audit artifacts.
 - verification records;
 - config, verification, and selection request/response bodies;
 - minimal `WebRequest`, `WebResponse`, and `WebRoute` shapes; and
-- the model catalog displayed by the client.
+- the API prefix and model catalog displayed by the client.
 
 Both snapshot producers (`VerifierHost.snapshot()` and
 `SelectionHost.snapshot()`) and the browser consumer must use these shared
@@ -186,6 +194,10 @@ to one concrete HTTP server implementation.
 When adding a public protocol export, re-export it from `src/index.ts` if package
 consumers need it. Do not remove an existing package-entry export as collateral
 for an internal refactor.
+
+`SelectionStartRequest` intentionally excludes `trigger`, `policy`, and
+`taskKind`. Those are trusted Host orchestration metadata; the manual HTTP route
+rejects them so a caller cannot opt itself into autopilot retention/relay rules.
 
 The model catalog uses complete endpoint tuples (`id`, `baseURL`, `apiKeyEnv`,
 `note`). Selecting a model must replace the whole tuple so credentials or URLs
@@ -212,6 +224,8 @@ Current rules:
 - Blank, malformed, torn, or schema-invalid rows are skipped so one bad tail
   cannot prevent Host startup.
 - Selection ledgers can deduplicate by ID; the last valid row for an ID wins.
+- Persisted selection IDs must match the path-safe `sel-*` identifier grammar
+  before they can address an audit-pack directory.
 - Histories are bounded and oversized files are compacted from the current
   in-memory view.
 
@@ -237,10 +251,10 @@ Runtime state belongs under `.data/` and is ignored. It must never be committed.
 
 ## 7. Lifecycle, cancellation, and secrets
 
-`VerifierHost.start()` establishes subscriptions and scheduling; `dispose()` is
-the ownership boundary that cancels in-flight work and disposes the selection
-host. Selection disposal must terminate sidecars, candidates, retained handles,
-and isolated workspaces. API disconnects and configured timeouts should flow
+`VerifierHost.start()` idempotently establishes subscriptions and scheduling;
+`dispose()` is the ownership boundary that cancels in-flight work and disposes
+the selection host. A disposed Host cannot be restarted. Selection disposal
+must terminate sidecars, candidates, retained handles, and isolated workspaces. API disconnects and configured timeouts should flow
 through existing abort signals instead of creating detached promises.
 
 Credential references cross configuration and API boundaries; credential
@@ -263,16 +277,19 @@ lock with `--force`:
 
 ```sh
 npm ci --force --ignore-scripts
+npm run check:architecture
 npm run typecheck
 npm run build:host
 npm run build:client
 npm test
 python3 bridge/self_test.py
-git diff --check
+git diff --check "$(git merge-base origin/main HEAD)" HEAD
 ```
 
 What each gate covers:
 
+- `check:architecture`: parses project imports, enforces allowed layer
+  directions, and rejects runtime or type-only module cycles.
 - `typecheck`: strict Host and client TypeScript checking without emit.
 - `build:host`: emits Node modules, source maps, and declarations to `lib/`.
 - `build:client`: bundles `src/client/index.ts` as the DSH browser module in
@@ -281,7 +298,9 @@ What each gate covers:
   including evidence, verifier, API, Host, ledger, and selection behavior.
 - `bridge/self_test.py`: offline framing, validation, shutdown, retry, and
   optional-provider gates for the Python boundary.
-- `git diff --check`: whitespace/EOL guard.
+- `git diff --check "$(git merge-base origin/main HEAD)" HEAD`: whitespace/EOL
+  guard over the committed change range. A bare `git diff --check` in a clean
+  checkout checks nothing.
 
 Some regression fixtures invoke PowerShell and require `pwsh`. Run the complete
 suite on the Ubuntu CI image when a local environment lacks it. The historical
