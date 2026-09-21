@@ -4,3 +4,7 @@ lib/
 *.tgz
 eval/results/
 .data/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage

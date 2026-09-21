@@ -26,6 +26,7 @@
   },
   "scripts": {
     "build": "bash scripts/build.sh",
+    "build:host": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "build:client": "tsdown",
     "test": "node scripts/test.mjs",

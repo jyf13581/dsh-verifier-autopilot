@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ['main', 'arena/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      # Published DSH release-candidate peers currently disagree on two
+      # transitive RC ranges. The lockfile pins the resolved, host-compatible
+      # set; --force tells npm to honor that pinned set deterministically.
+      - name: Install locked dependencies
+        run: npm ci --force --ignore-scripts
+      - name: Build Host and declarations
+        run: npm run build:host
+      - name: Build Web client
+        run: npm run build:client
+      - name: Run regression suite
+        env:
+          DSH_VA_PYTHON: python3
+        run: npm test
+      - name: Run sidecar offline gates
+        run: python3 bridge/self_test.py
+      - name: Check patch whitespace
+        run: git diff --check
