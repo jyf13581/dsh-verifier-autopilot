@@ -54,6 +54,12 @@ export interface BridgeSelectRequest {
   effort?: string
   onError?: 'tie' | 'raise'
   maxWorkers?: number | null
+  /** Token-bucket dispatch spacing (ms) inside the tournament; 0 = off. */
+  minIntervalMs?: number
+  /** Per-call transient (429) retries inside the sidecar. Each retry re-enters
+   *  the relay's per-request account round-robin, so a rate-limited account
+   *  stalls only its own call. 0..5, default 2. */
+  callRetries?: number
   timeoutMs?: number
   signal?: AbortSignal
 }
@@ -317,6 +323,8 @@ export class VerifierBridge {
       cache: null,
       on_error: req.onError ?? 'raise',
       max_workers: req.maxWorkers ?? null,
+      min_interval_ms: Math.max(0, Math.floor(req.minIntervalMs ?? 0)),
+      call_retries: Math.max(0, Math.min(5, Math.floor(req.callRetries ?? 2))),
       progress: false,
     }, { timeoutMs: req.timeoutMs ?? this.defaultTimeoutMs, signal: req.signal })
     if (frame.ok !== true) throw this.frameError(frame)

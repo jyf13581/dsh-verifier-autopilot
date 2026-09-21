@@ -8,6 +8,8 @@
  */
 
 import { cp, lstat, mkdir, readlink, rm, rmdir } from 'node:fs/promises'
+import { statSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
@@ -245,7 +247,14 @@ function makeChildSetup(
     }
     const session = aCtx.agent?.session
     if (session) {
-      session.append('approval/policy', { policy: 'never', source: 'delegation' })
+      // Approval must agree with the sandbox mode. `workspace-write` bundles
+      // approval=ask, so pinning 'never' there made every escalation request
+      // permanently unpromptable and the candidate parked on it (2026-09-14).
+      // The full-access preset already means "no approval prompts", so the pin
+      // is only correct when the child genuinely runs under that preset.
+      const approval = sandboxMode === 'danger-full-access' ? 'never' : undefined
+      if (approval) session.append('approval/policy', { policy: approval, source: 'delegation' })
+      else if (!sandboxMode) session.append('approval/policy', { policy: 'never', source: 'delegation' })
       if (sandboxMode) session.append('sandbox/mode', { mode: sandboxMode, source: 'delegation' })
     }
     // Model-selection replication (see header comment).
@@ -295,7 +304,16 @@ export function makeLiveCandidateFactory(args: {
       const header = parent ? ((parent.session as { header?: { delegationDepth?: number } }).header ?? {}) : {}
       const parentDepth = Number(header.delegationDepth ?? 0)
       const depth = Number.isSafeInteger(parentDepth) && parentDepth > 0 ? parentDepth + 1 : 1
-      const preset = spec.agentPreset ?? args.agentPreset
+      // A candidate that joins no preset resolves its tools against the empty
+      // global layer (agent-presets logs exactly this: "published without
+      // joining an agent preset"). It then has no real file/bash tool, so the
+      // model mounts ad-hoc dev_stage_* tools that run in the HOST process
+      // context and write through process.cwd() — which injected
+      // percent.js/percent.test.js into the installed @deepseek-ai/dsh package
+      // and killed the runtime with a native Node assertion (2026-09-13).
+      // Default to the standard preset so candidates always inherit the
+      // session-cwd-aware tool-fs/tool-bash/tool-pwsh set.
+      const preset = spec.agentPreset ?? args.agentPreset ?? 'standard'
       // Per-candidate route (heterogeneous pools) wins over the factory-wide
       // default; the host pre-merges shared candidateModel/candidateProvider
       // into each entry, so a wholesale ?? is the correct priority.
@@ -468,5 +486,121 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
       await rm(managed, { recursive: true, force: true })
       try { await rmdir(path.dirname(managed)) } catch { /* selection root not empty */ }
     }
+  }
+}
+
+/** Larger-output variant of exec() for evidence collection (numstat / status
+ *  listings legitimately exceed the 2000-char diagnostic tail). */
+function execWide(cmd: string, args: string[], cwd?: string, timeoutMs = 30000, cap = 262144): Promise<{ code: number; out: string }> {
+  return new Promise((resolve) => {
+    let out = ''
+    const child = spawn(cmd, args, { cwd, windowsHide: true })
+    const take = (b: Buffer | string) => { out = (out + String(b)).slice(0, cap) }
+    child.stdout?.on('data', take)
+    child.stderr?.on('data', take)
+    const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } }, timeoutMs)
+    child.on('error', () => { clearTimeout(timer); resolve({ code: -1, out }) })
+    child.on('exit', (code) => { clearTimeout(timer); resolve({ code: code ?? -1, out }) })
+  })
+}
+
+export interface DiffStatLite {
+  /** Tracked files whose worktree bytes differ from HEAD. */
+  files: number
+  insertions: number
+  deletions: number
+  /** Untracked (non-ignored) files — candidate NEW artifacts live here. */
+  untracked: number
+  /** Stable hash of the diff surface: numstat lines + untracked name:size.
+   *  Two candidates with equal fingerprints produced the same diff shape. */
+  fingerprint: string
+}
+
+/** Objective work evidence for one candidate workspace (ruling K.5 / J.4).
+ *  Returns null when the workspace is not a git worktree (manual blank
+ *  workspaces) — the caller then relies on tool-call evidence alone. */
+export async function gitDiffStat(cwd: string): Promise<DiffStatLite | null> {
+  try {
+    const head = await execWide('git', ['-C', cwd, 'rev-parse', '--verify', 'HEAD'], cwd)
+    if (head.code !== 0) return null
+    const numstat = await execWide('git', ['-C', cwd, 'diff', '--numstat', 'HEAD'], cwd)
+    if (numstat.code !== 0) return null
+    let files = 0
+    let insertions = 0
+    let deletions = 0
+    const numLines: string[] = []
+    for (const line of numstat.out.split(/\r?\n/)) {
+      const parts = line.split('\t')
+      if (parts.length < 3) continue
+      files += 1
+      insertions += parts[0] === '-' ? 0 : Number(parts[0]) || 0
+      deletions += parts[1] === '-' ? 0 : Number(parts[1]) || 0
+      numLines.push(line)
+    }
+    const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard'], cwd)
+    const untrackedEntries: string[] = []
+    if (others.code === 0) {
+      for (const rel of others.out.split(/\r?\n/).filter(Boolean).slice(0, 5000)) {
+        let size = -1
+        try { size = statSync(path.join(cwd, rel)).size } catch { /* raced away */ }
+        untrackedEntries.push(rel + ':' + size)
+      }
+    }
+    untrackedEntries.sort()
+    const fingerprint = createHash('sha256')
+      .update(numLines.join('\n'))
+      .update('\n--UNTRACKED--\n')
+      .update(untrackedEntries.join('\n'))
+      .digest('hex')
+      .slice(0, 16)
+    return { files, insertions, deletions, untracked: untrackedEntries.length, fingerprint }
+  } catch {
+    return null
+  }
+}
+
+export interface DiffFull {
+  /** git diff HEAD patch text, capped; untracked new files are included via
+   *  `git add -N` intent-to-add (safe: runs in a disposable worktree). */
+  patch: string
+  truncated: boolean
+  /** Untracked (non-ignored) file names — the typical brand-new deliverable. */
+  untrackedFiles: string[]
+}
+
+/** Full diff evidence for the audit pack (ruling I.5): what the candidate
+ *  actually changed, captured BEFORE the workspace can be reclaimed. */
+export async function gitDiffFull(cwd: string, patchCap = 262144): Promise<DiffFull | null> {
+  try {
+    const head = await execWide('git', ['-C', cwd, 'rev-parse', '--verify', 'HEAD'], cwd)
+    if (head.code !== 0) return null
+    await execWide('git', ['-C', cwd, 'add', '-N', '.'], cwd)
+    const diff = await execWide('git', ['-C', cwd, 'diff', 'HEAD', '--', '.'], cwd, 30000, patchCap)
+    if (diff.code !== 0) return null
+    const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard'], cwd)
+    const untrackedFiles = others.code === 0 ? others.out.split(/\r?\n/).filter(Boolean) : []
+    return { patch: diff.out, truncated: diff.out.length >= patchCap, untrackedFiles }
+  } catch {
+    return null
+  }
+}
+
+export interface RepoState {
+  head: string | null
+  /** Uncommitted porcelain entries (tracked edits + untracked). */
+  dirtyEntries: number
+}
+
+/** Post-audit evidence for the source repository (ruling I.5/G-4): HEAD
+ *  before/after plus worktree dirtiness, never a merge claim. */
+export async function gitRepoState(cwd: string): Promise<RepoState | null> {
+  try {
+    const headRun = await execWide('git', ['-C', cwd, 'rev-parse', '--verify', 'HEAD'], cwd)
+    if (headRun.code !== 0) return null
+    const status = await execWide('git', ['-C', cwd, 'status', '--porcelain'], cwd)
+    const dirtyEntries = status.code === 0 ? status.out.split(/\r?\n/).filter(Boolean).length : -1
+    return { head: headRun.out.trim() || null, dirtyEntries }
+  } catch {
+    return null
   }
 }

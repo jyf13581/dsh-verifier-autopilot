@@ -132,6 +132,9 @@ export function buildVerifierPrompt(problem: string, trace: string, criterion: s
     'Before claiming that something is absent (no final answer, no test output, no tool result), scan the entire trajectory including the section after any "[... trajectory tail ...]" marker — the final answer is normally the LAST [E*] line, and claims of absence that contradict a visible last line are automatically wrong.',
     '',
     '**Task:**', clampText(problem, 6000), '',
+    // compactTrace() already guarantees trace <= TRACE_BUDGET_CHARS (16000),
+    // so this clamp is now a defensive no-op that never cuts the final line
+    // (ruling J.4-E-3: the old 18000→16000 double truncation is removed).
     '**Trajectory A (current agent):**', clampText(trace, 16000), '',
     '**Trajectory B (reference failure baseline):**', 'No valid implementation, no completed verification, and no evidence of task completion.', '',
     '**Rating Scale:** A is a fully correct, complete, verified result. T is a complete failure. The letters A-T are ordered from best to worst.',
@@ -176,7 +179,43 @@ export function normalizeBaseUrl(value: string): string {
 export interface VerifyOptions {
   /** External abort signal (run-level fence); combined with the per-request timeout. */
   signal?: AbortSignal
+  /** Token-bucket smoother shared across lanes: spaces request dispatches so a
+   *  concurrent fan-out cannot self-inflict a rate-limit burst. Optional. */
+  smoother?: RequestSmoother
+  /** Per-lane model override (layered tiering): mechanical lanes may run a
+   *  cheap model while hard lanes stay on the configured verifier model. */
+  modelOverride?: string
 }
+
+/** Minimum spacing between verifier request dispatches (token-bucket smoothing).
+ *  Serializes acquire() calls through one chain so N concurrent lanes launch
+ *  at >= minIntervalMs apart. minIntervalMs <= 0 returns a no-op smoother. */
+export interface RequestSmoother {
+  acquire(): Promise<void>
+}
+
+export function createRequestSmoother(minIntervalMs: number): RequestSmoother {
+  const min = Math.max(0, Math.floor(minIntervalMs))
+  if (!(min > 0)) return { acquire: async () => undefined }
+  let chain: Promise<void> = Promise.resolve()
+  let last = 0
+  return {
+    acquire: () => {
+      const run = async () => {
+        const wait = Math.max(0, last + min - Date.now())
+        if (wait > 0) await new Promise<void>(resolve => setTimeout(resolve, wait))
+        last = Date.now()
+      }
+      chain = chain.then(run, run)
+      return chain
+    },
+  }
+}
+
+/** Mechanical session-verifier lenses that may run on the layered small model
+ *  (config.verifierSmallModel) when the operator opts in. Hard lanes —
+ *  adversarial/repair and requirement mapping — always stay on the main model. */
+export const SMALL_MODEL_LENSES = new Set(['completion', 'evidence'])
 
 function composeRequestSignal(config: Config, options?: VerifyOptions): AbortSignal {
   const timeout = AbortSignal.timeout(config.timeoutMs)
@@ -218,11 +257,14 @@ async function verifyRouteOnce(config: Config, credentials: Credentials | undefi
     // Egress policy gate: an unusable target is a configuration fault, never a
     // transient network condition, so it must not retry.
     if (!/^https?:\/\//i.test(target)) return { route, ok: false, errorCode: 'invalid_base_url', error: 'verifier baseURL must be an http(s) URL', durationMs: Date.now() - started }
+    // Token-bucket smoothing: space this dispatch away from the previous one so
+    // a concurrent lane fan-out cannot burst into a self-inflicted rate limit.
+    if (options?.smoother) await options.smoother.acquire()
     const response = await fetch(target + '/chat/completions', {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: 'Bearer ' + key },
       body: JSON.stringify({
-        model: config.model,
+        model: options?.modelOverride ?? config.model,
         messages: [{ role: 'user', content: redactSecrets(prompt, [key]) + '\n\nThis is verifier lane ' + route + ' of ' + config.routes + ', focused on ' + laneFor(route).name + '. ' + laneFor(route).instruction + ' Make this judgment independently and report only evidence from the supplied trajectory.' }],
         max_tokens: config.maxTokens,
         temperature: config.temperature,
@@ -309,7 +351,18 @@ export async function verifyRoute(config: Config, credentials: Credentials | und
 
 export async function verifyFive(config: Config, credentials: Credentials | undefined, prompt: string, options?: VerifyOptions): Promise<AggregateResult> {
   const count = Math.max(1, Math.min(5, config.routes))
-  const settled = await Promise.all(Array.from({ length: count }, (_, index) => verifyRoute(config, credentials, prompt, index + 1, options)))
+  // One shared smoother across the lane fan-out: 0 (default) disables it and
+  // the lanes launch exactly as before.
+  const smoother = config.verifierMinIntervalMs > 0 ? createRequestSmoother(config.verifierMinIntervalMs) : undefined
+  const smallModelRaw = typeof config.verifierSmallModel === 'string' ? config.verifierSmallModel.trim() : ''
+  const smallModel = smallModelRaw !== '' ? smallModelRaw : undefined
+  const settled = await Promise.all(Array.from({ length: count }, (_, index) => {
+    // Layered model tiering: mechanical lenses run the cheap model; the rest
+    // keep the configured verifier model (calibration surface unchanged).
+    const lens = laneFor(index + 1)
+    const modelOverride = smallModel && SMALL_MODEL_LENSES.has(lens.name) ? smallModel : undefined
+    return verifyRoute(config, credentials, prompt, index + 1, { ...options, smoother, modelOverride })
+  }))
   const valid = settled.filter(item => item.ok && typeof item.score === 'number')
   const scores = valid.map(item => item.score as number).sort((a, b) => a - b)
   const mean = scores.length ? scores.reduce((sum, value) => sum + value, 0) / scores.length : null

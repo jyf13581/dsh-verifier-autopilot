@@ -18,17 +18,18 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFil
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { VerifierBridge, type BridgeSelectRequest, type BridgeSelectResult } from './bridge.js'
-import {
-  SelectionRunner,
+import { SelectionRunner,
   MAX_CANDIDATES,
+  PROVISIONAL_MARGIN_THRESHOLD,
   type CandidateFactory,
   type ObjectiveCheck,
   type SelectionRecord,
   type SelectionRunInput,
+  type SelectionRunResult,
   type WorkspaceManager,
 } from './candidates.js'
 import type { SelectionAgentHandle } from './candidates.js'
-import { IsolatedWorkspaceManager, makeLiveCandidateFactory } from './live.js'
+import { IsolatedWorkspaceManager, gitDiffStat, gitDiffFull, gitRepoState, makeLiveCandidateFactory } from './live.js'
 import type { TrajectoryEvent } from './trajectory.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
 
@@ -59,7 +60,7 @@ export interface SelectionHostDeps {
   /** Session default route, used to complete partial candidate route
    *  overrides (DSH requires provider and model as a pair). */
   defaultRoute?: () => { provider?: string; model?: string } | undefined
-  verifier: () => { model: string; baseURL: string; apiKeyEnv: string; effort?: string }
+  verifier: () => { model: string; baseURL: string; apiKeyEnv: string; effort?: string; maxWorkers?: number; minIntervalMs?: number }
   /** Host-level default for manual /select when the request omits
    *  candidateTimeoutMs; sourced from config so strong slow models get the
    *  same time budget as autopilot instead of the runner's 300s floor. */
@@ -69,6 +70,13 @@ export interface SelectionHostDeps {
    *  operator defaults ride every manual run the same way. */
   nEvaluationsDefault?: () => number
   pivotsDefault?: () => number
+  /** Provisional margin gate for the winner state machine (ruling I.1). */
+  marginThresholdDefault?: () => number
+  /** Config default for the selection time budget when /select omits it. */
+  selectTimeoutMsDefault?: () => number
+  /** Directory for the per-selection audit pack written BEFORE cleanup
+   *  (ruling I.5); null disables persistence. Derived from workspaceRoot. */
+  artifactsDir?: string | null
   pythonPath?: string
   sidecarPath?: string
   workspaceRoot?: string
@@ -85,12 +93,36 @@ export interface SelectionHostDeps {
     workspaces?: WorkspaceManager
     bridge?: { select(req: BridgeSelectRequest): Promise<BridgeSelectResult> }
     retrySleep?: RetrySleep
+    /** Deterministic diff evidence for gate tests. */
+    diffStat?: (cwd: string) => Promise<import('./candidates.js').DiffStatLite | null>
+    /** Patch capture for artifact tests. */
+    diffFull?: (cwd: string) => Promise<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null>
   }
 }
 
-// The free Kimi relay currently enforces one in-flight request per user.
-// Candidate rollouts remain parallel; only the verifier tournament is serial.
+// Legacy single-account default: one in-flight verifier request. Kept as the
+// explicit-workers=1 value for back-compat.
 export const SELECTION_VERIFIER_MAX_WORKERS = 1
+// Auto tier for the relay account-pool execution model: the relay round-robins
+// accounts PER REQUEST, so concurrent verifier calls land on independent
+// accounts — a stuck account stalls only its own call instead of the whole
+// tournament. 4 is the conservative auto default (parallelism should not exceed
+// the account pool size in practice); operators with bigger pools raise it via
+// selectionVerifierWorkers.
+export const AUTO_VERIFIER_WORKERS = 4
+
+/** Resolve the tournament worker count from config: 0 = auto, 1..16 explicit.
+ *  Call-count identity is unaffected (calls = nComparisons × criteriaCount × K);
+ *  workers only change wall-clock time and account spread. */
+export function effectiveVerifierWorkers(explicit: number | undefined | null): number {
+  const value = Math.floor(Number(explicit ?? 0))
+  if (!Number.isFinite(value) || value <= 0) return AUTO_VERIFIER_WORKERS
+  return Math.min(16, value)
+}
+
+function safeHost(baseURL: string): string | null {
+  try { return new URL(baseURL).host } catch { return null }
+}
 
 export interface StartSelectionBody {
   sourceSessionId?: string
@@ -115,8 +147,17 @@ export interface StartSelectionBody {
   candidateOptions?: unknown
   candidateInstructions?: unknown
   useSourceSeed?: boolean
+  /** Explicit Git source workspace for a manual run. Requires an existing
+   *  directory that resolves to a Git root; candidates get isolated
+   *  worktrees under it. Without this (and without a source session) a real
+   *  run is refused rather than executed in the host process directory. */
+  sourceCwd?: string
   trigger?: 'manual' | 'autopilot'
   policy?: SelectionRecord['policy']
+  /** Task-kind lane decided at admission (autopilot sets policy.taskKind). */
+  taskKind?: string
+  /** Override the provisional margin gate for this run (0..0.5). */
+  marginThreshold?: number
 }
 
 export class SelectionApiError extends Error {
@@ -142,8 +183,8 @@ const MAX_SELECTION_TIMEOUT_MS = 600_000
 const DEFAULT_SELECTION_TIMEOUT_MS = 180_000
 
 /** Keep every verifier phase on the same finite request budget. */
-export function normalizeSelectionTimeoutMs(value: unknown): number {
-  const parsed = value === undefined ? DEFAULT_SELECTION_TIMEOUT_MS : Number(value)
+export function normalizeSelectionTimeoutMs(value: unknown, fallback?: number): number {
+  const parsed = value === undefined ? (fallback ?? DEFAULT_SELECTION_TIMEOUT_MS) : Number(value)
   if (!Number.isFinite(parsed)) return DEFAULT_SELECTION_TIMEOUT_MS
   return Math.max(MIN_SELECTION_TIMEOUT_MS, Math.min(MAX_SELECTION_TIMEOUT_MS, Math.floor(parsed)))
 }
@@ -462,6 +503,11 @@ export class SelectionHost {
       sourceCwd = runtime?.sourceCwd ?? parent.session.header?.cwd
       if (!problem) problem = problemFromEvents(parent.session.events)
       if (body.useSourceSeed !== false) seed = cutBalancedSeed(parent.session.events)
+    } else if (typeof body.sourceCwd === 'string' && body.sourceCwd.trim()) {
+      // Explicit operator-supplied Git workspace for a headless manual run.
+      // The workspace adapter still creates isolated worktrees inside it, so
+      // candidates never inherit the host process directory.
+      sourceCwd = body.sourceCwd.trim()
     }
     if (!problem) throw new SelectionApiError(400, 'problem-required', 'problem is required when the source session has no direct user task')
     const hasCandidateOptions = body.candidateOptions !== undefined && body.candidateOptions !== null
@@ -482,7 +528,22 @@ export class SelectionHost {
     const criteria = safeCriteria(body.criteria)
     const checks = safeChecks(body.checks)
     const verifierConf = this.deps.verifier()
-    const selectTimeoutMs = normalizeSelectionTimeoutMs(body.selectTimeoutMs)
+    const selectTimeoutMs = normalizeSelectionTimeoutMs(body.selectTimeoutMs, this.deps.selectTimeoutMsDefault?.())
+    // Isolation guard (2026-09-13 incident): without a resolvable Git source
+    // cwd the workspace adapter degrades to a blank directory and candidates
+    // then write through process.cwd(), i.e. the host process directory. That
+    // injected percent.js/percent.test.js into the installed @deepseek-ai/dsh
+    // package and crashed the runtime with a native Node assertion. Real
+    // candidate rollouts therefore require a Git source workspace; refuse
+    // loudly instead of spawning agents that can touch the host tree. Test
+    // harnesses inject their own factory/workspace manager and stay exempt.
+    const injectedHarness = this.deps.testing?.factory !== undefined || this.deps.testing?.workspaces !== undefined
+    if (!sourceCwd && !injectedHarness) {
+      throw new SelectionApiError(400, 'source-cwd-required', 'candidate selection requires a resolvable Git source session or workspace: without it candidates run in the host process directory and can overwrite host files')
+    }
+    const marginThreshold = body.marginThreshold === undefined
+      ? (this.deps.marginThresholdDefault?.() ?? PROVISIONAL_MARGIN_THRESHOLD)
+      : Math.max(0, Math.min(0.5, Number(body.marginThreshold)))
     const key = this.deps.resolveKey ? await this.deps.resolveKey(verifierConf.apiKeyEnv) : undefined
     if (!key) throw new SelectionApiError(400, 'missing-api-key', 'verifier credential is not configured: ' + verifierConf.apiKeyEnv)
 
@@ -521,7 +582,16 @@ export class SelectionHost {
         parent: parent as never,
         agentOptions: sharedRoute ?? {},
         agentPreset: body.agentPreset,
-        sandboxMode: body.trigger === 'autopilot' ? 'workspace-write' : undefined,
+        // Autopilot candidates need to run real verification commands (e.g.
+        // `node --test`), which spawn child processes. `workspace-write`
+        // bundles approval=ask, while the child setup pins approval=never, so
+        // every escalation request was silently unpromptable and the candidate
+        // parked until candidate-timeout (2026-09-14: three candidates sat in
+        // ranking for 10+ minutes behind one pending escalation). Autopilot
+        // therefore uses the self-consistent full-access preset, whose
+        // approval policy is never. Operators who want to approve each
+        // escalation should run manual /select without this override.
+        sandboxMode: body.trigger === 'autopilot' ? 'danger-full-access' : undefined,
       })
     })()
     const runner = new SelectionRunner({
@@ -529,9 +599,43 @@ export class SelectionHost {
       workspaces,
       bridge: this.bridge(),
       preflight: (signal) => this.runVerifierPreflight(verifierConf, key, selectTimeoutMs, signal),
+      diffStat: this.deps.testing?.diffStat ?? gitDiffStat,
+      diffFull: this.deps.testing?.diffFull ?? gitDiffFull,
       sleep: testing.retrySleep,
       now: this.now,
     })
+    // F5/I.5 — capture the EFFECTIVE configuration at start: later
+    // build/reload/POST /config drift must never rewrite what actually ran.
+    const configSnapshot: Record<string, unknown> = {
+      trigger: body.trigger === 'autopilot' ? 'autopilot' : 'manual',
+      candidateCount,
+      candidateOptions: candidateOptions
+        ? candidateOptions.map((route) => ({ provider: route?.provider ?? null, model: route?.model ?? null }))
+        : [{ provider: sharedRoute?.provider ?? null, model: sharedRoute?.model ?? null, shared: true }],
+      nEvaluations: body.nEvaluations ?? this.deps.nEvaluationsDefault?.() ?? null,
+      pivots: body.pivots ?? this.deps.pivotsDefault?.() ?? null,
+      candidateTimeoutMs: normalizeCandidateTimeoutMs(body.candidateTimeoutMs, this.deps.candidateTimeoutMsDefault?.()),
+      selectTimeoutMs,
+      marginThreshold,
+      verifierModel: verifierConf.model,
+      verifierEffort: verifierConf.effort ?? null,
+      verifierBaseURLHost: safeHost(verifierConf.baseURL),
+      taskKind: body.taskKind ?? body.policy?.taskKind ?? null,
+      checksConfigured: checks ? checks.map((c) => c.name) : null,
+      sourceCwd: sourceCwd ?? null,
+    }
+    // I.5: source attribution for the audit pack. The HEAD pins the source
+    // repo state at start; the model is read from the session header when the
+    // host exposes it (null stays honest when unknown).
+    let sourceHeadAtStart: string | null = null
+    let sourceModel: string | null = null
+    if (sourceCwd && body.trigger === 'autopilot') {
+      try { sourceHeadAtStart = (await gitRepoState(sourceCwd))?.head ?? null } catch { sourceHeadAtStart = null }
+    }
+    try {
+      const header = parent?.session.header as { model?: string } | undefined
+      sourceModel = header?.model ?? null
+    } catch { sourceModel = null }
     const runInput: SelectionRunInput = {
       problem,
       candidateCount,
@@ -551,6 +655,13 @@ export class SelectionHost {
       candidateInstructions,
       trigger: body.trigger === 'autopilot' ? 'autopilot' : 'manual',
       ...(body.policy ? { policy: body.policy } : {}),
+      taskKind: body.taskKind ?? body.policy?.taskKind,
+      marginThreshold,
+      recordSeed: {
+        configSnapshot,
+        sourceModel,
+        sourceHeadAtStart,
+      },
       progressGuard,
       onUpdate: (record) => { Object.assign(placeholder, record); this.emit() },
       candidateTimeoutMs: normalizeCandidateTimeoutMs(body.candidateTimeoutMs, this.deps.candidateTimeoutMsDefault?.()),
@@ -562,14 +673,15 @@ export class SelectionHost {
         apiKey: key,
         apiKeyEnv: verifierConf.apiKeyEnv,
         effort: verifierConf.effort,
-        maxWorkers: SELECTION_VERIFIER_MAX_WORKERS,
+        maxWorkers: effectiveVerifierWorkers(verifierConf.maxWorkers),
+        minIntervalMs: Math.max(0, Math.floor(verifierConf.minIntervalMs ?? 0)),
       },
       signal: controller.signal,
     }
     const run = (async () => {
       try {
-        const { record, winner } = await runner.run(runInput)
-        await this.finishRun(placeholder, record, winner ?? undefined)
+        const { record, retained, artifacts } = await runner.run(runInput)
+        await this.finishRun(placeholder, record, retained ?? undefined, artifacts)
       } catch (error) {
         const failed: SelectionRecord = {
           ...placeholder,
@@ -584,26 +696,31 @@ export class SelectionHost {
     return { ...placeholder }
   }
 
-  private async finishRun(placeholder: SelectionRecord, record: SelectionRecord, winner: { handle: SelectionAgentHandle } | undefined): Promise<void> {
+  private async finishRun(placeholder: SelectionRecord, record: SelectionRecord, retained: { handle: SelectionAgentHandle } | undefined, artifacts?: SelectionRunResult['artifacts']): Promise<void> {
     const idx = this.selections.indexOf(placeholder)
     if (idx >= 0) this.selections[idx] = record
     else this.selections.unshift(record)
-    if (winner) {
-      if (record.trigger === 'autopilot') this.winners.set(record.selectionId, winner.handle)
+    if (retained) {
+      if (record.trigger === 'autopilot') this.winners.set(record.selectionId, retained.handle)
       else {
-        try { await winner.handle.dispose() } catch { this.winners.set(record.selectionId, winner.handle) }
+        try { await retained.handle.dispose() } catch { this.winners.set(record.selectionId, retained.handle) }
       }
     }
     if (this.active?.selectionId === record.selectionId) this.active = null
     if (this.selectionsFile) this.persist(record)
+    this.writeArtifact(record, artifacts)
     this.emit()
     if (record.trigger !== 'autopilot' && this.deps.notify) {
       try { this.deps.notify(record) } catch { /* notices must never disturb accounting */ }
     }
   }
 
-  /** Abort the in-flight selection (no-op for finished ones). */
+  /** Abort the in-flight selection (no-op for finished ones). A record that
+   *  already settled answers false even if the active slot is mid-clear, so a
+   *  late cancel can never resurrect a terminal run. */
   cancel(selectionId: string): boolean {
+    const record = this.selections.find((s) => s.selectionId === selectionId)
+    if (record && record.status !== 'running') return false
     if (this.active?.selectionId !== selectionId) return false
     this.active.controller.abort()
     this.emit()
@@ -646,18 +763,23 @@ export class SelectionHost {
     return 'released'
   }
 
-  /** Destroy the winner outright. Each operation is idempotent; discardedAt is
-   *  durable only after handle, workspace, and session journal all settled. */
+  /** Destroy the retained candidate outright (winner OR fallback). Each
+   *  operation is idempotent; discardedAt is durable only after handle,
+   *  workspace, session journal, and the audit pack have all settled. */
   async discardWinner(selectionId: string): Promise<boolean> {
     const record = this.selections.find((s) => s.selectionId === selectionId)
-    if (!record?.winner || record.winner.discardedAt !== undefined) return false
+    const slot = record ? (record.winner ?? record.fallback) : undefined
+    if (!record || !slot || slot.discardedAt !== undefined) return false
     await this.releaseWinner(selectionId)
     const manager = this.deps.testing?.workspaces
       ?? (this.workspaceManager ??= new IsolatedWorkspaceManager(this.deps.workspaceRoot ?? defaultWorkspaceRoot()))
-    await manager.remove(record.winner.workspace)
-    await manager.purgeSessionRecord?.(record.winner.workspace)
-    record.winner.discardedAt = this.now()
+    await manager.remove(slot.workspace)
+    await manager.purgeSessionRecord?.(slot.workspace)
+    slot.discardedAt = this.now()
     if (this.selectionsFile) this.persist(record)
+    // Audit pack is rewritten AFTER the record update so post-audit fields
+    // (delivery, discardedAt) are captured before any restart loses them.
+    this.writeArtifact(record)
     this.emit()
     return true
   }
@@ -679,6 +801,16 @@ export class SelectionHost {
     } catch { /* observability must never break selection */ }
   }
 
+  /** Persist a settled record again after an out-of-band mutation (relay
+   *  timestamps, delivery audit): the ledger line wins by recency on reload,
+   *  and the audit pack's record.json re-reads from the same object. */
+  pubRecord(record: SelectionRecord): void {
+    if (!this.selections.includes(record)) return
+    if (this.selectionsFile) this.persist(record)
+    this.writeArtifact(record)
+    this.emit()
+  }
+
   private persist(record: SelectionRecord): void {
     const file = this.selectionsFile
     if (!file) return
@@ -689,6 +821,42 @@ export class SelectionHost {
       }
       appendFileSync(file, JSON.stringify(record) + String.fromCharCode(10))
     } catch { /* observability must never break selection */ }
+  }
+
+  /** Audit pack (ruling I.5/G, F6): one directory per selection, written at
+   *  settle BEFORE any workspace cleanup can free the evidence it holds —
+   *  record.json plus raw per-candidate materials. discard rewrites only the
+   *  record so settlement attribution stays immutable. */
+  private artifactDir(): string | null {
+    return this.deps.artifactsDir ?? null
+  }
+
+  private writeArtifact(record: SelectionRecord, artifacts?: SelectionRunResult['artifacts']): void {
+    const dir = this.artifactDir()
+    if (!dir) return
+    try {
+      const selDir = path.join(dir, record.selectionId)
+      mkdirSync(path.join(selDir, 'traces'), { recursive: true })
+      mkdirSync(path.join(selDir, 'diffs'), { recursive: true })
+      writeFileSync(path.join(selDir, 'record.json'), JSON.stringify({ artifactWrittenAt: this.now(), record }, null, 1) + String.fromCharCode(10))
+      if (artifacts) {
+        for (let i = 0; i < artifacts.traces.length; i += 1) {
+          const trace = artifacts.traces[i]
+          if (typeof trace === 'string' && trace) {
+            writeFileSync(path.join(selDir, 'traces', 'c' + i + '.txt'), trace)
+          }
+        }
+        for (let i = 0; i < artifacts.diffPatches.length; i += 1) {
+          const d = artifacts.diffPatches[i]
+          if (d) {
+            writeFileSync(
+              path.join(selDir, 'diffs', 'c' + i + '.patch'),
+              d.patch + String.fromCharCode(10) + '# truncated=' + d.truncated + '; untracked=' + (d.untrackedFiles.join(' ') || 'none') + String.fromCharCode(10),
+            )
+          }
+        }
+      }
+    } catch { /* audit persistence is observability, never fatal */ }
   }
 
   async dispose(): Promise<void> {

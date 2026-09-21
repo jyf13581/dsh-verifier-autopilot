@@ -70,6 +70,99 @@ _fgr._find_tag_logprobs = _find_tag_logprobs_tolerant
 
 MAX_MSG = 500
 
+# --- relay account-pool resilience -------------------------------------------
+# The operator's relay (chat.holisthoom.top) fronts a POOL of upstream NVIDIA
+# accounts and assigns one PER REQUEST round-robin. Two consequences:
+#   * concurrency spreads calls across independent accounts — one rate-limited
+#     account stalls only its own call (max_workers > 1);
+#   * a 429 on one call is recovered by an immediate small backoff retry: the
+#     round-robin has already advanced, so the retry lands on a DIFFERENT
+#     account instead of waiting for the stuck one to recover.
+# _ResilientClient wraps the OpenAI client for exactly this per-call behaviour
+# (bounded retries + optional dispatch spacing) without touching the library.
+
+import threading as _threading
+import time as _time
+
+
+def _sleep_ms(ms: float) -> None:
+    _time.sleep(max(0.0, ms) / 1000.0)
+
+
+def _is_rate_limited(exc: BaseException) -> bool:
+    """429 detection that works with real openai errors and test fakes."""
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status == 429:
+        return True
+    try:
+        import openai as _openai
+        if isinstance(exc, _openai.RateLimitError):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+class _ResilientClient:
+    """Drop-in wrapper: client.chat.completions.create gains bounded per-call
+    429 retries with small backoffs, plus an optional min-interval dispatch
+    smoother (token bucket). Unknown attributes delegate to the base client."""
+
+    def __init__(self, base, min_interval_ms: int = 0, call_retries: int = 2):
+        self._base = base
+        self._min_interval_ms = max(0, int(min_interval_ms))
+        self._call_retries = max(0, min(5, int(call_retries)))
+        self._lock = _threading.Lock()
+        self._last_dispatch = 0.0
+        self.chat = _ResilientChat(self)
+
+    def __getattr__(self, name):
+        # Instance attributes (e.g. the _llm_verifier_deepseek flag) resolve
+        # normally; everything else delegates to the wrapped client.
+        return getattr(self.__dict__["_base"], name)
+
+    def _pace_dispatch(self) -> None:
+        """Token bucket: serialise dispatches so they land >= min_interval_ms
+        apart (self-inflicted bursts are a common rate-limit trigger)."""
+        if self._min_interval_ms <= 0:
+            return
+        while True:
+            with self._lock:
+                now = _time.monotonic()
+                earliest = self._last_dispatch + self._min_interval_ms / 1000.0
+                if now >= earliest:
+                    self._last_dispatch = now
+                    return
+                wait = earliest - now
+            _time.sleep(min(wait, 0.25))
+
+    def create_completion(self, **kwargs):
+        self._pace_dispatch()
+        attempts = self._call_retries + 1
+        for attempt in range(attempts):
+            try:
+                return self._base.chat.completions.create(**kwargs)
+            except Exception as exc:
+                if attempt + 1 >= attempts or not _is_rate_limited(exc):
+                    raise
+                # Round-robin has moved on: retrying re-enters the relay on a
+                # different account. Small, fixed backoffs keep it bounded.
+                _sleep_ms(300.0 if attempt == 0 else 900.0)
+
+
+class _ResilientChat:
+    def __init__(self, owner: "_ResilientClient"):
+        self._owner = owner
+        self.completions = _ResilientCompletions(owner)
+
+
+class _ResilientCompletions:
+    def __init__(self, owner: "_ResilientClient"):
+        self._owner = owner
+
+    def create(self, **kwargs):
+        return self._owner.create_completion(**kwargs)
+
 # Verifier thinking strength ('思考强度'). A request may pin it via its
 # per-request "effort" field; absent means the process env decides. The
 # plugin default is "max" (plugin-side config default), so this module-level
@@ -157,6 +250,14 @@ def _validate(req: Dict[str, Any]) -> Dict[str, Any]:
              (isinstance(effort, str) and effort in EFFORT_LEVELS),
              "effort must be null or one of off|low|high|max")
     v["effort"] = effort
+    mim = req.get("min_interval_ms", 0)
+    _require(isinstance(mim, int) and not isinstance(mim, bool) and mim >= 0,
+             "min_interval_ms must be an integer >= 0")
+    v["min_interval_ms"] = mim
+    cr = req.get("call_retries", 2)
+    _require(isinstance(cr, int) and not isinstance(cr, bool) and 0 <= cr <= 5,
+             "call_retries must be an integer in [0, 5]")
+    v["call_retries"] = cr
     return v
 
 
@@ -241,6 +342,12 @@ def _handle_select(req_id: Optional[str], req: Dict[str, Any]) -> None:
         # prefill; the deepseek path reads sampled tag distributions and
         # RAISES when score-token logprobs are missing (no silent 0.5).
         client._llm_verifier_deepseek = True  # type: ignore[attr-defined]
+        # Relay account-pool execution mode (see _ResilientClient): bounded
+        # per-call 429 retries (each retry lands on the round-robin's NEXT
+        # account) and an optional dispatch smoother. Off when both are 0.
+        if v["min_interval_ms"] > 0 or v["call_retries"] > 0:
+            client = _ResilientClient(client, v["min_interval_ms"],
+                                      v["call_retries"])
         # The library's tournament re-reads the score map through its cache
         # file across ring/pivot phases; select(cache=None) silently degrades
         # ring accumulation (observed: exact 0.5 ties). A per-run temp cache is

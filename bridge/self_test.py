@@ -165,6 +165,83 @@ def main():
                       "ra=%.4f rb=%.4f (want ra>0.9, rb<0.1)" % (ra, rb)))
     except Exception as exc:
         gates.append(("mojibake_expectation", False, repr(exc)))
+    # (h) relay account-pool resilience: _ResilientClient per-call 429 retry,
+    # bounded exhaustion, non-429 passthrough, dispatch smoothing, and
+    # attribute delegation — fully offline against a fake base client.
+    try:
+        import time as _time
+        import llm_verifier_sidecar as _sc  # already importable per gate (g)
+
+        class _RateLimited(Exception):
+            status_code = 429
+
+        class _FakeBase:
+            def __init__(self, fail_first, exc=None):
+                self.calls = 0
+                self.started = []
+                self.fail_first = fail_first
+                self.exc = exc
+                self.timeout = 30  # delegation probe attribute
+                outer = self
+
+                class _Completions:
+                    def create(self, **kwargs):
+                        outer.calls += 1
+                        outer.started.append(_time.monotonic())
+                        if outer.calls <= outer.fail_first:
+                            raise outer.exc or _RateLimited("upstream 429")
+                        return "resp-%d" % outer.calls
+
+                class _Chat:
+                    completions = _Completions()
+
+                self.chat = _Chat()
+
+        def _wrap(base, **kw):
+            return _sc._ResilientClient(base, **kw)
+
+        # h1: two 429s then success — retry re-enters the round-robin (new
+        # account), so the third attempt lands.
+        base = _FakeBase(fail_first=2)
+        out = _wrap(base, call_retries=2).chat.completions.create(model="m")
+        h1 = out == "resp-3" and base.calls == 3
+
+        # h2: retries exhausted -> the 429 surfaces to the existing taxonomy.
+        base = _FakeBase(fail_first=99)
+        try:
+            _wrap(base, call_retries=1).chat.completions.create(model="m")
+            h2 = False
+        except _RateLimited:
+            h2 = base.calls == 2
+
+        # h3: non-429 failures are never retried per-call.
+        base = _FakeBase(fail_first=1, exc=ValueError("bad request"))
+        try:
+            _wrap(base, call_retries=3).chat.completions.create(model="m")
+            h3 = False
+        except ValueError:
+            h3 = base.calls == 1
+
+        # h4: dispatch smoothing — three calls spaced >= min_interval apart.
+        base = _FakeBase(fail_first=0)
+        wrap = _wrap(base, min_interval_ms=120, call_retries=0)
+        wrap.chat.completions.create(model="m")
+        wrap.chat.completions.create(model="m")
+        wrap.chat.completions.create(model="m")
+        h4 = len(base.started) == 3 and (base.started[2] - base.started[0]) >= 0.2
+
+        # h5: attribute delegation + protocol flag survives the wrapper.
+        base = _FakeBase(fail_first=0)
+        wrap = _wrap(base)
+        wrap._llm_verifier_deepseek = True
+        h5 = wrap.timeout == 30 and getattr(wrap, "_llm_verifier_deepseek", False) is True
+
+        gates.append(("resilient_client",
+                      h1 and h2 and h3 and h4 and h5,
+                      "retry=%s exhausted=%s passthrough=%s smooth=%s delegate=%s"
+                      % (h1, h2, h3, h4, h5)))
+    except Exception as exc:
+        gates.append(("resilient_client", False, repr(exc)))
     ok = True
     for name, passed, note in gates:
         print("%s %s  %s" % ("PASS" if passed else "FAIL", name, note))

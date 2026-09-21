@@ -45,6 +45,8 @@ Response: see [Health Response](#health-response).
   "cache": null,
   "on_error": "tie"|"raise",
   "max_workers": <integer>|null,
+  "min_interval_ms": <integer >=0>,
+  "call_retries": <integer 0..5>,
   "progress": false
 }
 ```
@@ -62,7 +64,9 @@ Response: see [Health Response](#health-response).
 - `api_key_env`: Name of the environment variable that holds the API key.
 - `cache`: Must be null in requests. The sidecar still uses a per-run temp cache file internally: `select()` re-reads its score map through the cache across ring/pivot phases, so a null cache silently degrades ring aggregation (measured: exact 0.5 ties at pivots=0). The temp file is deleted after the run; nothing persists across requests, so model/endpoint cache-key obliviousness cannot cross-contaminate.
 - `on_error`: How to handle errors during comparisons: "tie" (treat as tie) or "raise" (propagate error).
-- `max_workers`: Maximum number of worker threads (null for default).
+- `max_workers`: Maximum number of worker threads (null for default). The operator's relay assigns accounts PER REQUEST round-robin, so worker counts above 1 spread concurrent verifier calls across independent upstream accounts — one rate-limited account stalls only its own call. The call-count identity (`calls = n_comparisons * len(criteria) * n_evaluations`) is unaffected; workers only change wall-clock time.
+- `min_interval_ms`: Token-bucket dispatch spacing inside the tournament (default 0 = off). Serialises request dispatches so a concurrent fan-out cannot self-inflict a rate-limit burst.
+- `call_retries`: Bounded per-call retries on HTTP 429 (default 2, range 0..5). Each retry re-enters the relay's round-robin, i.e. lands on a DIFFERENT upstream account; backoffs are small and fixed (300ms, 900ms). Non-429 failures are never retried per-call — they keep the existing Node-side retry taxonomy.
 - `progress`: Must be false (progress reporting not implemented).
 
 ### Progress Request
