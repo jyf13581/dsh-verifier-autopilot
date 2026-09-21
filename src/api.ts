@@ -5,11 +5,12 @@
  */
 
 import {
-  buildVerifierPrompt, normalizeBaseUrl, resolveKey, verifyFive, verifyRoute,
+  buildVerifierPrompt, verifyFive, verifyRoute,
 } from './verifier.js'
 import { SelectionApiError } from './selection/host.js'
 import { VERIFICATION_HISTORY_LIMIT, VerifierHost, VerifyAbortedError } from './host.js'
 import { API_PREFIX, type HeaderValue, type WebRequest, type WebResponse, type WebRoute } from './protocol.js'
+import { normalizeBaseUrl, resolveKey } from './util.js'
 
 export function json(res: WebResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })

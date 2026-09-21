@@ -9,7 +9,7 @@ import { createUserMessage, boundContextSummary, type UserMessage } from '@deeps
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import {
-  buildVerifierPrompt, decideFeedback, noDefectLaneCount, resolveKey, verifyFive,
+  buildVerifierPrompt, decideFeedback, noDefectLaneCount, verifyFive,
   type AggregateResult,
 } from './verifier.js'
 import { VerificationCoordinator, type ScheduleEntry, type RunContext } from './coordinator.js'
@@ -21,6 +21,7 @@ import {
 } from './evidence.js'
 import { appendJsonlLedger, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from './ledger.js'
 import type { StateResponse, VerificationRecord, WebRoute } from './protocol.js'
+import { resolveKey, type Credentials } from './util.js'
 import { SelectionHost } from './selection/host.js'
 import { runChecks } from './selection/checks.js'
 import { evaluateDelivery } from './selection/candidates.js'
@@ -28,7 +29,7 @@ import { buildAutopilotContext, buildAutopilotRelay, planAutopilotTask } from '.
 import { gitRepoState, resolveAutopilotSourceCwd } from './selection/live.js'
 import { createModelProber, type ModelProber } from './selection/probe.js'
 
-export type Credentials = { resolve?: (ref: string) => Promise<{ value?: string } | undefined> }
+export type { Credentials } from './util.js'
 export type Agent = { id: string; session: { events: readonly EventRecord[]; header?: { cwd?: string; parentSession?: string } }; ctx: Context; followup: (message: UserMessage) => void | Promise<void> }
 export type { WebRoute } from './protocol.js'
 export type HostContext = Context & { webServer: { register(route: WebRoute): () => void }; credentials?: Credentials; agents?: { list(): Agent[]; get(id: string): Agent | undefined }; llm?: { listModels(provider: string): Promise<Array<{ id: string; provider?: string }>> } }

@@ -25,6 +25,7 @@ export { API_RATE_LIMITS, apiRoutes, createRateLimiter, json, readJson } from '.
 export { API_PREFIX, MODEL_OPTIONS } from './protocol.js'
 export type { ApiErrorResponse, ConfigRequest, ConfigResponse, ModelOption, SelectionIdRequest, SelectionItemResponse, SelectionSnapshot, SelectionView, SelectionsListResponse, State, StateResponse, VerificationRecord, VerifyRequest, VerifyResponse, WebRequest, WebResponse } from './protocol.js'
 export type { RateLimiter } from './api.js'
+export { normalizeBaseUrl, redactSecrets, resolveKey } from './util.js'
 
 
 export const name = '@dsh-external/dsh-verifier-autopilot'
