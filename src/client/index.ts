@@ -6,7 +6,7 @@ type SettingsScope = { getSnapshot(): { value?: SettingsValue; status?: string }
 type SettingsBinder = { bind(spec: { namespace: string }): SettingsScope }
 type ClientContext = { slots: SlotsService; get(name: string): unknown; settingsScope?: SettingsBinder }
 type LaneView = { route?: number; ok?: boolean; score?: number; lane?: string; finding?: string; error?: string; errorCode?: string; retried?: boolean; scoreSource?: string; durationMs?: number }
-type State = { config?: { enabled?: boolean; autoFeedback?: boolean; routes?: number; model?: string; maxTokens?: number; verifierEffort?: 'off' | 'low' | 'high' | 'max'; selectionMode?: 'off' | 'auto' | 'always'; selectionModelStrategy?: 'quality-first' | 'exploration'; selectionProvider?: string; selectionModels?: string; selectionStandardCandidates?: number; selectionDeepCandidates?: number; selectionEvaluations?: number; selectionPivots?: number }; records?: Array<{ turn: number; status: string; skippedReason?: string; citationAudit?: { defectFindings?: number; defectFindingsWithoutCitation?: number; findingsCitingUnknownIds?: number; findingsCitingHistoricalVerdict?: number; findingsWithoutIndependentCitation?: number }; feedbackSent?: boolean; feedbackSuppressed?: { reason?: string; defectFindings?: number; independentFindings?: number }; error?: string; feedbackError?: string; suppressedFeedback?: { median?: number; noDefectLanes?: number; validLanes?: number }; aggregate?: { score?: number; median?: number; dispersion?: number; confidence?: string; valid?: unknown[]; results?: LaneView[] } }> }
+type State = { config?: { enabled?: boolean; autoFeedback?: boolean; routes?: number; model?: string; maxTokens?: number; verifierEffort?: 'off' | 'low' | 'high' | 'max'; selectionMode?: 'off' | 'auto' | 'always'; selectionModelStrategy?: 'quality-first' | 'exploration'; selectionProvider?: string; selectionModels?: string; selectionStandardCandidates?: number; selectionDeepCandidates?: number; selectionEvaluations?: number; selectionPivots?: number; selectionMarginThreshold?: number; selectionVerifierWorkers?: number; verifierMinIntervalMs?: number; verifierSmallModel?: string }; records?: Array<{ turn: number; status: string; skippedReason?: string; citationAudit?: { defectFindings?: number; defectFindingsWithoutCitation?: number; findingsCitingUnknownIds?: number; findingsCitingHistoricalVerdict?: number; findingsWithoutIndependentCitation?: number }; feedbackSent?: boolean; feedbackSuppressed?: { reason?: string; defectFindings?: number; independentFindings?: number }; error?: string; feedbackError?: string; suppressedFeedback?: { median?: number; noDefectLanes?: number; validLanes?: number }; aggregate?: { score?: number; median?: number; dispersion?: number; confidence?: string; valid?: unknown[]; results?: LaneView[] } }> }
 
 type ReactApi = {
   createElement: (type: any, props?: Record<string, any> | null, ...children: any[]) => any
@@ -22,9 +22,11 @@ const panelStyle = { padding: 12, display: 'grid', gap: 8, fontSize: 12, borderT
 const rowStyle = { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }
 
 /** lane 模型选项（每选项自带完整端点三元组：model + baseURL + apiKeyEnv）。
- *  门禁实测定论（HANDOFF §7.2）：
- *  - minimaxai/minimax-m3（relay）：当前免费 Kimi relay 的严格门禁可用默认。
+ *  门禁实测定论（HANDOFF §7.2，2026-09-13 复核）：
+ *  - nvidia/nemotron-3-super-120b-a12b（relay）：默认。严格协议实测通过，
+ *    HTTP 200 + score tags + logprobs，单次约 6s。
  *  - kimi-k3（relay）：可选但 max 强度下延迟不稳定。
+ *  - z-ai/glm-5.3-flash（relay）：可用但 effort=max 思考耗时长，易撞超时，不作默认。
  *  - deepseek-chat（官方 api.deepseek.com）：legacy lane 备选，需单独配置官方 key。
  *  - deepseek-v4-flash（官方）：技术上过门但 reasoning 吃 4096 预算，
  *    8192 时 51s/次——生产 lane 不实用。
@@ -32,10 +34,13 @@ const rowStyle = { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wra
 const RELAY = { baseURL: 'https://chat.holisthoom.top/v1', apiKeyEnv: 'KIMI_API_KEY' }
 const DEEPSEEK_OFFICIAL = { baseURL: 'https://api.deepseek.com', apiKeyEnv: 'DEEPSEEK_API_KEY' }
 const MODEL_OPTIONS = [
-  { id: 'minimaxai/minimax-m3', ...RELAY, note: '推荐：免费 Kimi relay 当前实测严格门禁可用' },
-  { id: 'kimi-k3', ...RELAY, note: '不推荐：免费 relay 在 max 强度下常超时' },
+  { id: 'nvidia/nemotron-3-super-120b-a12b', ...RELAY, note: '默认：严格协议实测通过（~6s，带 logprobs）' },
+  { id: 'z-ai/glm-5.3-flash', ...RELAY, note: '不推荐：effort=max 时思考耗时长，容易撞 lane 超时' },
+  { id: 'kimi-k3', ...RELAY, note: '可用：max 强度下延迟不稳定' },
+  { id: 'moonshotai/kimi-k3', ...RELAY, note: '可用：kimi-k3 的别名路由' },
+  { id: 'nemotron-3-ultra-550b-a55b', ...RELAY, note: '可用：~3s，更强但慢' },
+  { id: 'minimaxai/minimax-m3', ...RELAY, note: '已下线：2026-09-09 relay 返回 410（End-of-life）' },
   { id: 'deepseek-chat', ...DEEPSEEK_OFFICIAL, note: '备选：官方 API，需单独配置 DEEPSEEK_API_KEY' },
-  { id: 'nvidia/nemotron-3-super-120b-a12b', ...RELAY, note: '备选：免费 Kimi relay，可用但质量未充分验证' },
   { id: 'deepseek-v4-flash', ...DEEPSEEK_OFFICIAL, note: '不推荐：reasoning 吞噬 4096 预算（8192 时 51s/次）' },
   { id: 'step-3.7-flash', ...RELAY, note: '不推荐：长提示推理超 180s 会超时' },
 ]
@@ -120,6 +125,14 @@ type SelectionView = {
   policy?: { depth?: string; modelStrategy?: 'quality-first' | 'exploration'; candidateCount?: number; nEvaluations?: number; pivots?: number; verifierEffort?: string; contextChars?: number; models?: string[] }
   candidates?: Array<{ index: number; status: string; workspace: string; agentOptions?: { model?: string }; error?: string; eliminatedBy?: string[] }>
   winner?: { index: number; sessionId: string | null; workspace: string; discardedAt?: number }
+  fallback?: { index: number; sessionId: string | null; workspace: string; discardedAt?: number }
+  outcome?: 'ranked_winner' | 'objective_only_result' | 'single_candidate_fallback' | 'insufficient_evidence' | 'abstain' | 'verifier_unavailable'
+  delivery?: { delivered?: 'yes' | 'no' | 'unknown' }
+  noSearchSpace?: boolean
+  llmOnly?: boolean
+  margin?: number
+  marginThreshold?: number
+  marginProvisional?: boolean
   scores?: Array<number | null>
   ranking?: number[]
   nComparisons?: number
@@ -200,20 +213,25 @@ function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsSco
       ? (policy.depth ?? 'standard') + ' · ' + (policy.modelStrategy ?? 'legacy') + ' · N=' + (policy.candidateCount ?? '?') + ' · K=' + (policy.nEvaluations ?? '?') + (policy.pivots === undefined ? '' : ' · P=' + policy.pivots) + (policy.verifierEffort ? ' · 强度=' + policy.verifierEffort : '') + ' · ' + (policy.models ?? []).join(' / ')
       : (selection.trigger === 'manual' ? '诊断手动运行' : '')
     const winner = selection.winner
+    const fallback = selection.fallback
+    const slot = winner ?? fallback
     return h('article', { key: selection.selectionId, style: { display: 'grid', gap: 5, padding: '9px 0', borderTop: '1px solid var(--border-color, #ddd)' } },
       h('div', { style: { ...rowStyle, justifyContent: 'space-between' } },
         h('strong', { style: { fontSize: 12 } }, selection.selectionId.slice(0, 12) + ' · ' + selection.status),
         h('span', null, selection.stage ? (STAGE_LABELS[selection.stage] ?? selection.stage) : ''),
         selection.status === 'running' ? h('button', { type: 'button', disabled: saving, onClick: () => { void post('/selections/cancel', { selectionId: selection.selectionId }).then(refresh) } }, '取消') : null),
+      selection.outcome ? h('div', { style: { color: selection.outcome === 'ranked_winner' ? 'var(--ok-color, #067647)' : 'var(--muted-color, #666)' } }, '结果 · ' + selection.outcome + (selection.noSearchSpace ? '（无搜索空间，已去重）' : '') + (selection.llmOnly ? '（仅 LLM 信号）' : '')) : null,
+      selection.margin !== undefined ? h('div', { style: { color: 'var(--muted-color, #666)' } }, 'margin ' + selection.margin.toFixed(4) + ' / 阈值 ' + (selection.marginThreshold ?? '?') + (selection.marginProvisional ? '（临时未校准）' : '')) : null,
       policyLine ? h('div', { style: { color: 'var(--muted-color, #666)' } }, policyLine) : null,
       candidateLine ? h('pre', { style: { margin: 0, whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 11 } }, candidateLine) : null,
       typeof selection.nComparisons === 'number' ? h('div', null, selection.nComparisons + ' 次比较' + (usageLine ? ' · ' + usageLine : '')) : null,
       (selection.rankingAttempts ?? 0) > 1 ? h('div', { style: { color: 'var(--muted-color, #666)' } }, '验证器尝试 ' + selection.rankingAttempts + ' 次 · 瞬时错误重试 ' + (selection.rankingRetryErrors?.length ?? 0) + ' 次') : null,
-      selection.winnerBasis ? h('div', { style: { color: 'var(--muted-color, #666)' } }, '胜者依据 · ' + selection.winnerBasis) : null,
+      selection.winnerBasis ? h('div', { style: { color: 'var(--muted-color, #666)' } }, '胜者依据 · ' + selection.winnerBasis + (selection.outcome && selection.outcome !== 'ranked_winner' ? '（非选优）' : '')) : null,
+      selection.outcome ? h('div', { style: { color: 'var(--muted-color, #666)' } }, '审计包 · .data/selection-artifacts/' + selection.selectionId + '/（record.json + traces + diffs）' + (selection.delivery ? ' · 交付审计 delivered=' + selection.delivery.delivered : '')) : null,
       selection.error ? h('div', { style: { color: 'var(--danger-color, #b42318)' } }, selection.error) : null,
-      winner ? h('div', { style: rowStyle },
-        h('span', null, winner.discardedAt ? 'winner c' + winner.index + ' 已清理' : 'winner c' + winner.index + ' · ' + winner.workspace),
-        !winner.discardedAt && selection.trigger !== 'autopilot' ? h('button', { type: 'button', onClick: () => { void post('/selections/discard', { selectionId: selection.selectionId }).then(refresh) } }, '清理') : null,
+      slot ? h('div', { style: rowStyle },
+        h('span', null, slot.discardedAt ? (winner ? 'winner' : 'fallback') + ' c' + slot.index + ' 已清理' : (winner ? 'winner' : 'fallback（未经候选间比较）') + ' c' + slot.index + ' · ' + slot.workspace),
+        !slot.discardedAt && selection.trigger !== 'autopilot' ? h('button', { type: 'button', onClick: () => { void post('/selections/discard', { selectionId: selection.selectionId }).then(refresh) } }, '清理') : null,
       ) : null,
     )
   })
@@ -246,6 +264,12 @@ function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsSco
     h('div', { style: rowStyle },
       h('span', null, '思考强度'),
       h(EffortSelect, { value: config?.verifierEffort ?? 'low', disabled: saving, onCommit: (v: 'off' | 'low' | 'high' | 'max') => { void saveConfig('verifierEffort', v) } }),
+      h('span', null, '噪声阈值'),
+      h('input', {
+        type: 'number', min: 0, max: 0.5, step: 0.005, value: config?.selectionMarginThreshold ?? 0.03, disabled: saving, style: tinyInputStyle,
+        title: 'top-2 margin 噪声门限：低于它一律 abstain（0.03 = 校准首轮 C0 噪声上限的 2.2 倍，暂标 temporary）',
+        onChange: (ev: any) => { const v = Number(String(ev.target?.value ?? '')); if (Number.isFinite(v)) void saveConfig('selectionMarginThreshold', Math.max(0, Math.min(0.5, v))) },
+      }),
       h('span', null, 'provider'),
       h('input', {
         value: config?.selectionProvider ?? 'kimi', disabled: saving, style: tinyInputStyle, title: '候选 provider 名',
@@ -383,18 +407,25 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
     h('div', { style: rowStyle },
       h('span', null, '验证模型:'),
       h('select', {
-        value: state?.config?.model ?? 'minimaxai/minimax-m3',
+        value: MODEL_OPTIONS.some(option => option.id === state?.config?.model) ? (state?.config?.model ?? '') : '__custom__',
         disabled: saving,
         onChange: (ev: any) => {
           const next = String(ev.target.value ?? '')
-          if (!next) return
-          // Lane models carry their endpoint triple: model without its own
-          // baseURL/apiKeyEnv silently verifies against the WRONG backend.
+          if (!next || next === '__custom__') return
           const opt = MODEL_OPTIONS.find(o => o.id === next)
           void savePatch(opt ? { baseURL: opt.baseURL, apiKeyEnv: opt.apiKeyEnv, model: next } : { model: next })
         },
         style: { fontSize: 12 },
-      }, ...MODEL_OPTIONS.map(option => h('option', { key: option.id, value: option.id }, option.id))),
+      }, ...MODEL_OPTIONS.map(option => h('option', { key: option.id, value: option.id }, option.id)), h('option', { value: '__custom__' }, '自定义…')),
+      h('input', {
+        value: state?.config?.model ?? '', disabled: saving, style: wideInputStyle, maxLength: 200,
+        placeholder: '输入任意模型 ID', title: '自定义模型 ID；必须支持当前 Verifier 的标签/评分协议',
+        onBlur: (ev: any) => {
+          const next = String(ev.target.value ?? '').trim()
+          if (next && next !== state?.config?.model) void savePatch({ model: next })
+        },
+        onKeyDown: (ev: any) => { if (ev.key === 'Enter') ev.currentTarget.blur() },
+      }),
     ),
     h('small', null, MODEL_OPTIONS.find(option => option.id === state?.config?.model)?.note ?? '自定义模型：需自行确认 logprob/标签门禁'),
     h('div', { style: rowStyle },
@@ -403,7 +434,22 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
       h('span', null, '思考强度'),
       h(EffortSelect, { value: state?.config?.verifierEffort ?? 'low', disabled: saving, onCommit: (v: 'off' | 'low' | 'high' | 'max') => { void savePatch({ verifierEffort: v }) } }),
       h('span', null, '输出上限'),
-      h(NumberField, { value: state?.config?.maxTokens ?? 8192, min: 256, max: 8192, disabled: saving, title: '每路最大输出 token（思考会从该预算中扣除）', onCommit: (n: number) => { void savePatch({ maxTokens: n }) } })),
+      h(NumberField, { value: state?.config?.maxTokens ?? 64000, min: 256, max: 65536, disabled: saving, title: '每路最大输出 token（思考会从该预算中扣除）', onCommit: (n: number) => { void savePatch({ maxTokens: n }) } })),
+    h('div', { style: rowStyle },
+      h('span', null, '锦标赛并发'),
+      h(NumberField, { value: state?.config?.selectionVerifierWorkers ?? 0, min: 0, max: 16, disabled: saving, title: '排位锦标赛并发请求数（0=自动4）。中转站按请求轮询分号：并发请求摊到不同账号，单账号限速只卡它自己那一路；建议不超过号池大小', onCommit: (n: number) => { void savePatch({ selectionVerifierWorkers: n }) } }),
+      h('span', null, '发送平滑(ms)'),
+      h(NumberField, { value: state?.config?.verifierMinIntervalMs ?? 0, min: 0, max: 60000, disabled: saving, title: '验证请求发送的最小间隔（令牌桶平滑，0=关闭）。把并发摊匀，避免突发打满限额', onCommit: (n: number) => { void savePatch({ verifierMinIntervalMs: n }) } }),
+      h('span', null, '小模型'),
+      h('input', {
+        value: state?.config?.verifierSmallModel ?? '', disabled: saving, style: wideInputStyle, maxLength: 200,
+        placeholder: '留空=全部用主模型', title: '分层小模型：completion/evidence 这类机械 lane 改用它（如 nvidia/nemotron-3-ultra-550b-a55b）；难 lane 与锦标赛仍用主模型',
+        onBlur: (ev: any) => {
+          const next = String(ev.target.value ?? '').trim()
+          if (next !== (state?.config?.verifierSmallModel ?? '')) void savePatch({ verifierSmallModel: next })
+        },
+        onKeyDown: (ev: any) => { if (ev.key === 'Enter') ev.currentTarget.blur() },
+      })),
     h('div', { style: rowStyle },
       h('button', { type: 'button', disabled: busy || saving, onClick: () => { void verify() } }, busy ? '验证中...' : '验证当前会话'),
       h('span', null, props.sessionId ? '当前会话已选' : '无当前会话'),

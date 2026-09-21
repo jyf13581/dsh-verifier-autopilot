@@ -25,7 +25,17 @@ import { boundCandidateHandoff } from './autopilot.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
 
 export type CandidateStatus =
-  | 'created' | 'running' | 'finished' | 'failed' | 'eliminated' | 'winner' | 'loser'
+  | 'created' | 'running' | 'finished' | 'failed' | 'eliminated' | 'winner' | 'retained' | 'loser'
+
+/** Objective workspace-diff evidence collected after the rollout (ruling
+ *  I.5/J.4). Produced by an injected helper so this module stays pure. */
+export interface DiffStatLite {
+  files: number
+  insertions: number
+  deletions: number
+  untracked: number
+  fingerprint: string
+}
 
 export interface CandidateRecord {
   index: number
@@ -37,12 +47,34 @@ export interface CandidateRecord {
   error?: string
   eventCount?: number
   toolCalls?: number
+  /** Execution-class tool calls (meta/discovery tools excluded, ruling K.4-1). */
+  execToolCalls?: number
+  /** Worktree diff vs source HEAD; null when the workspace is not git. */
+  diffStat?: DiffStatLite | null
+  /** Objective-evidence tier: pass = caller checks all ok; none = no checks,
+   *  checks invalid, or never ran. A candidate eliminated by a genuine check
+   *  failure is recorded via eliminatedBy instead. */
+  objectiveEvidence?: 'pass' | 'none'
+  /** Every failing check was a shell interpreter error (B-10): the gate itself
+   *  malfunctioned, so the candidate survives as if no checks were given. */
+  checksInvalid?: boolean
   trajectoryChars?: number
   checks?: CheckResult[]
   eliminatedBy?: string[]
   /** Online progress samples when progressGuard was active. */
   progress?: Array<{ at: number; score: number }>
 }
+
+/** Ruling I.2 outcome state machine: exactly one value once the selection
+ *  settles. `winnerBasis` is narrowed for compatibility; consumers must read
+ *  `outcome` first. */
+export type SelectionOutcome =
+  | 'ranked_winner'             // margin above threshold; verifier preference
+  | 'objective_only_result'     // verifier absent; strict deterministic order
+  | 'single_candidate_fallback' // exactly one survivor; never compared
+  | 'insufficient_evidence'     // survivors produced no verifiable work
+  | 'abstain'                   // margin inside the (uncalibrated) noise band
+  | 'verifier_unavailable'      // ranking infrastructure failed after retries
 
 export interface SelectionRecord {
   selectionId: string
@@ -53,11 +85,19 @@ export interface SelectionRecord {
   error?: string
   trigger?: 'manual' | 'autopilot'
   stage?: 'workspace' | 'preflight' | 'rollout' | 'checks' | 'ranking' | 'settled'
-  policy?: { depth: 'standard' | 'deep'; modelStrategy?: 'quality-first' | 'exploration'; candidateCount: number; nEvaluations: number; contextChars: number; models: string[]; pivots?: number; verifierEffort?: string }
+  policy?: { depth: 'standard' | 'deep'; modelStrategy?: 'quality-first' | 'exploration'; candidateCount: number; nEvaluations: number; contextChars: number; models: string[]; pivots?: number; verifierEffort?: string; taskKind?: string; probes?: Record<string, boolean> }
+  /** Admission-time task type evidence lane (ruling I.3). */
+  taskKind?: string
+  outcome?: SelectionOutcome
   effectiveEvaluations?: number
   verificationPasses?: number
   candidates: CandidateRecord[]
+  /** Set ONLY for outcome=ranked_winner: a verifier preference cleared the
+   *  margin gate. Retained workspace/handle for the finalizer. */
   winner?: { index: number; sessionId: string | null; workspace: string; discardedAt?: number }
+  /** Retained survivor that is NOT a chosen-best claim: single-survivor or
+   *  objective-only / deduped results keep the workspace under this field. */
+  fallback?: { index: number; sessionId: string | null; workspace: string; discardedAt?: number }
   finalists?: Array<{ index: number; score: number | null; model?: string; handoff: string }>
   /** Per ORIGINAL candidate index; null for candidates that never reached select(). */
   scores?: Array<number | null>
@@ -68,9 +108,58 @@ export interface SelectionRecord {
   rankingAttempts?: number
   /** Sanitized transient failures that were retried before settlement. */
   rankingRetryErrors?: string[]
-  /** Evidence basis for the crowned candidate; never infer verifier evidence from a shortcut. */
+  /** Legacy compatibility basis; the authoritative state is `outcome`. */
   winnerBasis?: 'verifier' | 'objective-check-only' | 'single-candidate'
+  /** All survivors shared one diff fingerprint — deduped before the verifier
+   *  (ruling F3); the record is a fallback, never a ranking claim. */
+  noSearchSpace?: boolean
+  /** No candidate carried deterministic objective evidence (checks pass); any
+   *  ranking on this record was LLM-only. */
+  llmOnly?: boolean
+  /** Top-2 score margin and the gate it was judged against. */
+  margin?: number
+  marginThreshold?: number
+  marginCondition?: string
+  /** Threshold is provisional until the calibration experiment (ruling I.4). */
+  marginProvisional?: boolean
+  /** At least one candidate's checks were shell-level failures (B-10). */
+  checksUnreliable?: boolean
+  /** Effective config captured at start; survives config reloads (ruling F5). */
+  configSnapshot?: Record<string, unknown>
+  sourceModel?: string | null
+  sourceHeadAtStart?: string | null
+  /** Free-text note carrying an abstain/fallback reason for the ledger. */
+  note?: string
+  /**
+   * Source-integration post-audit (ruling G-4/I.5): executed at autopilot
+   * winner/fallback cleanup time. `delivered` is granted only when the audit
+   * observed integration evidence; un-audited stays `unknown` forever.
+   */
+  delivery?: {
+    audited: boolean
+    headBefore?: string | null
+    headAfter?: string | null
+    headChanged?: boolean | null
+    dirtyEntries?: number | null
+    /** Exit code of the configured post-audit test command, when it ran. */
+    postAuditTestExit?: number | null
+    delivered: 'yes' | 'no' | 'unknown'
+    note?: string
+  }
+  /** Lifecycle timestamps so relay/idle/discard timing questions (B-9) can be
+   *  answered from the ledger instead of guessed. */
+  timing?: { relayedAt?: number; auditedAt?: number }
   usage?: BridgeUsage
+  /** Count of criteria sent to the verifier for this ranking. Together with
+   *  nComparisons and effectiveEvaluations it pins the scheduler identity
+   *  (upstream fine_grained_reward: one API call per directed comparison per
+   *  (criterion, rep), no internal retries — on_error='raise' aborts):
+   *  usage.calls == nComparisons * criteriaCount * effectiveEvaluations. */
+  criteriaCount?: number
+  /** nComparisons * criteriaCount * effectiveEvaluations at ranking time.
+   *  A live usage.calls that deviates from this value is itself an anomaly
+   *  (legacy tie-swallow path, upstream scheduler change, or counter drift). */
+  expectedVerifierCalls?: number
   verifierModel?: string
 }
 
@@ -138,6 +227,12 @@ export interface SelectionRunnerDeps {
    *  (HANDOFF: unsupported provider must fail the selection fast, never mint
    *  five silent ties). Throwing fails the run as status 'failed'. */
   preflight?: (signal: AbortSignal | undefined) => Promise<void>
+  /** Objective diff evidence collector; absent → diff portion of the has-work
+   *  gate silently unavailable (tool-call evidence still applies). */
+  diffStat?: (cwd: string) => Promise<DiffStatLite | null>
+  /** Full patch capture for the audit pack (ruling I.5). Runs right after the
+   *  per-candidate accounting pass, before any workspace disposal. */
+  diffFull?: (cwd: string) => Promise<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null>
   /** Test seam for bounded verifier backoff; production uses abort-aware timers. */
   sleep?: RetrySleep
   now?: () => number
@@ -167,6 +262,15 @@ export interface SelectionRunInput {
   candidateInstructions?: readonly string[]
   trigger?: 'manual' | 'autopilot'
   policy?: SelectionRecord['policy']
+  /** Task-type evidence lane decided at admission (ruling I.3). Unknown is
+   *  treated as code-shaped whenever worktrees are involved. */
+  taskKind?: string
+  /** Provisional top-2 margin gate; below it the outcome is abstain, not a
+   *  verifier winner (ruling I.1/I.4). Recorded per run with its condition. */
+  marginThreshold?: number
+  /** Extra fields merged into the record at creation (config snapshot, source
+   *  attribution). Runner-controlled keys always win. */
+  recordSeed?: Partial<SelectionRecord>
   onUpdate?: (record: SelectionRecord) => void
   /** Opt-in online abandonment (see ProgressGuardOptions). */
   progressGuard?: ProgressGuardOptions
@@ -184,17 +288,56 @@ export interface SelectionRunInput {
     effort?: string
     onError?: 'tie' | 'raise'
     maxWorkers?: number | null
+    /** Token-bucket dispatch spacing (ms) inside the tournament sidecar; 0 = off. */
+    minIntervalMs?: number
   }
   signal?: AbortSignal
 }
 
 export interface SelectionRunResult {
   record: SelectionRecord
-  /** Transfer of ownership: the orchestrator never disposes the winner. */
-  winner?: { candidateIndex: number; sessionId: string; workspace: string; handle: SelectionAgentHandle }
+  /** Transfer of ownership: the orchestrator never disposes the retained
+   *  candidate. Present for a ranked winner OR a fallback survivor. */
+  retained?: { candidateIndex: number; sessionId: string; workspace: string; handle: SelectionAgentHandle }
+  /** Captured before loser workspaces were disposed: rendered trajectories and
+   *  full git patches per candidate index. Written to the audit pack
+   *  (.data/selection-artifacts/<id>/) by the host at settle time. */
+  artifacts?: {
+    traces: Array<string | null>
+    diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null>
+  }
 }
 
 export const MAX_CANDIDATES = 5
+
+/** Delivery decision for the source-integration post-audit (ruling I.2):
+ *  `yes` requires observed integration AND a configured test command that
+ *  passed. Without a test command the answer is never yes — the plugin does
+ *  not invent evidence. */
+export function evaluateDelivery(input: {
+  audited: boolean
+  headChanged: boolean | null
+  dirtyEntries: number | null
+  testsConfigured: boolean
+  testsExit?: number | null
+}): { delivered: 'yes' | 'no' | 'unknown'; note: string } {
+  if (!input.audited) return { delivered: 'unknown', note: 'audit did not run' }
+  const integrated = input.headChanged === true || (input.dirtyEntries !== null && (input.dirtyEntries ?? 0) > 0)
+  if (!integrated) return { delivered: 'no', note: 'no HEAD advance and clean worktree at audit time' }
+  if (!input.testsConfigured) {
+    return { delivered: 'unknown', note: 'integration evidence observed; no test command configured (selectionPostAuditTestCommand) so verification is unresolved' }
+  }
+  if (input.testsExit === 0) return { delivered: 'yes', note: 'HEAD/advanced worktree integrated and the configured test command exited 0' }
+  return { delivered: 'no', note: 'integration evidence present but the configured test command failed (exit ' + (input.testsExit ?? 'n/a') + ')' }
+}
+
+/** Ruling I.1: provisional margin gate. 2026-09-08 calibration round 1 (C0,
+ *  24 reps × 2 seeds, minimax-m3@low, eval/calibration/run.mjs): identical-
+ *  candidate noise q95 = 0.0123, max = 0.0135, positional bias ≈ 0, no 0.5
+ *  pinning; oracle-separated pairs land at margin 0.31..0.46 with 12/12
+ *  correct signs. 0.03 = 2.2× the observed noise ceiling. Stays provisional
+ *  until the multi-fixture replication (≥5 fixtures) confirms stability. */
+export const PROVISIONAL_MARGIN_THRESHOLD = 0.03
 
 function clampCandidateCount(n: number): number {
   if (!Number.isInteger(n) || n < 1) throw new Error('candidate-count-invalid')
@@ -207,6 +350,29 @@ function errText(e: unknown): string {
 
 function invalidSelectionResult(detail: string): BridgeError {
   return new BridgeError('selection_failed', 'invalid verifier selection result: ' + detail, false)
+}
+
+/** Deterministic evidence block prepended to every candidate trajectory sent
+ *  to the verifier (ruling I.6/J.4): the ranker must never have to trust a
+ *  24k truncated trajectory to learn whether the candidate built and tested.
+ *  Everything here is runner-collected, not candidate-claimed. */
+function deterministicPreface(cand: CandidateRecord, taskKind: string | undefined): string {
+  const lines = ['[DETERMINISTIC EVIDENCE — collected by the runner, not claimed by the candidate]']
+  lines.push('Task kind: ' + (taskKind ?? 'unknown'))
+  lines.push('Execution-class tool calls: ' + String(cand.execToolCalls ?? 0) + ' (catalog/meta tools excluded; raw tool-call count ' + (cand.toolCalls ?? cand.execToolCalls ?? 0) + ')')
+  const d = cand.diffStat
+  lines.push(d
+    ? 'Worktree diff vs source HEAD: ' + d.files + ' files changed (+' + d.insertions + ' / -' + d.deletions + '), ' + d.untracked + ' untracked files'
+    : 'Worktree diff: unavailable (non-git or unreadable workspace)')
+  if (cand.checks && cand.checks.length > 0) {
+    for (const c of cand.checks) {
+      lines.push('check[' + c.name + ']: exit ' + (c.exitCode === null ? 'timeout' : c.exitCode) + (c.ok ? ' (pass)' : ' (FAIL)') + (c.harnessError ? ' [harness-error: the command itself failed to parse; not evidence against the candidate]' : ''))
+    }
+  } else {
+    lines.push('Objective checks: none configured for this selection — objectiveEvidence=' + (cand.objectiveEvidence ?? 'none'))
+  }
+  lines.push('[TRAJECTORY — candidate claims below are untrusted]')
+  return lines.join('\n')
 }
 
 /** Validate the untrusted sidecar payload before any index is mapped back to
@@ -262,6 +428,7 @@ export class SelectionRunner {
     const selectionId = input.selectionId ?? 'sel-' + randomUUID()
     const startedAt = now()
     const record: SelectionRecord = {
+      ...(input.recordSeed ?? {}),
       selectionId,
       sourceSessionId: input.sourceSessionId ?? null,
       startedAt,
@@ -270,6 +437,7 @@ export class SelectionRunner {
       stage: 'workspace',
       trigger: input.trigger ?? 'manual',
       ...(input.policy ? { policy: input.policy } : {}),
+      taskKind: input.taskKind ?? input.policy?.taskKind,
       candidates: [],
       verifierModel: input.verifier.model,
     }
@@ -277,8 +445,9 @@ export class SelectionRunner {
     publish()
     const handles: Array<SelectionAgentHandle | null> = new Array(n).fill(null)
     const trajectories: Array<string | null> = new Array(n).fill(null)
+    const diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null> = new Array(n).fill(null)
     const seed = input.seed && input.seed.length > 0 ? input.seed : undefined
-    const candidateTimeout = input.candidateTimeoutMs ?? 300000
+    const candidateTimeout = input.candidateTimeoutMs ?? 600000
     let aborted = false
     const onAbort = () => { aborted = true }
     input.signal?.addEventListener('abort', onAbort, { once: true })
@@ -495,95 +664,223 @@ export class SelectionRunner {
           const r = renderTrajectory(sliced)
           cand.eventCount = r.eventCount
           cand.toolCalls = r.toolCalls
+          cand.execToolCalls = r.execToolCalls
           cand.trajectoryChars = r.totalChars
           trajectories[cand.index] = r.text
         } catch { /* render is observability, never fatal */ }
+        // Objective diff evidence (ruling I.5): the workspace's git surface is
+        // the has-work gate's primary trust anchor. Best-effort; a non-git
+        // workspace yields null and the gate falls back to tool calls.
+        if (this.deps.diffStat) {
+          try { cand.diffStat = await this.deps.diffStat(cand.workspace) } catch { cand.diffStat = null }
+        }
+        // Full patch capture for the artifact pack — BEFORE any cleanup could
+        // delete the worktree (loser disposal runs later).
+        if (this.deps.diffFull) {
+          try { diffPatches[cand.index] = await this.deps.diffFull(cand.workspace) } catch { diffPatches[cand.index] = null }
+        }
         publish()
       }))
       if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted after candidate runs', false)
 
       record.stage = 'checks'
       publish()
-      // 4. Objective checks eliminate clearly-failed candidates.
+      // 4. Objective checks eliminate clearly-failed candidates. A check whose
+      //    own command was mangled by the shell (harnessError) is not evidence
+      //    against the candidate (ruling B-10/K.5): the gate stayed silent,
+      //    recorded, and never causes all_candidates_eliminated.
       for (const cand of record.candidates) {
         if (cand.status !== 'finished') continue
-        if (!input.checks || input.checks.length === 0) continue
+        if (!input.checks || input.checks.length === 0) { cand.objectiveEvidence = 'none'; continue }
         cand.checks = await runChecks(cand.workspace, input.checks, { signal: input.signal })
-        const failed = cand.checks.filter((c) => !c.ok).map((c) => c.name)
-        if (failed.length > 0) {
+        const failed = cand.checks.filter((c) => !c.ok)
+        if (failed.length > 0 && failed.every((c) => c.harnessError)) {
+          cand.checksInvalid = true
+          cand.objectiveEvidence = 'none'
+          record.checksUnreliable = true
+        } else if (failed.length > 0) {
           cand.status = 'eliminated'
-          cand.eliminatedBy = failed
+          cand.eliminatedBy = failed.map((c) => c.name)
+        } else {
+          cand.objectiveEvidence = 'pass'
         }
       }
 
       record.stage = 'ranking'
       publish()
-      // 5. Verifier selection over surviving candidates.
-      const survivors = record.candidates.filter((c) => c.status === 'finished')
+      // 5. Survivor gates around the verifier tournament (ruling I.2/I.3, K.5):
+      //    a "winner" must clear objective evidence, a real search space, and
+      //    the margin gate; anything less is an honestly labeled fallback,
+      //    abstain, or insufficient_evidence — never winnerBasis=verifier.
       record.candidates.forEach((c) => {
         if (c.status === 'failed' && !c.eliminatedBy) c.eliminatedBy = ['run-failed']
       })
+      let survivors = record.candidates.filter((c) => c.status === 'finished')
+      const taskKind = record.taskKind ?? 'unknown'
+      // Analysis-text tasks have no deterministic evidence layer by design
+      // (ruling I.3); everything else provisioned a worktree and is judged as
+      // code-shaped. "No tool calls" alone never eliminates for analysis.
+      const requiresWork = taskKind !== 'analysis-text'
+      if (survivors.length > 0 && !survivors.some((c) => c.objectiveEvidence === 'pass')) record.llmOnly = true
+      if (requiresWork) {
+        for (const cand of survivors) {
+          const diff = cand.diffStat ?? null
+          const diffWork = !!diff && (diff.files > 0 || diff.untracked > 0)
+          const toolWork = (cand.execToolCalls ?? 0) > 0
+          if (!diffWork && !toolWork) {
+            cand.status = 'eliminated'
+            cand.eliminatedBy = [...(cand.eliminatedBy ?? []), 'insufficient-evidence']
+          }
+        }
+        survivors = record.candidates.filter((c) => c.status === 'finished')
+        if (survivors.length === 0
+          && record.candidates.some((c) => c.eliminatedBy?.includes('insufficient-evidence'))) {
+          record.outcome = 'insufficient_evidence'
+          record.note = 'surviving candidates produced no execution-class tool calls and an empty worktree diff (has-work gate)'
+        }
+      }
       let winnerIdx = -1
-      if (survivors.length === 0) {
-        record.status = 'failed'
-        record.error = 'all_candidates_eliminated'
-      } else if (survivors.length === 1) {
-        // Objective checks establish eligibility, not a verifier score. Keep
-        // this shortcut explicit so downstream finalization cannot overclaim.
-        winnerIdx = survivors[0].index
-        record.winnerBasis = input.checks && input.checks.length > 0 ? 'objective-check-only' : 'single-candidate'
-        record.scores = record.candidates.map(() => null)
-        record.ranking = [survivors[0].index]
-        record.nComparisons = 0
-      } else {
-        if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted before verifier select', false)
-        // Ceiling matches host.ts MAX_SELECTION_TIMEOUT_MS (600s since
-        // 2026-09-05): max-effort verifiers need >300s for even two beats.
-        const rankingBudgetMs = Math.max(1, Math.min(600_000, Math.floor(input.selectTimeoutMs ?? 180_000)))
-        const rankingDeadlineAt = now() + rankingBudgetMs
-        const nEvaluations = Math.max(1, Math.min(8, Math.floor(input.nEvaluations ?? 2)))
-        const pivots = Math.max(0, Math.min(survivors.length, Math.floor(input.pivots ?? 1)))
-        const outcome = await retryTransientBridge((attempt) => this.deps.bridge.select({
-          problem: input.problem,
-          candidates: survivors.map((c) => trajectories[c.index] ?? ''),
-          criteria: input.criteria,
-          groundTruthNote: input.groundTruthNote ?? null,
-          nEvaluations,
-          pivots,
-          seed: input.algorithmSeed ?? 0,
-          model: input.verifier.model,
-          baseUrl: input.verifier.baseUrl,
-          apiKey: input.verifier.apiKey,
-          apiKeyEnv: input.verifier.apiKeyEnv,
-          effort: input.verifier.effort,
-          onError: input.verifier.onError ?? 'raise',
-          maxWorkers: input.verifier.maxWorkers ?? null,
-          timeoutMs: attempt.timeoutMs,
-          signal: attempt.signal,
-        }), {
-          signal: input.signal,
-          sleep: this.deps.sleep,
-          deadlineAt: rankingDeadlineAt,
-          maxAttempts: 2,
-          now,
-          onAttempt: (attempt) => { record.rankingAttempts = attempt; publish() },
-          onRetry: (error) => {
-            const errors = record.rankingRetryErrors ?? (record.rankingRetryErrors = [])
-            errors.push(error.message.slice(0, 300))
-            publish()
-          },
-        })
-        validateSelectionResult(outcome, survivors.length)
-        record.winnerBasis = 'verifier'
-        record.effectiveEvaluations = nEvaluations
-        record.verificationPasses = record.rankingAttempts ?? 1
-        const fullScores: Array<number | null> = record.candidates.map(() => null)
-        survivors.forEach((c, si) => { fullScores[c.index] = outcome.scores[si] })
-        record.scores = fullScores
-        record.ranking = outcome.ranking.map((ri) => survivors[ri].index)
-        record.nComparisons = outcome.nComparisons
-        record.usage = outcome.usage
-        winnerIdx = survivors[outcome.index].index
+      let retainedIdx = -1
+      if (!record.outcome) {
+        if (survivors.length === 0) {
+          record.status = 'failed'
+          record.error = 'all_candidates_eliminated'
+        } else if (survivors.length === 1) {
+          // Single survivor: retained for the source turn but NEVER a ranking
+          // claim (ruling I.2 single_candidate_fallback).
+          const sole = survivors[0]
+          retainedIdx = sole.index
+          record.outcome = 'single_candidate_fallback'
+          record.winnerBasis = input.checks && input.checks.length > 0 && !sole.checksInvalid ? 'objective-check-only' : 'single-candidate'
+          record.scores = record.candidates.map(() => null)
+          record.ranking = [sole.index]
+          record.nComparisons = 0
+          record.fallback = { index: sole.index, sessionId: sole.sessionId, workspace: sole.workspace }
+        } else {
+          // Identical diff surfaces = zero search space: dedupe BEFORE paying
+          // the tournament (ruling F3). Applies only when git evidence exists
+          // for every survivor; otherwise the verifier decides.
+          const fingerprints = survivors.map((c) => c.diffStat?.fingerprint)
+          if (requiresWork
+            && fingerprints.every((fp) => typeof fp === 'string')
+            && new Set(fingerprints).size === 1) {
+            const kept = survivors[0]
+            record.noSearchSpace = true
+            record.outcome = 'single_candidate_fallback'
+            record.winnerBasis = 'single-candidate'
+            retainedIdx = kept.index
+            record.scores = record.candidates.map(() => null)
+            record.ranking = [kept.index]
+            record.nComparisons = 0
+            record.fallback = { index: kept.index, sessionId: kept.sessionId, workspace: kept.workspace }
+            record.note = 'all survivors produced identical diff surfaces; deduped before verifier (no-search-space)'
+          } else {
+            if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted before verifier select', false)
+            // Ceiling matches host.ts MAX_SELECTION_TIMEOUT_MS (600s since
+            // 2026-09-05): max-effort verifiers need >300s for even two beats.
+            const rankingBudgetMs = Math.max(1, Math.min(600_000, Math.floor(input.selectTimeoutMs ?? 180_000)))
+            const rankingDeadlineAt = now() + rankingBudgetMs
+            const nEvaluations = Math.max(1, Math.min(8, Math.floor(input.nEvaluations ?? 2)))
+            const pivots = Math.max(0, Math.min(survivors.length, Math.floor(input.pivots ?? 1)))
+            let selectResult: BridgeSelectResult | null = null
+            try {
+              selectResult = await retryTransientBridge((attempt) => this.deps.bridge.select({
+                problem: input.problem,
+                candidates: survivors.map((c) => deterministicPreface(c, record.taskKind ?? input.taskKind) + '\n\n' + (trajectories[c.index] ?? '')),
+                criteria: input.criteria,
+                groundTruthNote: input.groundTruthNote ?? null,
+                nEvaluations,
+                pivots,
+                seed: input.algorithmSeed ?? 0,
+                model: input.verifier.model,
+                baseUrl: input.verifier.baseUrl,
+                apiKey: input.verifier.apiKey,
+                apiKeyEnv: input.verifier.apiKeyEnv,
+                effort: input.verifier.effort,
+                onError: input.verifier.onError ?? 'raise',
+                maxWorkers: input.verifier.maxWorkers ?? null,
+                minIntervalMs: input.verifier.minIntervalMs ?? 0,
+                timeoutMs: attempt.timeoutMs,
+                signal: attempt.signal,
+              }), {
+                signal: input.signal,
+                sleep: this.deps.sleep,
+                deadlineAt: rankingDeadlineAt,
+                maxAttempts: 2,
+                now,
+                onAttempt: (attempt) => { record.rankingAttempts = attempt; publish() },
+                onRetry: (error) => {
+                  const errors = record.rankingRetryErrors ?? (record.rankingRetryErrors = [])
+                  errors.push(error.message.slice(0, 300))
+                  publish()
+                },
+              })
+            } catch (bridgeFailure) {
+              // Ruling K.5: verifier infrastructure failure is NOT a verdict.
+              // When every survivor carries passing objective checks, keep
+              // their eligibility honestly instead of dropping to failed.
+              if (!survivors.every((c) => c.objectiveEvidence === 'pass')) throw bridgeFailure
+              record.outcome = 'verifier_unavailable'
+              record.note = 'ranking failed after retries: ' + errText(bridgeFailure)
+              const passCounts = survivors.map((c) => (c.checks ?? []).filter((x) => x.ok).length)
+              if (new Set(passCounts).size === passCounts.length) {
+                // A strictly ordered deterministic signal exists: report it as
+                // an objective-only result, explicitly not a verifier ranking.
+                const ordered = [...survivors].sort((a, b) => {
+                  const pa = (a.checks ?? []).filter((x) => x.ok).length
+                  const pb = (b.checks ?? []).filter((x) => x.ok).length
+                  return pb - pa || a.index - b.index
+                })
+                const lead = ordered[0]
+                record.outcome = 'objective_only_result'
+                record.winnerBasis = 'objective-check-only'
+                record.ranking = ordered.map((c) => c.index)
+                record.scores = record.candidates.map(() => null)
+                record.nComparisons = 0
+                retainedIdx = lead.index
+                record.fallback = { index: lead.index, sessionId: lead.sessionId, workspace: lead.workspace }
+              }
+            }
+            if (selectResult) {
+              validateSelectionResult(selectResult, survivors.length)
+              record.effectiveEvaluations = nEvaluations
+              record.verificationPasses = record.rankingAttempts ?? 1
+              const fullScores: Array<number | null> = record.candidates.map(() => null)
+              survivors.forEach((c, si) => { fullScores[c.index] = selectResult.scores[si] })
+              record.scores = fullScores
+              record.ranking = selectResult.ranking.map((ri) => survivors[ri].index)
+              record.nComparisons = selectResult.nComparisons
+              record.usage = selectResult.usage
+              const criteriaCount = Array.isArray(input.criteria) ? input.criteria.length : Object.keys(input.criteria ?? {}).length
+              record.criteriaCount = criteriaCount
+              record.expectedVerifierCalls = selectResult.nComparisons * criteriaCount * nEvaluations
+              // Margin gate (ruling I.1/I.4, B-8): a verifier preference inside
+              // the uncalibrated noise band — exact ties included — abstains.
+              // Evidence base (rounds 1-5, two model families): the measured
+              // noise ceiling stayed <= 0.014 throughout (n=240 zero-hypothesis
+              // frames, max=0.01377); 0.03 sits 2.17x above it (the earlier
+              // "2.2x" phrasing was a rounding overstatement, corrected
+              // 2026-09-10). Graduation rules: docs/MARGIN-GRADUATION-INVOICE.md;
+              // marginProvisional stays true until the invoice clears.
+              const first = record.scores[record.ranking[0]] as number
+              const second = record.scores[record.ranking[1]] as number
+              const margin = Math.abs(first - second)
+              const threshold = Math.max(0, Math.min(0.5, input.marginThreshold ?? PROVISIONAL_MARGIN_THRESHOLD))
+              record.margin = margin
+              record.marginThreshold = threshold
+              record.marginProvisional = true
+              record.marginCondition = input.verifier.model + '@' + (input.verifier.effort ?? 'default')
+              if (margin < threshold) {
+                record.outcome = 'abstain'
+                record.note = 'top-2 margin ' + margin.toFixed(6) + ' inside provisional noise band < ' + threshold + ' (' + record.marginCondition + ')'
+              } else {
+                record.outcome = 'ranked_winner'
+                record.winnerBasis = 'verifier'
+                winnerIdx = survivors[selectResult.index].index
+              }
+            }
+          }
+        }
       }
 
       // Preserve bounded evidence from the two highest-ranked candidates before
@@ -595,16 +892,22 @@ export class SelectionRunner {
         handoff: boundCandidateHandoff(trajectories[index] ?? ''),
       }))
 
-      // 6. Winner/loser lifecycle: winner survives, losers disposed + removed.
-      let winner: SelectionRunResult['winner']
-      if (winnerIdx >= 0) {
-        const cand = record.candidates[winnerIdx]
-        cand.status = 'winner'
-        record.winner = { index: winnerIdx, sessionId: cand.sessionId, workspace: cand.workspace }
-        winner = { candidateIndex: winnerIdx, sessionId: String(cand.sessionId), workspace: cand.workspace, handle: handles[winnerIdx] as SelectionAgentHandle }
+      // 6. Retention lifecycle: exactly one survived candidate may be kept for
+      //    the source turn — as `winner` ONLY for outcome=ranked_winner, else
+      //    as a `fallback`/`retained` slot that the relay must not frame as a
+      //    chosen-best. Every other candidate is disposed and removed.
+      const keepIdx = winnerIdx >= 0 ? winnerIdx : retainedIdx
+      let retained: SelectionRunResult['retained']
+      if (keepIdx >= 0) {
+        const cand = record.candidates[keepIdx]
+        cand.status = winnerIdx >= 0 ? 'winner' : 'retained'
+        if (winnerIdx >= 0) {
+          record.winner = { index: winnerIdx, sessionId: cand.sessionId, workspace: cand.workspace }
+        }
+        retained = { candidateIndex: keepIdx, sessionId: String(cand.sessionId), workspace: cand.workspace, handle: handles[keepIdx] as SelectionAgentHandle }
       }
       for (let i = 0; i < n; i += 1) {
-        if (i === winnerIdx) continue
+        if (i === keepIdx) continue
         if (record.candidates[i].status !== 'failed' && record.candidates[i].status !== 'eliminated') {
           record.candidates[i].status = 'loser'
         }
@@ -614,8 +917,8 @@ export class SelectionRunner {
       if (record.status === 'running') record.status = 'completed'
       record.stage = 'settled'
       publish()
-      await this.sweepWinnerlessRoot(record, winnerIdx >= 0, input.workspaceRoot)
-      return { record, winner }
+      await this.sweepWinnerlessRoot(record, keepIdx >= 0, input.workspaceRoot)
+      return { record, retained, artifacts: { traces: trajectories, diffPatches } }
     } catch (e) {
       const isAbort = aborted || (e instanceof BridgeError && e.code === 'bridge_aborted')
       record.status = isAbort ? 'aborted' : 'failed'
@@ -625,7 +928,7 @@ export class SelectionRunner {
       publish()
       for (let i = 0; i < n; i += 1) await disposeLoser(i)
       await this.sweepWinnerlessRoot(record, false, input.workspaceRoot)
-      return { record }
+      return { record, artifacts: { traces: trajectories, diffPatches } }
     } finally {
       input.signal?.removeEventListener('abort', onAbort)
     }

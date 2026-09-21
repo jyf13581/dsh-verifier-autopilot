@@ -1,0 +1,686 @@
+# 架构总览
+
+> **目的**：只用这一页回答三件事：系统由什么组成、哪些事实已经坐实、下一步优化先做什么。详细过程、原始日志和历史争议放在下方资料页，不在总览页展开。
+>
+
+## 先读这里
+
+**当前目标**：提高最终交付质量，而不是追求模型数量、复杂度或漂亮的排名记录。
+
+**当前结论**：
+
+- Best-of-N 候选编排、客观淘汰、verifier 排名和 relay 链路已经实现；2026-09-05 有真实多幸存者 ranking 成功记录。
+- 一次 source 集成闭环已经跑通，但属于 single-candidate；它证明 finalizer/lifecycle，不证明 verifier 选优质量。
+- 还没有可重复的固定题集，因此“质量提升”目前没有统一、可复验的度量。
+- 自动路径下 source agent 是否稳定完成检查、集成、测试、交付，仍需要新的 live fixture 证据。
+- 结论必须区分：**实现存在**、**运行成功**、**质量提升**。三者不是同一件事。
+
+## 1. 系统边界
+
+```
+用户任务
+  ↓
+原始 source agent
+  ↓ 只对满足条件的任务触发
+autopilot 准入与任务整理
+  ↓
+N 个隔离 candidate rollouts
+  ↓
+objective checks / timeout / progress 淘汰
+  ↓
+verifier 对幸存者进行比较与排序
+  ↓
+winner + 有界证据 relay
+  ↓
+source agent 检查、集成、测试、交付
+```
+
+**责任边界**：
+
+| 组件 | 负责什么 | 不负责什么 |
+| --- | --- | --- |
+| source agent / finalizer | 最终判断、集成改动、测试、交付 | 不应盲信候选摘要 |
+| autopilot | 准入、N/K/P 策略、上下文整理、后台调度 | 不直接替用户合并代码 |
+| candidate runner | 隔离 workspace、并行候选、工具轨迹 | 不读取其他候选结果 |
+| objective checks | 用可执行条件淘汰不合格候选 | 不是完整安全沙箱 |
+| verifier | 比较幸存候选并给出相对排序 | 不写回 source workspace |
+| relay / lifecycle | 传递有界证据、回收 loser/winner 工件 | 不自动证明 source 已履约 |
+
+## 2. 组件地图
+
+| 层 | 主要模块 | 关注问题 |
+| --- | --- | --- |
+| 接入层 | `src/index.ts`、autopilot pre-step | 哪些任务进入自动路径 |
+| 策略层 | `src/selection/autopilot.ts` | N/K/P、候选路由、上下文边界 |
+| 执行层 | `src/selection/candidates.ts`、`live.ts` | worktree 隔离、并发、超时、清理 |
+| 验证层 | `checks.ts`、`bridge.ts`、sidecar | 客观门禁、verifier 预检、重试、超时 |
+| 交付层 | trajectory relay、source finalizer | winner 证据、集成和交付确认 |
+| 证据层 | selection ledger、测试、live records | 当前事实与历史记录的区分 |
+
+## 3. 当前事实、决策与历史的分层
+
+**权威顺序**：
+
+1. 当前代码和当前 live API/运行记录。
+2. 事实基线：只放已核验的当前事实和证据边界。
+3. 架构契约与实现说明：README｜历史快照（不作决策依据）、HANDOFF｜历史快照（不作决策依据）。两者冲突时，以代码和 live 证据为准。
+4. 设计判断与研究建议：研究报告｜当前结论与决策、问题清单｜当前执行版。它们是决策输入，不是运行事实；对应历史材料归档在 研究报告｜历史材料归档（不作决策依据） 和 问题清单｜历史材料归档（不作决策依据）。
+5. 时间线、故障和原始过程：9.3记录、9.6 记录。它们用于追溯，不覆盖当前基线。
+
+**页面规则**：
+
+- 根页面只放稳定结论、边界、决策和下一步。
+- 事实基线只回答“现在是什么”。
+- 决策页只回答“为什么这样做、接受什么取舍”。
+- 实验页只记录“当时的条件、结果和限制”。
+- 故障页只记录“何时发生、影响什么、如何恢复”。
+- 待办必须有 owner、验收标准和截止条件；没有验收标准的内容不进入当前结论。
+
+## 4. 优化路线：先修证据链，再测质量
+
+### P0：最小机制验收，不建设大型评测集
+
+当前最优先级不是扩大题集，而是证明系统不会制造假事实。用 5 类小型 fixture 验收：
+
+1. 无工具、无 diff、无测试，却声称完成 → 必须是 `insufficient_evidence`，不得成为已验证 winner。
+2. 关键工具证据位于轨迹中间并被 `compactTrace()` 丢弃 → 被丢弃的 `[E*]` 不得继续通过 citation audit。
+3. 多个 verifier 共享同一错误 → “评分一致”不得升级为“事实已证实”。
+4. 手动验证选中纯对话/状态轮 → 必须要求明确 task turn，不能默认审查最后一轮。
+5. 确定性测试与 LLM 结论冲突 → 测试/文件/退出码优先，LLM 只能降级或 abstain。
+
+P0 验收字段：evidence IDs 的可见性、provenance、`supported/contradicted/insufficient_evidence`、winner basis、objective checks、source turn、拒绝原因。P0 完成前，不声称“质量提升”。
+
+### P1：固定小规模质量基线与自动交付链
+
+在 P0 通过后，再用少量、可复验的代码 fixture 记录 pass@1、pass@N、verifier top-1 与 oracle 一致率、completion rate、source 集成成功率、候选差异度、请求数和墙钟；同时复测 admission → selection → relay → source integrate → tests → delivery → cleanup。
+
+### P2：候选质量与多样性
+
+当前优先验证“同一强模型的独立多样化采样”是否带来增益，而不是先扩大异质模型池。一次实验只改变一个主变量，例如：
+
+- sampling 参数或候选策略，观察候选差异度；
+- N/K/P，观察质量、尾延迟和请求数；
+- verifier 模型或 effort，观察排序稳定性。
+
+候选差异接近零时，应记录为“本轮没有产生有效搜索空间”，而不是继续堆更多 verifier 调用。
+
+### P3：可靠性与运维加固
+
+- 模型探活必须区别“目录可见”和“真实可用”。
+- objective checks 需要明确超时、子进程和权限边界。
+- source/finalizer 的集成结果应有后置审计，而不是只依赖 prompt contract。
+- ledger 需要能按 source 模型、候选路由和版本归因。
+- 配置变更必须区分 live 内存态与持久化配置，重启后重新核验。
+- 模型探活必须区别“目录可见”和“真实可用”。
+- objective checks 需要明确超时、子进程和权限边界。
+- source/finalizer 的集成结果应有后置审计，而不是只依赖 prompt contract。
+- ledger 需要能按 source 模型、候选路由和版本归因。
+- 配置变更必须区分 live 内存态与持久化配置，重启后重新核验。
+
+## 5. 当前不做的事
+
+- 不把 legacy verifier 的分数当作 Best-of-N 质量证据。
+- 不因为模型列表更长就认定质量更高。
+- 不在没有固定题集时同时改模型、N、K、P、timeout 和 checks。
+- 不把历史故障、旧配置或旧时间预算直接写成当前状态。
+- 不为“保持文档完整”把所有原始日志复制进根页面。
+
+## 6. 每条新记录的最小格式
+
+```
+类型：事实 / 决策 / 实验 / 故障 / 待办
+时间：
+状态：当前 / 已关闭 / 待验证 / 已废弃
+结论（一句话）：
+证据来源：
+影响范围：
+下一动作与验收标准：
+```
+
+**判断标准**：如果一条内容不能帮助回答“现在是什么、为什么这样做、下一步验证什么”，就不应放在本页。
+
+## 7. 近期唯一建议
+
+先做 **P0 最小机制验收与证据门禁**，再做 **P1 小规模质量基线 + 自动交付链复测**；两者完成前暂停扩展模型池、增加 N/K/P、堆叠 verifier 调用和搬运历史细节。
+
+> **审计口径**：只以工作区内可读材料为证据——HANDOFF｜历史快照（9.6）（2026-09-05 权威快照，下称 H-0905）、README｜历史快照（9.6）（R-0905）、HANDOFF｜历史快照（不作决策依据）（H-0901）、简单记录（本机 AI 读源码与 `.data/` 的答复原文，下称 JL）、问题清单｜历史材料归档（不作决策依据）（QA）、研究报告｜历史材料归档（不作决策依据）（RA），以及当前决策页 架构https://github.com/jyf13581/dsh-verifier-autopilot、事实基线、研究报告｜当前结论与决策、问题清单｜当前执行版。
+>
+
+> **v1.0 未读到**：源码本体、`selections.jsonl` 原文、live `/state`。**v1.2（第 J 节）已直读 GitHub 仓库 `jyf13581/dsh-verifier-autopilot` @ main 的源码**；**v1.3 / v1.4（第 K 节）已直读 selections_jsonl（用户上传的 ledger 副本 38/47 行 + 证据附件｜selections.jsonl 物理第 39–47 行（2026-09-08） 补齐的第 39–47 行；v1.4 合计 47/47 行、39 条唯一记录，附件 99,219 字节、SHA-256 与本机一致）**；`records.jsonl` 未直读（94/191 为用户本机核查读数）；live `/state` 与 `llm_verifier` 库内部仍未读到。凡依赖它们的判断一律写「未知」。不预设任何当前页面结论成立。
+>
+
+<aside>
+⚖️
+
+**一句话裁决：当前最该修的不是模型能力，而是证据与状态语义。**
+
+依据：系统在自己文档判为「几乎平分、不可信」的分差带（≤0.026）内仍输出 `winnerBasis=verifier`（09-05 两条记录分差 ≈0 与 0.013）；候选工作区在裁决后即回收、轨迹不落盘，任何「选对没选对」都无法事后核验。这两点修好之前，换模型、加 N/K/P、抬 8192、建大评测集，都是在放大不可归因的噪声。**v1.4 ledger 回放（K.2，47/47 行）**：20 条 `completed` 中，11 条 verifier 排序的 top-2 分差中位数 0.0048，仅 sel-4fcbc905 一条在 0.08 门禁下仍为 `ranked_winner`；其余 19 条应为 abstain / single-candidate fallback / objective-only / insufficient_evidence。全量唯一一条自动路径的 verifier winner（sel-fa093cb5）分差 0.0118，本身就是 abstain 案例；两对「等价候选」（sel-1b5c286c 工具序列逐字相同、sel-fa093cb5 结论一致）给出的 0.0132 / 0.0118 就是当前 verifier 的噪声底。
+
+</aside>
+
+## 0. 五类信息分层
+
+### 0.1 已被源码、运行记录或测试直接证明的事实
+
+| 事实 | 证据位置 |
+| --- | --- |
+| `quality-first` 把 N 个候选全部分配给 `usable[0]`（autopilot.ts:106-111）；实测 distinct=1 | JL B3；H-0905 §6.4.3 |
+| `src/selection/` 无 temperature / top_p / seed 传参；候选差异只来自 5 条固定 `STRATEGIES` 提示词（autopilot.ts:41-47） | JL A14 |
+| `MAX_CANDIDATES=5` 硬编码（candidates.ts:195） | JL F5 |
+| `listModels()` 只列目录不探活；kimi-k3 宕机期间仍在目录；`selectionProvider` 单字符串、无 fallback / 健康检查 / cooldown | JL A16；H-0905 §6.4 |
+| 打分依赖 score-token logprobs，缺失即 raise（`sidecar.py:198`）；`allowLabelFallback` 默认 false | JL B1 |
+| 有真实比较（`nComparisons>0`）的记录：旧 8 条 + 09-05 新 2 条。旧 8 条中 7 条极差 ≤0.026；新 2 条极差 ≈0（0.50000000469/0.49999999531）与 0.013（0.4934/0.5066） | H-0905 §6.5.1、§6.2.2 |
+| 唯一明显分开的记录 sel-4fcbc905（0.649/0.351）对应约 6 倍真实差距 | H-0905 §7.3 |
+| sel-cd6590de：两候选因继承精简工具集（无写文件/shell）只产解释性文本，仍 `winnerBasis=verifier` | H-0905 §6.2.2 |
+| sel-a79f6c44：`winnerBasis=single-candidate`、`nComparisons=0`；集成/测试/提交证据为旁路核对，winner 工作区已回收、无法哈希比对 | H-0905 §0c、§6.2.1 |
+| 7/8 旧 ranking 记录的 winner 工作区已回收、候选轨迹不落盘；6 个 candidate-timeout 工作区 files=0 | H-0905 §6.5、§6.5.1 |
+| finalizer contract 为 prompt-level，插件不审计 source turn，无后置审计器 | H-0901 §2.5；H-0905 §2.5 |
+| `POST /config` 只改内存；任何 build / reload 回退到 `src/index.ts:1308-1309` 默认值（09-04 实测发生并复现） | H-0905 §6.4.2 |
+| source/finalizer 模型不写入 selection ledger | H-0905 §0a.1 |
+| lane `maxTokens=8192`「已拉满；思考从输出预算中扣除」；`verifierEffort` 同时作用于 lane 与 tournament | H-0905 §4、§2.4 |
+| effort=max 下 minimax-m3 单次比较 70–100s；kimi-k3 在 280s 预算内完不成；selection 上限因此 300s→600s | H-0905 §2.4、§6.2.2 |
+| objective checks 由 caller 提供、≤5 条、内联 `pwsh -NoProfile -Command`、无 allowlist、Windows timeout 不杀孙进程；sel-5e84f540 因外层转义使 check 失效 | H-0905 §2.3、§7.3 |
+| 离线门禁：build ✓、npm test 173/173、bridge self-test 9/9、`git diff --check` ✓ | H-0905 §5.2 |
+
+### 0.2 基于事实的推论
+
+- BoN 收益 ≈ 候选方差 × 选择器分辨力。方差被 `quality-first + 无采样参数` 压到≈0，分辨力只在「数倍差距」量级成立（RA §0.2）→ 现有 10 条「ranking 成功」记录**无法与随机选择区分**。
+- 同模型候选的日常差距远小于「数倍」→ 当前绝大多数 verifier 裁决落在噪声内；`winnerBasis=verifier` 这个标签在这些记录里不承载信息。
+- 当前「质量顺序」实为「可用性顺序」（见 0.5）。
+- 在 `/config` 会被 reload 静默回退、source 模型不进 ledger 的条件下，任何跨运行的对比结论都不可归因。
+
+### 0.3 尚未验证的假设
+
+- 自动路径下 source agent 会真的检查/集成/测试/交付：**0 条带 selection ID 的证据**。H-0905 头部称「低强度 M3 selection 完成真实 2 次 ranking comparison」属自动触发，但全文无对应 ID。
+- 同一强模型加采样参数能造出有效搜索空间。
+- verifier self-preference 的因果大小（verifier=minimax-m3 且同在候选池，H-0905 §6.4.2 已记账）。
+- 增加输出长度会提高 lane 结论可靠性：工作区**无任一截断实例记录**。
+- **P0 五类 fixture 所指机制真实存在**：`compactTrace()`、`citation audit`、`[E*]` evidence IDs、`supported/contradicted/insufficient_evidence`、`confidence high`、「手动验证选中状态轮」——这些符号在 H-0901、H-0905、R-0905、JL、QA、RA **全部缺席**，仅见于 2026-09-06/07 撰写的四个决策页。它们要么来自未进入 Notion 的对话/源码阅读，要么是尚未实现的设想。**来源未知，必须先核对再投入。**
+- **二轮复核（2026-09-07，用户侧读数）**：用户转来的本地源码审计确认 `compactTrace()`、`traceFor()`、`auditFindingCitation()` 位于 `src/index.ts`，`confidence` 位于 `src/verifier.ts`（本页未见源码原文，按用户陈述记录）。`src/index.ts` 承载的是配置、legacy verifier、autopilot pre-step 与 Host 装配（H-0905 文件表），`index.ts:80` 的 temperature 也只服务 legacy（JL A14）；citation audit 与 evidence ID 是 finding 级概念，属 legacy 单轨迹 verifier。结论从「可能不存在」改为更硬的一条：**这些机制存在，但 P0 K1 把 legacy 路径的核验机制写成了 BoN 路径（`src/selection/`）的验收**。`compactTrace()` 是否同时被 autopilot pre-step 或 ranking 输入复用：**已由源码裁决——不复用**；BoN 排序输入走 `src/selection/trajectory.ts` 的 `renderTrajectory()`（见 J.1-1、J.1-12）。
+
+### 0.4 页面之间相互冲突的事实
+
+| 冲突点 | 一方 | 另一方 | 状态 |
+| --- | --- | --- | --- |
+| autopilot candidate timeout | H-0905 §0b、R-0905：300000ms | H-0905 §4：900000ms（事实基线取 300000ms） | **已由源码裁决：300000ms**（`Config.selectionCandidateTimeoutMs` 默认值，见 J.1-15）；900000 为历史值 |
+| P0 是什么 | RA §三（2026-09-06）：P0=固定评测题集 | 研究报告当前版（同日）：P0=机制验收，评测集降为 P1 | 同日两页互相矛盾；RA 顶部仍自称「只有本节能作为当前决策入口」 |
+| GLM-5.2 注册表 | JL A15：注册表已移除 | R-0905 / H-0905 §0a.2-7：仍保留注册 | 未裁决 |
+| 候选策略 | H-0905 §6.4.2：09-04 切 exploration 并论证「必须切」 | 研究报告当前版：quality-first 为默认、exploration 不作质量默认 | 源码默认 quality-first；**当前 live 实值未知** |
+| 事实基线的来源 | 正文：核验日期 2026-09-06，主要依据 README/HANDOFF | 顶部 callout：2026-09-07 复核，新增 citation audit / confidence high / 无工具 single-candidate 三项风险 | 三项在正文与任何来源页均无支撑 |
+| 架构页 P3 清单 | 五条内容 | 同五条紧接着重复一遍 | 编辑残留，提示复制漂移 |
+
+### 0.5 可能被错误命名或错误解释的状态
+
+| 名称 | 实际含义 | 证据 |
+| --- | --- | --- |
+| 「2026-09-05 有真实多幸存者 ranking 成功记录」 | 管道走通。两条记录分差 ≈0 与 0.013，都落在同文档判为「几乎平分 / 不可信」的 ≤0.026 带内；cd6590de 的两候选什么都没做 | H-0905 §6.2.2、§6.5.1 |
+| `quality-first` / 「质量顺序」 | 当前列表 M3 → nemotron-super-120b → ultra-550b → kimi-k3 → deepseek 是**可用性/延迟顺序**（R-0905 自称 usable defaults；H-0905 §0a.1 称 M3 是「可用默认」）。用户给出的能力序是 kimi-k3 > M3 > Ultra >> Super（RA 缺陷 3；QA C11）。所以现在的 quality-first = 把全部 N 交给可用模型中并非最强者，且能力最弱的 Super 排第二 | R-0905 Current Defaults；RA 缺陷 3 |
+| `winnerBasis=verifier` | 仅表示「≥1 次有效比较且结果校验通过」，校验项（winner index、0..1、permutation、降序、tie-break、nComparisons>0）里**没有分差阈值** | H-0905 §2.4 |
+| 「已核验运行证据」（事实基线） | 核验对象是 README/HANDOFF 文本，不是 ledger 原文 | 事实基线页首说明 |
+| 「effort=max 已拉满」 | 已证明的效果是单次比较 70–100s；未证明分辨力提升；两条 09-05 记录都在 max 下近平局 | H-0905 §2.4、§6.2.2 |
+| `completed` | 终局无错误；不含质量与交付含义（completed=16 含 single-candidate 与近平局） | H-0905 §6.5 |
+| 「端到端闭环」 | 一次、single-candidate、旁证；插件不产生交付证明 | H-0905 §0c |
+
+## A. 系统到底在解决什么
+
+**名义目标**：README/HANDOFF 一句话里塞了四件事——候选生成、客观过滤、verifier 排序、source 最终化；另有并存的 legacy 单轨迹 verifier/feedback（verifyFive、/verify、/probe、/eval、records.jsonl）做「任务完成验证」。架构页把总目标定义为「提高最终交付质量」，H-0905 §0a.2 记录用户目标为「提高质量上限」。
+
+**实际能力（有证据）**：
+
+1. 编排与生命周期——隔离 worktree、并行 rollout、超时/检查淘汰、严格结果校验、relay、清理（173 项离线测试 + 少量 live 记录）。
+2. 粗粒度方向排序——候选差距达数倍时方向正确（仅 1 条）。
+3. 一次 single-candidate 交付闭环（旁证）。
+
+**没有证据**：细粒度选优；自动路径交付；任何质量提升。
+
+**差距的核心**不是「还没测出来」，而是四种语义被同一个词 `winner` 承载：
+
+- 搜索：有没有产生不同的解
+- 客观核验：有没有做事、测试过没过
+- 相对偏好：哪个更好
+- 交付：source 有没有真的集成
+
+当前 P0 又把第五种语义——单轨迹事实核验（evidence IDs / citation / supported-contradicted）——写进 BoN 的验收，而这套词汇在工作区没有任何源码对应（0.3）。
+
+**结论**：系统名义上做「质量提升」，实际证明的是「能跑完并给出一个格式合法的相对偏好」；决策页则在用一套未证实存在的核验词汇规划下一步。
+
+## B. 最可能失败的五处（概率 × 影响 × 修复难度）
+
+只列会导致错误决策、错误 winner、错误事实或错误投入方向的结构性风险；模型宕机、429、并发上限属运行可靠性——让系统「跑不起来」，不会让它「跑错还自以为对」，故不入列。
+
+| # | 结构性风险 | 为什么会导致错误 | 证据 | 概率 | 影响 | 修复难度 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `winner` 无分差阈值、无「做过事」门禁 | 近平局与空产出都能成为 verifier winner；relay 给 source 时带着「已选优」暗示 | sel-cd6590de、sel-1b5c286c；H-0905 §2.4 校验项 | 高（每次同模型运行） | 高：错误 winner + 错误叙事 | 低 |
+| 2 | verifier 分辨力低于工作区间 | 只能分辨数倍差距；日常差距 <3% → 裁决≈随机 | H-0905 §6.5.1；RA §0.2 | 高 | 高 | 中（可执行证据主排序） |
+| 3 | 候选方差≈0 | 同模型 + 固定提示 + 无采样参数 → 搜索空间为空，N 只是同一答案付 N 遍钱 | JL A14 / B3 | 确定 | 高：投入方向错误 | 中 |
+| 4 | 证据不留存、运行不可归因 | 工作区裁决后回收、轨迹不落盘、config 热重载回退、source 模型不进 ledger → 永远无法回答「选对了吗 / 当时跑的是哪套配置」 | H-0905 §6.5.1、§6.4.2、§0a.1 | 确定 | 高：一切度量失效 | 低 |
+| 5 | 客观门禁可选且脆弱 | checks 可缺省 → LLM 成唯一信号且不标注；有 checks 时内联 pwsh 转义可废掉整轮、孙进程不死 → 门禁自身误杀 | H-0905 §2.3、§7.3；QA K8 | 中 | 高 | 中 |
+
+## C. 8192 是不是核心瓶颈
+
+| 层次 | 事实 | 判断 |
+| --- | --- | --- |
+| legacy lane 的 8192 | lane `maxTokens=8192` 已拉满、思考从输出预算扣除（H-0905 §4）。feedback 默认关闭；文档自判 legacy 不是 BoN 证据 | **已发生，但不是 8192 截断**：`records.jsonl` 191 条有效记录中 94 条 `traceChars > 16000`、最大 18052（用户本机核查读数）——全部落在 J.1-3 的 16000–18050 尾截区间；至多 1 条（18052）触发 `compactTrace()` 压缩，其余 93 条是 prompt 直接切掉输入轨迹尾部。修法是统一预算（J.4-E 第 3 项），已从可选优化升级为**明确缺陷修复** |
+| BoN ranking 的输出预算 | selection 侧 max_tokens 实值在工作区材料中**未出现**。打分信号是 score-tag 的 logprob 期望（`sidecar.py:198`；JL B1/B2），不依赖长输出 | 输出长度不是 ranking 分辨力的约束：两条 09-05 记录在 effort=max（最长思考）下依然近平局；ledger `usage`（K.3）：11 条 ranking 记录每次调用输出 155–1228 token（最大为 sel-fa093cb5）、`reasoning_tokens=0`，仍不足 8192 的 1/6 |
+| 思考挤压 finding/score/citation | 机制上成立（lane 侧）；09-05 lane 探针 effort=max 70.7s 严格打分通过（H-0905 §5.2），无失败样本 | 真正被挤压的是**时间**：max 下单次 70–100s，直接导致 300s→600s 的预算抬升；maxWorkers=1 串行下再加长输出只会加剧 |
+| 加长后可靠性会否提高 | 无证据 | 可预期的是延迟上升、180s lane timeout 更易触发。若 lane 输出被截断，正确修法是「检测 `finish_reason=length` → 判 `insufficient_evidence`（fail-closed）+ 思考预算与答案预算分离」，而不是抬上限——抬上限只把截断阈值后移，不改变「截断即静默」的失败模式（若存在） |
+
+**明确结论：当前不值得优先把 8192 改为 16K / 32K。** 值得做的是（a）截断可检测且 fail-closed，（b）lane 的 effort 与输出预算解耦——两者都不动上限。只有当 P0 fixture 里出现一条可复现的「因截断导致错误 finding」记录，再在该 fixture 上 A/B 16K。**v1.3 闭合**：ranking 侧由 `usage` 证明 8192 从未生效（K.3）；legacy 侧 94/191 条实例证明缺陷是 16000/18000 输入预算不一致——这 94 条丢的是输入轨迹的尾部，与输出上限 8192 无关，抬到 16K 对它们没有任何帮助。
+
+## D. 「先建大型评测集」是不是错误 P0
+
+**结论：是错误 P0；但当前页面给出的替代方案（五类 fixture）本身也站不稳。**
+
+1. **会放大错误。** 评测集测的是端到端结果；而当前（a）配置会在 build/reload 时静默回退（09-04 实测发生），（b）source 模型不进 ledger，（c）工作区裁决后回收。任何 pass@1 / verifier-top-1 数字都无法归因到「当时到底跑的是什么」，却会被写成「质量提升 / 未提升」的结论。
+2. **必须先于评测集解决**：证据留存 + 运行归因（B-4）；`winner` 语义（B-1）；「做过事」门禁；以及**确认 P0 五类 fixture 描述的机制是否存在、属于哪条路径**（0.3 末条）。
+3. **最小可行机制验收集**（建议替换当前五类；全部可在 BoN 路径用现有 ledger 字段观测）：
+
+| # | fixture | 期望行为 |
+| --- | --- | --- |
+| F1 | 两候选产出等价（分差 < 噪声阈值） | `basis=tie-abstain`，不得为 `verifier`；relay 双候选或回 source |
+| F2 | N=2，一者超时，幸存者无 caller checks | `basis=single-candidate-unverified`；relay 明示 unverified |
+| F3 | 两候选 diff 相同 / 近零距离 | 记录 `diversity≈0`，跳过 verifier，标 `no-search-space` |
+| F4 | 候选无 diff、无 tool call、无 checks 通过 | 排序前淘汰；全部如此 → abstain |
+| F5 | 起跑后 `POST /config` 并触发 reload | record 中的配置快照与 source 模型不变，且反映真实执行值 |
+| F6 | 任一 selection 完成并 cleanup | cleanup 前 diff + 压缩轨迹 + 快照已落盘可读 |
+| F7（仅 legacy 保留时） | lane 输出 `finish_reason=length` | 判 `insufficient_evidence`，不得输出 score |
+
+当前五类中「compactTrace 丢证据」「共享错误→评分一致」「手动验证选错 turn」三项，在能否映射到具体代码之前不应占 P0 名额。
+
+**4. 何时值得建较大评测集**：F1–F6 通过；5–10 题 pilot 复跑两次，标签（basis / abstain / evidence）稳定；pilot 上 pass@N − pass@1 > 0（否则 verifier 没有可捞回的空间，评测集测不出东西）。
+
+## E. 逐项检查
+
+| 问题 | 是否存在 | 证据 | 根因 | 后果 | 最小修复 |
+| --- | --- | --- | --- | --- | --- |
+| 无工具、无 diff、无测试仍成 winner | **存在（已发生）** | sel-cd6590de 两候选只产文本，`winnerBasis=verifier`（H-0905 §6.2.2） | winner = 幸存 + 相对偏好，不含「做过事」条件 | relay 一个什么都没做的赢家 | 排序前加确定性 has-work gate：diff 非空 ∨ **执行类** tool calls>0（`tool_search` / `tool_slimmer_catalog` 等元工具不计——sel-cd6590de 的 winner `toolCalls=3` 全为元工具，K.4-1）∨ checks 通过；全不满足 → abstain 回 source |
+| single-candidate 被误读为选优 | ledger 层字段正确，但规模被低估：全量 20 条 `completed` 中 9 条 `nComparisons=0`（K.2），其中 4 条为无 checks 的纯兜底、3 条 winner `toolCalls=0`（最新一条 sel-1c8d28ef：autopilot deep、两对手 timeout、幸存者零工具调用仍成 winner，K.4-7）；叙事层存在 | §6.2.1 字段正确；R-0905 称其「the one complete live closure」 | relay 声明 basis（J.1-11），但 `[FINALIZER CONTRACT]` 对 verifier 与 single-candidate 完全相同 | source 把单幸存者当已选优集成 | relay 头部强制带 basis 与 unverified 标记 |
+| 多 verifier 共享错误却高置信 | BoN：K 次评估来自同一模型，K>1 不增独立性（结构事实）；`confidence high` = 同模型五路 lane 分歧度 ≤0.12（源码 J.1-4）→ **存在** | H-0905 §2.4（K=nEvaluations）；legacy 五路同模型 | 把同模型自一致当作多源印证 | 假置信 | 只输出 `agreement`，不输出 `confidence`；`verified` 只能由确定性证据授予 |
+| compactTrace 丢弃证据仍过 citation audit | **存在**（源码 J.1-2：审计集 = 压缩前全集；J.1-3：16000/18000 双重截断）。实例规模：`records.jsonl` 94/191 条处于尾截区间（用户本机核查，K.3）→ 明确缺陷修复 | H-0905 §7.2 | 若存在：审计对象是压缩前 ID 集 | 引用不可见证据 | 审计只对压缩后可见 ID 集解析；被丢弃 ID → 引用无效 → finding 降级 |
+| 评分一致性被命名为事实置信度 | **存在**（源码 J.1-4：`confidence` 由 lane 间分歧度阈值 0.12 决定，与事实无关） | 事实基线 callout | 同上 | 同上 | 同上 |
+| 手动验证可审查错误 turn | **存在**（源码 J.3：`verifySession()` 固定取最后一个 `turn/end`，`/verify` 不能指定 turn）。legacy 配置里有 `skipStatusContinuation`（JL A16），说明「状态延续轮」问题曾被识别 | JL A16 | — | 审查非任务轮 | 手动 verify 必须显式指定 turn，或默认取最后一个含工具活动的任务轮 |
+| checks 与 LLM 冲突无优先级 | **按文档不成立**：checks 在 ranking 之前作淘汰门，失败者不进 verifier（§0a、§2.3/§2.4）。真实缺口：checks 可缺省；两候选都通过后 LLM 独判；测试数量 / diff 不进入排序。源码 J.1-7 + ledger K.2：自动路径不传 checks，全量 13 条 autopilot 记录无一带 checks——LLM 是唯一信号；末 9 行中 3 条 autopilot 的 `policy.contextChars` 实测 641 / 646 / 2994 字 | H-0905 §2.3、§2.4；QA K8 | 客观信号只当门槛、不当排序 | 无 checks 时 LLM 是唯一信号且不标注 | 每候选记录 `objectiveEvidence ∈ {pass, fail, none}`；全 none 时 record 标 `llm-only`；后续让可执行证据成为主排序 |
+| source 集成无后置审计 | **存在（文档明写）** | H-0905 §2.5；a79f6c44 证据为旁证 | 交付契约是 prompt-level | `delivered` 永远只能旁证 | source idle 时自动记录 HEAD 增量与测试结果写入 ledger：`delivered ∈ {yes, no, unknown}` |
+
+## F. 目标架构
+
+| 层 | 负责 | 不负责 | 输出 |
+| --- | --- | --- | --- |
+| 证据层 | 每候选 diff、tool-call 日志（稳定 ID + 显式「已丢弃区间」）、checks 输出/退出码、时序；起跑配置快照、候选模型、source 模型；**cleanup 前落盘** | 任何判断 | 不可变 evidence bundle |
+| 确定性验证层 | checks（落盘脚本 + 进程组 kill）、has-work gate、diversity 距离、截断检测 | 通过者之间的优劣偏好 | `objectiveEvidence ∈ {pass, fail, none}`、`diversity`、`truncated` |
+| LLM 审查层 | 仅对通过确定性层的候选做 pairwise / listwise 偏好；输出 margin 与 `agreement` | 声明事实、声明完成、写回 | `preference`、`margin`、`agreement` |
+| 策略层 | 准入、N/K/P/effort、带探活的模型路由、预算、决定 relay 还是 abstain | 合并代码 | `decision ∈ {relay, abstain}`  • 理由 |
+| 交付层 | relay 携带 basis 与状态；source idle 后置审计（HEAD 增量 + 测试）；审计完成后才允许 cleanup | 选 winner | `delivered ∈ {yes, no, unknown}` |
+
+**状态词表**（只允许这样叫）：
+
+| 状态 | 授予条件 | 不代表 |
+| --- | --- | --- |
+| `completed` | 管道到达终态且无错误 | 质量、交付 |
+| `winner` | 被选中 relay 的候选；必须同时带 `basis ∈ {verifier-margin, objective-count, single-survivor}` 与 `objectiveEvidence` | 已验证、已交付 |
+| `verified` | 仅当确定性证据 pass（checks 通过或等价可执行证据） | 由 LLM agreement 授予 |
+| `delivered` | 后置审计确认 source 集成（diff 存在 + 测试通过） | 缺审计时一律 `unknown` |
+| `abstain` | 见下 | 失败 |
+
+**必须 abstain 的条件**：margin < 噪声阈值；所有候选 `objectiveEvidence=none` 且无 has-work 证据；`diversity≈0`；verifier 不可用；（可选严格模式）多幸存者且无任何 checks。
+
+原则：不以增加模型数量解决结构性问题——上述每一层都可以在 N=2、单模型下先验收。
+
+## G. 未来两周信息增益最高的行动顺序
+
+| # | 要验证的假设 | 最小实验 / 改动 | 成功标准 | 失败后的决策 | 不得同时改动 |
+| --- | --- | --- | --- | --- | --- |
+| 1（第 1 天） | P0 五类 fixture 的符号（compactTrace / citation audit / [E*] / insufficient_evidence / confidence）属于 legacy lane 而非 BoN，或根本不存在 | 在仓库 grep 并把每条 fixture 映射到文件与路径 | 每条 fixture 都对应到一个具名函数与路径；P0 清单据此重写 | 符号不存在 → 从 P0 移除，记为「未实现的设想」 | 任何配置、模型、N/K |
+| 2（第 2–4 天） | 现有 verifier winner 中 ≥80% 落在噪声内、应为 abstain | 加 `margin` 与 `hasWorkEvidence` 字段；对 10 条有比较的 ledger 记录回放；跑 3 个 live fixture（等价候选 / 空候选 / 明显差距） | 等价 → abstain；空 → 淘汰；明显差距 → verifier winner | 明显差距也 abstain → 阈值失准，调阈值不换模型 | verifier 模型、effort、N/K |
+| 3（第 3–6 天） | 事后 oracle 判分今天不可能，因为工件被回收 | cleanup 前落盘 diff + 压缩轨迹 + 配置快照 + source 模型；跑 2 次并在 cleanup 后检查文件；起跑后 `POST /config`  • build/reload，检查 record 是否反映真实执行值 | 100% 运行有留存 diff 与快照；reload 不改写 record | 磁盘/时间成本过高 → 只留 diff | N/K/P、模型 |
+| 4（第 6–10 天） | 自动路径 relay 之后 source 真的集成的比例 ≥ X%（当前 X 未知，0 条证据） | 新 Git fixture；autopilot standard N=2/K=1；source idle 后置审计记录 HEAD 增量与测试结果；跑 3 次 | 3/3 记录 `delivered ∈ {yes, no}`（非 unknown）；至少 1 个 yes | 0 个 yes → relay 契约无效，在 finalizer 修好前停止对 ranking 的一切投入 | verifier、effort、N/K、模型 |
+| 5（第 10–14 天，仅当 1–3 完成） | 同模型加采样多样性能产生非零 diff 距离与非平局 margin | 只加 temperature 一个变量；5 个固定小任务 × N=2；对比默认值 | diff 距离中位数 > 0；margin 分布离开 0.5 | 无变化 → 提示策略与 temperature 都造不出搜索空间，转向两层候选 / sequential revision，而非加 N | verifier、K、P、effort、模型 |
+
+两周内**不做**：20–30 题评测集；模型池变更；N/K/P/effort 变更；8192 变更。
+
+## H. 裁决
+
+| 问题 | 裁决 |
+| --- | --- |
+| 1. 继续、暂停、还是重构后继续 | **暂停一切能力扩展；只做窄范围重构后继续**——证据层 + 状态语义 + 后置审计。不推倒重来：编排层与结果校验层是可复用资产 |
+| 2. 当前 P0 | G-1 ～ G-3：符号核对、`winner` 收紧（margin + has-work + abstain）、证据留存与运行归因。不是当前五类 fixture 原文，不是评测集 |
+| 3. 最不该做的三件事 | ① 抬 8192 / 抬 effort；② 扩模型池、切 exploration、加 N/K/P；③ 建 20–30 题评测集或继续把历史搬进文档 |
+| 4. 只能修一个 | **`winner` 收紧**：margin 低于噪声或无做事证据 → abstain。它同时消除错误 winner、错误叙事，并给后续所有度量一个可信锚点 |
+| 5. 最可能错的现有结论 | 架构页首条「2026-09-05 有真实多幸存者 ranking 成功记录」——作为「流程曾走通」成立；作为「verifier 已可靠选优」不成立；作为「架构已证明质量提升」更不成立。两条记录的分差都落在同一文档判为不可信的区间。建议改写为：「2026-09-05 曾完成多幸存者 ranking 流程；当前没有证据证明 ranking 结果优于随机选择，也没有与客观 oracle 的一致性数据。」（二轮修订：由「结论错误」收紧为「语义过强」——事实句保留，只收紧解释。）次选：P0 五类 fixture 把 legacy 路径机制写成了 BoN 路径验收（见 0.3 二轮复核） |
+
+**回答核心问题——当前最应该修复的，是模型能力不足，还是证据与状态语义不可靠？** 证据与状态语义。理由：即使换上完美 verifier，在现有留存与语义下也**无法被证明**有效；而现有数据已显示系统在自判不可信的分差下照常发 `verifier` winner。
+
+## I. 二轮复核（2026-09-07）——外部评审三处校正的裁决与追问 A–F
+
+> 输入：用户转来的评审意见（含其本地源码与 ledger 读数的转述）。本轮**仍未读到**源码与 `selections.jsonl` 原文（对话中的链接指向本机路径，Notion 端不可读）。凡引用评审方本地读数处标「用户侧读数」。**主裁决不变：先修证据与状态语义。**
+>
+
+### I.1 三处校正的裁决
+
+| 校正 | 裁决 | 采纳后的口径 | 保留的分歧 / 补充 |
+| --- | --- | --- | --- |
+| 1. margin 阈值不能写死，须先做控制实验校准 | **采纳** | margin 低于 calibrated_noise(condition) → abstain；condition = verifier 模型 × effort × 任务规模档。实验设计见 I.4 | 校准不得成为门禁上线的前置条件：先以 fail-closed 的**临时阈值**上线（历史同模型近平局带 ≤0.026 只作下界，标 `provisional`），校准并行；每条 record 必须写入当时使用的阈值与 condition key，否则事后无法复核 |
+| 2. 「必须有做事证据」不能套用所有任务 | **采纳** | 证据策略按任务类型定义（I.3）；「无工具调用」本身永不作为淘汰条件 | 任务类型必须在**准入阶段**由 caller 或确定性分类器声明并写入 ledger，不得由候选/LLM 自报；凡为候选开了 worktree 的任务默认按代码/文件类处理；纯文本任务没有确定性证据层，最高只能到 `ranked_winner(llm-only)`，**永不** `verified` |
+| 3. 「架构页 ranking 成功结论是错的」应改为「语义过强」 | **采纳** | H-5 已改写；建议架构页首条改为：「2026-09-05 曾完成多幸存者 ranking 流程；当前没有证据证明 ranking 结果优于随机选择，也没有与客观 oracle 的一致性数据。」 | 措辞微调：oracle 是基准而非对手，「优于 oracle」不成立，应写「与 oracle 的一致率未知」 |
+
+**对评审方一处判断的反驳**：评审建议「实现时优先保证 evidence visibility」。不同意其作为单一优先级，理由见 I.6。
+
+### I.2 winner 状态机（追问 C）
+
+原则：一个 `winner` 字段不再承载多种含义；新增 `outcome` 字段；`winnerBasis` 保留但取值收窄；`verified` 不是状态，是只能由确定性证据授予的谓词。
+
+候选级状态：
+
+| 状态 | 授予条件 | 记录字段 |
+| --- | --- | --- |
+| `candidate_finished` | rollout 到达终态无错误 | `toolCalls`、`diffStat`、`durationMs` |
+| `candidate_eliminated` | timeout / progress / checks 失败 / 任务类型最低证据缺失 | `eliminatedReason` |
+| `candidate_objective_passed` | caller checks 全通过 **且** 满足 I.3 的任务类型最低证据 | `objectiveEvidence=pass` |
+
+selection 级 outcome（互斥，恰有一个）：
+
+| outcome | 授予条件 | relay 行为 | 禁止的解读 |
+| --- | --- | --- | --- |
+| `ranked_winner` | ≥2 个 objective_passed 幸存者；margin > 该 condition 的校准阈值；若做了位置对换，符号一致 | relay winner，头部带 `basis=verifier-margin`、margin、阈值 | ≠ verified；≠ 正确 |
+| `objective_only_result` | ≥2 幸存者；verifier abstain 或不可用；确定性排序（测试通过数 / checks 通过数）**严格**分出先后 | relay 首位，`basis=objective-count` | ≠ verifier 选优 |
+| `single_candidate_fallback` | 恰 1 个幸存者；未发生任何比较 | relay 该候选，头部明示「未经候选间比较」及其 `objectiveEvidence` | **≠ verifier 选优成功**；≠ 端到端闭环证明 |
+| `insufficient_evidence` | 有幸存者，但无一满足任务类型最低证据 | 不 relay「winner」；回 source 说明「候选未产生可核验工作」 | ≠ 失败；≠ 完成 |
+| `abstain` | ≥2 幸存者，margin 在噪声内或位置对换后符号翻转，且确定性排序打平 | relay 双 finalist 不带 winner 标签，或回 source | ≠ 失败 |
+
+标志位（非状态）：`noSearchSpace`（候选 diff 距离≈0 → 去重后按 single_candidate 处理并记录）、`llmOnly`（全部候选 `objectiveEvidence=none`）。
+
+交付级：`delivered ∈ {yes, no, unknown}`——仅由 source idle 后置审计授予（HEAD 增量非空 ∧ 测试通过 → yes；审计执行且未发现集成 → no；未执行 → unknown，**默认 unknown**）。
+
+`verified` 谓词：只可加在 `candidate_objective_passed` 与 `delivered=yes` 上；`ranked_winner` 不因排序获得 verified；LLM agreement 永不授予 verified。`completed` 保留原义（管道终态无错误），任何报告不得单独以 completed 作为质量或交付证据。
+
+兼容：`winnerBasis` 取值收窄为 `{verifier-margin, objective-count, single-survivor}`；读 `winnerIdx` 的消费者必须先读 `outcome`。
+
+### I.3 任务类型证据策略（追问 B）
+
+| 任务类型 | 最低确定性证据 | 证据缺失 → outcome | 可达最高状态 |
+| --- | --- | --- | --- |
+| 代码修改 | 非空 diff ∧（测试/checks 通过 ∨ 明确记录的失败） | `insufficient_evidence` | verified |
+| 文件操作 | 目标路径存在性 / 内容哈希变化 + 操作退出码 | `insufficient_evidence` | verified |
+| 部署 / 运维 | 命令退出码 + 服务状态探测 + 至少一次真实请求结果 | `insufficient_evidence` | verified |
+| 外部事实核验 | 来源 URL 可解析 + 抓取时间 + 引用文本可在抓取内容中定位（确定性） | `insufficient_evidence` | verified（仅引用可定位性） |
+| 纯文本回答 / 设计讨论 | 无确定性证据层；只检查硬约束（格式、必答项、长度） | 不适用；标 `llmOnly=true` | `ranked_winner(llm-only)`，**永不 verified** |
+
+规则：① 任务类型在准入阶段声明并写入 ledger（caller 显式给出，或确定性分类器：是否需要 worktree、是否引用路径/文件）；② 候选/LLM 不得自报任务类型；③ 类型未知且已开 worktree → 按代码/文件类处理；④ 纯文本任务原则上不应进入需要 worktree 的 BoN 路径，若进入则全程 `llmOnly`。
+
+### I.4 calibrated margin 最小实验（追问 D）
+
+目标：得到每个 condition 下「无真实差异」时 margin 的分位数（q95 / q99），并确认 verifier 对已知差距的敏感度。**不允许**把 0.026 当通用阈值——它是 7 条历史记录的极差观测，不是噪声分位数。
+
+| 组 | 构造 | 测什么 | 最小样本 |
+| --- | --- | --- | --- |
+| C0 同一候选 vs 同一候选 | 同一 diff / 轨迹同时作为 A 与 B | 零假设下 margin 分布（噪声）；s_A − s_B 的系统偏移 = 位置偏置 | ≥5 个 fixture × ≥10 次重复 / condition |
+| C1 明显更好 vs 明显更差 | oracle 已知：一者全部测试通过，一者至少一项失败或含明显缺陷 | 敏感度：margin 高于 q95 且符号正确的比例；A/B 与 B/A 各跑一遍 | ≥5 对 × 2 顺序 × ≥3 次 |
+| C2 接近但不同 | oracle 已知的小差距（如 5/5 vs 4/5 测试；同测试但一方在未覆盖分支有记录缺陷） | 分辨力下限：从哪级差距起 margin 才离开 q95 | ≥5 对 × 2 顺序 × ≥3 次 |
+
+要点：「接近但不同」必须由 oracle 定义，不能由 verifier 自己定义；C0 若显示显著位置偏置，则所有正式比较必须做 A/B 对换，符号翻转即 abstain。
+
+condition 分层：先只在**实际默认运行条件**（minimax-m3、effort=low、maxWorkers=1）校准；再用同一批 fixture 跑 effort=max 一次——若 q95 无显著差异则合并 condition，不要预先按每个 effort / 模型拆分。任务规模只分两档（按 ranking 输入 token 数）。在 max 档校准是浪费：默认自动路径是 low。
+
+阈值规则：margin ≤ q95(C0；condition) → abstain（严格模式用 q99）。阈值、condition key、位置对换一致性写入每条 record。
+
+成功标准：C0 的 q95 在两轮独立重复间相对差 < 20%；C1 在 margin 高于 q95 时符号正确率 ≥ 90%；C2 给出明确的分辨力下限。
+
+失败后的决策：C1 符号正确率 < 70% → 该 condition 下 verifier 不能作排序信号，**不抬 effort、不换模型**，先把确定性证据摘要（测试结果、diff stat）喂进 ranking 输入再重跑 C1；若 C0 的 q95 ≥ C1 的典型 margin → verifier 无分离能力，排序改为 `objective-count` 主序、LLM 仅 tie-break。
+
+不得同时改动：verifier 模型、N/K、策略提示词、checks。
+
+### I.5 最小审计包与清理顺序
+
+cleanup 前必须落盘（如 `.data/selection-artifacts/{selId}/`）：
+
+- 起跑时**生效值**的配置快照（不是源码默认值）：strategy、models、N/K/P、effort、timeouts、provider、baseURL host
+- 每候选：模型、`toolCalls`、diff（小于设定阈值存全文，否则存 stat + hash）、checks 命令 / 退出码 / 输出头部、`eliminatedReason`
+- ranking 输入摘要：ranker 实际看到的文本的 hash + 长度 + 被丢弃区间
+- ranking 结果：scores、margin、阈值、condition key、对换一致性、verifier 模型
+- `outcome`、`winnerBasis`、`objectiveEvidence`、`llmOnly`、`noSearchSpace`
+- source 模型；后置审计：HEAD before/after、diff stat、测试退出码、`delivered`
+
+顺序：写审计包 → source 后置审计完成（或超时记 `delivered=unknown`）→ 才允许清理完整 workspace。轨迹全文不强制保存（隐私 / 磁盘），保存压缩摘要与丢弃区间即可。
+
+### I.6 只能改一个机制：winner gate vs evidence visibility vs artifact retention（追问 F）
+
+| 机制 | 改变什么 | 依赖 | 不改的代价 | 所属路径 |
+| --- | --- | --- | --- | --- |
+| winner gate（I.2 + I.3） | 系统**今天的动作**：不再 relay 无工作候选与噪声内的「verifier winner」；single-candidate 不再被叙述成选优 | has-work 部分只需现有 ledger 字段（`toolCalls`、diff、checks）；margin 部分先用临时阈值 | 继续产生错误 winner 与错误叙事（已发生：cd6590de；用户侧读数：最新记录 single-candidate、nComparisons=0、toolCalls=0） | BoN（`src/selection/`） |
+| evidence visibility（compactTrace ↔ citation audit） | legacy verifier **报告**的引用完整性：finding 不得引用被丢弃的证据 | 源码位置（用户侧已确认在 `src/index.ts`） | 手动 / legacy 核验报告可能给出虚假 supported；但按 I.2，LLM finding 本就不能授予 verified，不污染状态机 | legacy（`src/index.ts`） |
+| artifact retention（I.5） | 可归因性与可校准性 | 无 | 无法校准阈值、无法做事后 oracle；但**不改变任何动作** | 两者 |
+
+**单一优先级：winner gate。** 三者中只有它改变系统今天输出什么；它不等校准完成（fail-closed 临时阈值），也不等留存（字段已在 ledger）。评审方的依赖论证「verifier 引用看不见的证据 → winner gate 无基础」不成立：I.2 / I.3 下 winner gate 的输入全部是确定性字段，不经过任何 LLM finding；citation audit 修的是 legacy 报告的引用完整性，且 LLM finding 不能授予 verified，其错误的传播范围被状态机截断。它升级为同级的**唯一条件**：`/verify` 报告被用于人工判定交付是否可信——若是，先在报告头部加「引用未审计」标记，成本更低。retention 排第二，因为校准（I.4）与 `delivered`（G-4）都依赖它。
+
+BoN 侧也有一个「可见性」问题，但性质不同：ranking 输入若同样经有界尾部压缩（H-0905 §7.2 的 20/20），ranker 可能看不到中段的测试执行；修法不是 citation audit，而是把确定性证据摘要（checks 结果、diff stat、toolCalls）作为结构化字段前置进 ranking 输入。是否与 legacy 共用 `compactTrace()`：**源码裁决——不共用**；ranking 输入走 `renderTrajectory()`（24000 字符、头部截断、保留尾部），checks 结果与 diff 均不进入输入（J.1-12）。
+
+### I.7 修订后的两周顺序（合并评审方 6 步与本页 G）
+
+1. **状态机 + winner gate**（合为一次改动；I.2 / I.3；临时阈值标 provisional）——评审方第 1、3 步合并
+2. **审计包 + 配置快照 + 清理顺序**（I.5）——评审方第 4 步前移，因为第 3 步依赖它
+3. **校准实验 C0 / C1 / C2**（I.4）——即评审方第 5 步的「3 个控制 fixture」，输出正式阈值替换临时值
+4. **source 后置审计 → `delivered`**（G-4）——评审方未单列，但其「最大盲区」一段正是此项
+5. **legacy evidence visibility 契约**：`compactTrace()` 返回 `{text, visibleEvidenceIds, droppedRanges}`；`auditFindingCitation()` 只接受 `visibleEvidenceIds`，越界引用 → finding 降为 `insufficient_evidence`、reason=`cites_dropped_evidence`；`traceFor()` 在压缩前分配稳定 ID；验收 fixture：关键工具结果位于被丢弃的中段、finding 引用之 → 期望被拒——评审方第 2 步后移；若 `/verify` 被用于交付判定则提前到第 2 位
+6. 之后才是：采样多样性单变量实验（G-5）→ 小规模代码题集 → 最后 8192 / effort / 模型池 / N/K/P / exploration
+
+与评审方的差别只有两处：evidence visibility 从第 2 位移到第 5 位（理由见 I.6）；retention 从第 4 位移到第 2 位（校准依赖它）。
+
+### I.8 追问 A–F 的可答状态
+
+| 追问 | 本轮状态 | 仍需材料 |
+| --- | --- | --- |
+| A. 哪些「未知」可被源码确认 | 仅一项按用户侧读数更新：五类 fixture 符号存在且位于 legacy 路径（0.3 二轮复核）。其余未知项原样保留 | `src/index.ts` 中 `compactTrace()` / `traceFor()` / `auditFindingCitation()` 函数体与调用方；`src/verifier.ts` 中 `maxTokens` / `verifierEffort` / `confidence` 的实现；`src/selection/candidates.ts` 中 `survivors` / `winnerBasis` / `winnerIdx` 的处理；`bridge/llm_verifier_sidecar.py` 中 `select()` 的实际请求字段（含 `max_tokens`） |
+| B. task-type evidence policy | 已给（I.3） | 准入阶段现有字段（是否已有任务分类） |
+| C. winner 状态机 | 已给（I.2） | `candidates.ts` 现有 `winnerBasis` 枚举，以便兼容映射 |
+| D. calibrated margin 实验 | 已给（I.4） | 可脱离 autopilot 直接调用 ranker 的入口（`/probe` 或 sidecar `select()`），以便喂固定候选对 |
+| E. compactTrace ↔ citation audit 最小修复位置 | 只能给契约（I.7 第 5 步），行号未知 | 同 A |
+| F. 单一优先级 | 已裁决：winner gate（I.6） | — |
+
+ledger：需最近 10 条唯一 selection 记录原文（至少字段 `id`、`status`、`winnerBasis`、`winnerIdx`、`nComparisons`、`scores`、`toolCalls`、`policy.models`、`verifier`、`error`、`durationMs`）。**v1.3 部分闭合**：selections_jsonl 提供了 38/47 行（34 条唯一）；**v1.4 已闭合**：证据附件｜selections.jsonl 物理第 39–47 行（2026-09-08） 补齐第 39–47 行（5 条新唯一记录 + sel-cd6590de 完整 finalists；SHA-256 `2c0a5155…c52c` 与本机一致），合计 47/47 行、39 条唯一；回放见 K。
+
+## J. 源码级复核（2026-09-07）——GitHub `jyf13581/dsh-verifier-autopilot` @ main 直读
+
+> 读取范围：`src/index.ts`（全文）、`src/verifier.ts`（全文）、`src/selection/{candidates,autopilot,host,bridge,trajectory,checks}.ts`（全文）、`bridge/llm_verifier_sidecar.py`（全文）、`scripts/test.mjs`（compactTrace / citation audit / prompt 相关测试片段）、`.gitignore`、仓库文件树（tree `4d6b92b`）。**仍未读到**：`.data/selections.jsonl` 与 `.data/records.jsonl`（`.data/` 在 `.gitignore`）、外部库 `llm_verifier` 本体、`src/selection/live.ts` 与 `retry.ts`、live `/state`。以下凡写「源码」均指本次直读，引用给到文件与函数名。**主裁决不变，强度上调**（J.6）。
+>
+
+### J.1 源码直接证实的事实（闭合 0.3 / 0.4 / E 表中的「未知」）
+
+| # | 事实 | 位置 | 对本页的影响 |
+| --- | --- | --- | --- |
+| 1 | `compactTrace()` / `traceFor()` / `auditFindingCitation()` / `auditAggregateCitations()` 全在 `src/index.ts`，唯一调用方是 `VerifierHost.verifyAgent()`（legacy 五路 lane）。BoN 排序输入由 `src/selection/trajectory.ts` 的 `renderTrajectory()` 独立渲染，不经 `compactTrace()` | `src/index.ts`、`trajectory.ts` | 0.3 末条闭合：K1 五类 fixture 全部属 legacy 路径 |
+| 2 | `traceFor()` 先给**全部**渲染行编号并令 `evidenceIds = numbered.map(item => item.id)`，之后才调用 `compactTrace(rendered)`；`compactTrace()` 在 `fullTrace.length > 18000` 时输出「前 5000 字符 + 工具行摘选（≤8000 字符）+ 后 5000 字符」，按**字符**切、中段整体丢弃；`auditFindingCitation()` 只判 `cited ∈ evidenceIds`，没有「可见」概念 | `src/index.ts` | E 表「compactTrace 丢证据仍过审计」：未知 → **存在** |
+| 3 | 双重截断且预算不一致：`compactTrace()` 压缩产物最长约 18050 字符，`buildVerifierPrompt()` 再 `clampText(trace, 16000)` 从**尾部**截断。(a) 长度在 16000–18000 之间：压缩不触发，prompt 直接切掉尾部（最终答复所在）；(b) 长度大于 18000 且工具行多：尾部 5000 字符块最多被切掉约 2050 字符。同一 prompt 却写着「最终答复通常是最后一个 E 行，与可见末行矛盾的缺失声明自动错误」。`test.mjs` 只断言 `[truncated]` 标记存在，不断言末行存活 | `src/index.ts`、`src/verifier.ts` | **新发现**。C 表「是否真实发生截断」：机制上在该区间必然发生；实例数需 `records.jsonl` 的 `traceStats.traceChars`（大于 16000 即命中） |
+| 4 | `confidence`（`verifyFive()`）= `valid.length < 2 ? 'none' : dispersion <= 0.12 ? 'high' : 'low'`（0.12 = `disagreementThreshold` 默认值）；类型中的 `'medium'` 永不产生 | `src/verifier.ts` | E 表「评分一致性命名为置信度」：未知 → **存在** |
+| 5 | `maxTokens` schema `min(256).max(8192).default(8192)`，只进 legacy lane 请求的 `max_tokens`；`finish_reason !== 'stop'` → `incomplete_response`，该 lane 判无效不计分（fail-closed 已存在）。**ranking 路径不传 max_tokens**：`bridge.ts select()` 帧字段为 problem / candidates / criteria / ground_truth_note / n_evaluations / pivots / seed / effort / model / base_url / api_key_env / cache / on_error / max_workers / progress，sidecar `_validate()` 同集；输出预算由外部库 `llm_verifier.select()` 决定 | `src/index.ts`、`src/verifier.ts`、`bridge.ts`、sidecar | C 结论加固：8192 与 BoN ranking 无关；抬到 16K 需改 schema 且只影响 legacy |
+| 6 | `winnerBasis` 枚举 `'verifier' | 'objective-check-only' | 'single-candidate'`。单幸存者分支：`winnerIdx = survivors[0].index`、`scores` 全 null、`ranking=[idx]`、`nComparisons=0`、候选状态置 `'winner'`、`record.winner` 赋值、`record.status='completed'` | `candidates.ts` 第 5 步 | I.2 兼容映射基准 |
+| 7 | `handleAutopilotPreStep()` 调 `selections.start({...})` 时**不传 `checks`**（也不传 `groundTruthNote` / `progressGuard`）。自动路径永不运行客观检查；`objective-check-only` 在自动路径不可达；自动路径的 basis 只有 `verifier`（LLM）或 `single-candidate`（无任何证据） | `src/index.ts`、`host.ts` | B-5 由「可选且脆弱」升级为「自动路径缺席」 |
+| 8 | 无 has-work 门禁：`renderTrajectory()` 产出 `toolCalls` 写入 `cand.toolCalls`，源码中**无任何读取者**参与淘汰或门禁；`finished` 仅要求未超时、未被 progressGuard 中止、无 `turn/end` 且 `reason.kind==='error'` | `candidates.ts` 第 3 步 | E-1 根因落到代码 |
+| 9 | `selectionSeparation()` 阈值硬编码：`>= 0.08 → clear`、`>= 0.025 → leaning`、否则 `unresolved`，**只用于 relay 文本标签**，不参与门禁；`buildAutopilotRelay()` 在 `unresolved` 下照常输出 `[FINALIZER CONTRACT]` | `autopilot.ts` | 评审方「不能写死阈值」的警告在源码里已以另一形式发生：写死了、但不生效 |
+| 10 | `validateSelectionResult()` 校验 index 范围、[0,1]、完整排列、按分降序 + index tie-break、`nComparisons >= 1`——**不拒绝完全平分**；平分时 `ranking[0]` 为较小 index → c0 以 `winnerBasis='verifier'` 胜出。preflight 反而把 0.5/0.5 判为失败（`bridge.ts preflight()`） | `candidates.ts`、`bridge.ts` | 0.5 表 `winnerBasis=verifier` 行补一条；I.2 的 `abstain` 需显式含「完全平分」 |
+| 11 | relay（`buildAutopilotRelay()`）带 `Winner basis:` 与 `Separation:` 两行，但其后的 `[FINALIZER CONTRACT]`（「你是唯一 finalizer……检查 winner 工作区……集成……运行测试……交付」）对 verifier 与 single-candidate **完全相同** | `autopilot.ts` | E-2「relay 是否声明 basis」：声明了，但契约不区分——这就是 single-candidate 被读成选优的代码位置 |
+| 12 | ranking 输入 = 每候选 `renderTrajectory()` 文本，`DEFAULT_TOTAL_CAP=24000` 字符，**头部截断、保留尾部**，单元上限 2000 字符；`cand.checks`、diff、文件状态均**不进入** ranking 输入；`problem` = autopilot 12k 上下文包 | `trajectory.ts`、`candidates.ts` | I.6 末段「BoN 侧可见性」：未知 → 存在，性质是头截断，不是 citation |
+| 13 | 留存：loser 在 ranking 之后、record 落盘之前即 `dispose`  • `workspaces.remove`  • `purgeSessionRecord`；仅 top-2 的 `finalists[].handoff`（`boundCandidateHandoff`，14000 字符，35% 头 + 65% 尾）随 record 持久化；无 diff / hash 字段。autopilot winner 句柄保留到 source 的下一次 `idle`（`handleStatus` → `cleanupAutopilotWinners` → `discardWinner`）；manual winner 句柄在结算时 dispose，工作区留到 operator discard | `candidates.ts` 第 6 步、`host.ts`、`src/index.ts` | B-4 / I.5 落到代码 |
+| 14 | `SelectionRecord` 没有 `delivered` / 集成结果 / source 模型字段；`persist()` 只在 `finishRun` 与 `discardWinner` 追加行 | `candidates.ts`、`host.ts` | G-4 需新字段，不是补记录 |
+| 15 | `selectionCandidateTimeoutMs` 默认 300000（范围 30000–1800000）；`selectionSelectTimeoutMs` 默认 600000（上限 600000）；`host.ts` 的 `DEFAULT_SELECTION_TIMEOUT_MS=180000` 只用于 body 缺省的 manual `/select` | `src/index.ts` Config、`host.ts` | 0.4 冲突行闭合：900000 为历史值 |
+| 16 | legacy 已有任务形态分类 `classifyTurn()` → `'task' | 'pure-answer' | 'status-continuation' | 'repair-followup' | 'no-task'`，注释明写「工具缺席本身永不触发门禁；解释 / 设计 / 纯问答合法无工具」。autopilot 准入 `planAutopilotTask()` 只有 `depth ∈ {standard, deep}`，无任务类型；`ACTION_SIGNAL` 把「审查 / 研究 / 分析 / 设计 / 架构」也判为 actionable → 纯分析任务会进入 BoN 并收到代码型 finalizer 契约 | `src/index.ts`、`autopilot.ts` | I.3 规则 ① 的落点：任务类型必须在 `planAutopilotTask()` 产生并写进 `policy` |
+| 17 | `algorithmSeed` 缺省 → 排序 `seed: 0` 固定；quality-first 下 N 个候选全部 `usable[0]`；差异只来自 5 条 `STRATEGIES` 轮转；`sandboxMode='workspace-write'` 仅 autopilot | `candidates.ts`、`autopilot.ts`、`host.ts` | 复证 0.1；校准实验可利用固定 seed 去掉一个方差源 |
+| 18 | sidecar 注释「plugin default is 'max'」与 `Config.verifierEffort` 默认 `'low'` 不一致；`handleAutopilotPreStep` 仅在 `step === 1` 且非子会话（`parentSession` 为空）触发 | sidecar、`src/index.ts` | 文档漂移，无行为影响；子会话不会递归触发 autopilot（正确） |
+| 19 | 测试覆盖：`test.mjs` 对 `compactTrace` 断言「晚期 build 证据存活」「压缩后仍能计数」，对 `auditFindingCitation` 断言未知 ID / verdict ID / 区间解析；**没有**「被丢弃 ID 不得计为有效引用」与「prompt 截断后末行存活」两条 | `scripts/test.mjs` | J.4 第一步应是补这两条会失败的测试 |
+
+### J.2 源码层面的新结构性风险（B 表补充）
+
+| # | 风险 | 依据 | 后果 | 状态 |
+| --- | --- | --- | --- | --- |
+| B-6 | 审计对象 ≠ 可见对象（legacy） | J.1-2、J.1-3 | `independentCitation` 可由一条 verifier 看不见的 tool-result 行满足；`autoFeedback=true` 时会据此向 source 发 feedback（默认 false，故当前只污染 records / GUI / `/verify` 报告） | 源码确认 |
+| B-7 | 自动路径零确定性验证 | J.1-7、J.1-8 | 自动路径的「客观过滤」实际只有 timeout 与 turn-error（progressGuard 亦未由 autopilot 传入）；「候选产出纯文本」到「source 被要求集成 winner」之间没有任何确定性关卡 | 源码确认 |
+| B-8 | 完全平分 → c0 胜 | J.1-10 | 零信息裁决被标为 `verifier` | 源码确认 |
+| B-9 | winner 工作区寿命 = source 的**下一次** idle，而非 relay 轮结束 | `waitFor().then` 内先 `autopilotCleanup.add()` 再 `agent.followup(relay)`；`handleStatus(idle)` 每次都跑 `cleanupAutopilotWinners()` | 若 selection 结算时 source 正处于另一轮对话，relay 进 inbox 排队，而当前轮结束触发的 idle 会先 `discardWinner()`——relay 轮开始时工作区可能已删，finalizer 只剩 14000 字符摘录 | **待确认**：取决于 DSH 在有排队 inbox 消息时是否发出 idle。复现：autopilot 起跑后让 source 持续忙到结算，比对 `discardedAt` 与 relay 轮起始时间 |
+| B-10 | check 本身失效被记为候选失败（无 `check-invalid` 状态） | ledger sel-5e84f540：两候选的 `result-file-content` 检查 `outputTail` 均为 pwsh 解析错误「The term '=' is not recognized…」「-eq is not recognized…」、exit=1 → 两候选被淘汰、`all_candidates_eliminated`（K.4-3）；`checks.ts` 只看退出码 | 门禁自身误杀整轮，且在 ledger 里与「候选没做对」不可区分；同名 check 在 sel-bbc7de5a 再次淘汰候选（tail 为空，无法判定） | ledger 确认（源码：`checks.ts` 无命令自检） |
+
+### J.3 追问 A：上轮「未知」的逐项闭合
+
+| 上轮未知 | 现状 |
+| --- | --- |
+| 五类 fixture 符号是否存在、属哪条路径 | 存在，全部 legacy（J.1-1） |
+| `compactTrace()` 是否被 ranking 复用 | 否（J.1-1、J.1-12） |
+| selection 侧 max_tokens 实值 | 插件不传，由 `llm_verifier` 库决定——**仍未知**；可从 ledger `usage.output_tokens / reasoning_tokens` 反推（J.5） |
+| candidate timeout 300000 vs 900000 | 300000（J.1-15） |
+| relay 是否携带 `winnerBasis` | 携带；但 finalizer 契约不区分（J.1-11） |
+| 是否存在 lane 截断实例 | 机制上在 16000–18050 字符区间必然尾截（J.1-3）；实例数需 `records.jsonl` 的 `traceStats.traceChars` |
+| `confidence` 的定义 | lane 间分歧度阈值（J.1-4） |
+| `/verify` 能否指定 turn | 不能：`verifySession()` 固定取 `turnBounds()` = 最后一个 `turn/end`；`force` 只绕过 no-op 门，不绕过 `no-direct-task` |
+| 准入阶段是否有任务类型字段 | 无（J.1-16） |
+| 仍未知 | ledger 原文（v1.4：47/47 行已读，见 K）；`llm_verifier.select()` 内部（比较调度、max_tokens、温度；ledger 显示 `calls` 为 `nComparisons` 的 1–6 倍，调度未知）；live 实值；`live.ts` 快照细节；B-9 是否真实发生（ledger 无时序字段，仍待 live 复现） |
+
+### J.4 追问 E / C / F：最小修复位置
+
+**E. legacy evidence visibility（4 处，约 30 行 + 2 条测试）**
+
+1. `src/index.ts` `compactTrace()`：head / tail 按**行边界**取整；返回值新增 `visibleIds: number[]`（解析每条保留行开头的 `[E..]` 编号）与 `droppedRanges`
+2. `traceFor()`：新增 `visibleEvidenceIds = compacted.visibleIds`；原 `evidenceIds` 保留为渲染全集，只供统计
+3. `buildVerifierPrompt()` 与 `compactTrace()` 共用一个常量（如 `TRACE_BUDGET_CHARS = 16000`），5000 / 8000 / 5000 按它推导，使 `clampText` 永不再切轨迹
+4. `verifyAgent()`：`auditAggregateCitations(aggregate, visibleEvidenceIds, verdictLineIds, kindsById)`，feedback 过滤同改。`auditFindingCitation()` 本体不必动——它已把不在集合内的 id 记为 unknown
+
+测试：(a) 600 行轨迹，`[E150]` 为 TOOL RESULT 且落在被丢弃的中段，finding 引用之 → `unknownIds` 含 150、`independentCitation=false`；(b) `buildVerifierPrompt(problem, traceFor(...).trace, criterion)` 的输出含最后一行的编号。
+
+**C / F. BoN winner gate（落点 `candidates.ts` 第 5 步 + `autopilot.ts` relay）**
+
+- `SelectionRecord` 新增 `outcome`（I.2 枚举）与 `taskKind`；`winnerBasis` 保留兼容
+- `candidates.ts` 第 5 步：单幸存者分支**不再设 `winnerIdx`**，改写 `record.fallback={index}`、`outcome='single_candidate_fallback'`，其工作区按 winner 规则保留但不置 `record.winner`；多幸存者分支在 `validateSelectionResult()` 之后加三道门：`scores` 完全相等 → `abstain`；`margin < thresholdFor(conditionKey)` → `abstain`（阈值表缺项时用现有 `selectionSeparation` 的 `clear` 下界 0.08 作临时值并标 `provisional`——比 I.1 的 ≤0.026 更保守，两者均以 I.4 结果替换）；`taskKind ∈ {code-change, file-op}` 且候选 `diffStat` 为空 ∧ 执行类 `toolCalls === 0`（只计写文件 / shell / git 等会改动工作区或运行命令的工具；`tool_search`、`tool_slimmer_catalog` 等元工具不计，见 K.4-1）→ 该候选 `insufficient_evidence`，全部如此 → `outcome='insufficient_evidence'`
+- `diffStat`：在第 3 步末的 trajectory accounting 旁对候选 worktree 跑 `git diff --stat HEAD`，写入 `cand.diffStat`（worktree 由 `live.ts` 建立，git 已可用）
+- `handleAutopilotPreStep()` 的现有条件 `record.status !== 'completed' || !record.winner` **不改**：不设 `winner` 就自动不发 finalizer 契约；为 fallback / abstain 新增一条非 finalizer relay（复用 `buildAutopilotRelay()` 非 winner 分支的措辞 + fallback 摘录 + 明示「未经候选间比较 / 证据不足」）
+- `planAutopilotTask()`：从 `ACTION_SIGNAL` 拆出修改类动词 + 路径 / 代码围栏信号 → `taskKind`，写入 `policy.taskKind`；只有分析类动词且无路径 → `analysis-text`（进入 BoN 则全程 `llmOnly`，最高 `ranked_winner(llm-only)`）
+
+预计改动：`candidates.ts` 约 40 行、`autopilot.ts` 约 30 行、`src/index.ts` 约 10 行、`live.ts` 1 个 diff 辅助函数；`test.mjs` 新增 5 条（F1–F4 + 完全平分）。以上为阅读源码后的定位与草案，**未在本机编译或运行**。
+
+### J.5 追问 D 补充：校准实验的实际入口
+
+- 直接向 sidecar 发 `select` 帧（协议见 `bridge/PROTOCOL.md`；`eval/smoke/sidecar_live_smoke.py` 可作模板）：`candidates` 给两段固定文本，`n_evaluations=1, pivots=0, max_workers=1, effort='low'`（与自动路径一致），`seed` 固定 0 与随机各一组，每组 ≥20 次，记录 `scores` 差与 `usage`
+- C0：`PREFLIGHT_GOOD` 文本复制两份；C1：`PREFLIGHT_GOOD` vs `PREFLIGHT_BAD`（`bridge.ts` 内置）；C2：自造「TOOL RESULT 含 PASS」vs「仅 ASSISTANT 声称 PASS」两段
+- 顺带闭合 8192 问题：`usage.output_tokens / reasoning_tokens / calls` 给出每次比较的真实输出规模；历史 ledger 中 8 条 ranking 记录的 `usage` 字段可先看，不必新跑
+
+### J.6 裁决变化
+
+- 方向不变；**强度上调**：自动路径没有任何确定性验证（B-7），winner gate 不是「加严」而是「从零建立」；single-candidate 被当选优的位置已定位到 `buildAutopilotRelay()` 的同一份 finalizer 契约
+- F 单一优先级仍为 winner gate；evidence visibility 的修复范围已精确到 4 处，可作独立小 PR 与 gate 并行，不再需要争位次
+- C：8192 结论加固——ranking 与 8192 无关；legacy 真正的缺陷是 16000 / 18000 预算不一致导致尾截，修法是统一预算，不是抬上限
+- 新增待确认高风险项 B-9；若成立，则「后置审计先于 cleanup」（I.5）从建议升级为必须
+
+## K. ledger 级回放（2026-09-07；v1.4 于 2026-09-08 补齐至 47/47 行）——`selections.jsonl` 全量直读 + 本机核查读数
+
+> 读取范围：selections_jsonl（用户上传到架构页下的 ledger 副本，38 行）+ 证据附件｜selections.jsonl 物理第 39–47 行（2026-09-08）（第 39–47 行原文，99,219 字节，SHA-256 `2c0a5155…c52c` 与用户本机一致，9/9 行解析成功）。**v1.4 已补齐**：47/47 行 / 39 条唯一 `selectionId`（8 条重复写入：f78b5d20、a79f6c44、4b1d0031、290185b9，以及末 9 行内的 cd6590de、1b5c286c、fa093cb5、1c8d28ef——重复对只在 `winner.discardedAt` 上不同）。末 9 行新增 5 条唯一记录：sel-ac011a39、sel-1b5c286c、sel-70bb7aa4、sel-fa093cb5、sel-1c8d28ef，并含 sel-cd6590de 的完整 finalists；v1.3 标「用户侧读数」的三条已全部原文核对、数值一致。末 9 行出现的新字段：`verificationPasses`、`winner{index,sessionId,workspace,discardedAt}`、`finalists[].model`、`policy.contextChars`、`candidates[].agentOptions`、`eliminatedBy`；`records.jsonl` 未直读，「94/191、最大 18052」同为用户侧读数。解析：Notion 导入把 JSON 塞成单段并做了 markdown 转义，34 条顶层字段全部解析成功；仅 sel-a79f6c44 的 `candidates[]` 因 handoff 文本被转义而按原文手工回填（c0 failed `candidate-timeout`、`toolCalls=10`；c1 winner `toolCalls=7`、`trajectoryChars=14593`）。回放规则 = J.4 草案：`nComparisons=0` → 有 checks 且全过为 `objective_only_result`，否则 `single_candidate_fallback`；`nComparisons>0` → top-2 分差不低于临时阈值为 `ranked_winner`，否则 `abstain`（同时给 0.08 与 0.025 两档）；winner `toolCalls=0` → `insufficient_evidence`。ledger 无 `taskKind` 与 diff 字段，证据门只能用 `toolCalls` 代理，其不足见 K.4-1。
+>
+
+### K.1 总览（39 条唯一记录 / 47 行，北京时间）
+
+| 维度 | 数值 |
+| --- | --- |
+| 状态 | `completed` 20 ｜ `failed` 14 ｜ `aborted` 5 |
+| 按触发 | legacy（无 `trigger` 字段，08-27 → 08-30）19：15 completed / 1 failed / 3 aborted ｜ `autopilot`（08-31 起）13：**3** completed（sel-a79f6c44 single-candidate、sel-fa093cb5 verifier、sel-1c8d28ef single-candidate）/ 8 failed / 2 aborted ｜ `manual` 7：2 completed（sel-cd6590de、sel-1b5c286c）/ 5 failed |
+| 08-31 之后（autopilot 上线后） | 20 条中 5 条 completed / 13 failed / 2 aborted；**自动路径的 verifier 排序 winner 全量只有 1 条**——sel-fa093cb5（0.4941 / 0.5059，分差 0.0118，回放 `abstain`）；另一条 autopilot completed sel-1c8d28ef 为 single-candidate（3 候选 2 timeout，winner `toolCalls=0`） |
+| candidates 合计 | 95：winner 20 / loser 16 / finished 18 / failed 20 / eliminated 6 / created 15（`created` = 未跑完即整轮中止；末 9 行新增 11 条候选，最长 9596 字，无新增超限） |
+| 候选失败原因 | `candidate-timeout` 11（含 sel-1c8d28ef 的 c1、c2）｜ `workspace-prepare: source-workspace-not-git` 3 ｜ 整轮 abort 3 ｜ 模型配置错误 3（`agent … has no provider/model` ×2、`pi-ai provider "kimi" has no configured model "minimaxai/minimax-m3"` ×1） |
+| 非 completed 的 19 条 | **verifier 侧不可用 / 预算 / 中止 14**（preflight 平分 1、preflight 绝对预算 2、preflight 被中止 3、ranking 429 限流 2、ranking 900000ms×4 ≈ 66 min 超时 1、ranking 绝对预算 4——新增 09-06 的 sel-ac011a39（verifier kimi-k3）与 sel-70bb7aa4（minimax-m3、effort=max）、ranking 被 caller 中止 1）；`all_candidates_eliminated` 4（1 条 check 本身失效 K.4-3、1 条 `source-workspace-not-git`、1 条 timeout+check、1 条 3 候选全 timeout）；候选跑完后整轮中止 1 |
+
+### K.2 20 条 `completed` 的门禁回放
+
+| # | selection | 时间 | trigger | N / 幸存 / nCmp | basis（字段或推断） | top-2 分差 | winner toolCalls | winner checks | 回放 @0.08 | @0.025 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | sel-bfa3f150 | 08-27 06:13 | legacy | 1 / 1 / 0 | 单候选（无字段） | — | 0 | — | `insufficient_evidence` | 同左 |
+| 2 | sel-f80ee60e | 08-27 06:23 | legacy | 1 / 1 / 0 | 单候选（无字段） | — | 12 | — | `single_candidate_fallback` | 同左 |
+| 3 | sel-82d5d500 | 08-27 06:28 | legacy | 3 / 1 / 0 | 单候选（c0 被 check `mean-output` 淘汰、c2 timeout） | — | 10 | ok | `objective_only_result` | 同左 |
+| 4 | sel-412c0c1d | 08-27 06:34 | legacy | 3 / 3 / 5 | verifier（nemotron-super） | 0.00057 | 15 | ok | `abstain` | `abstain` |
+| 5 | sel-7cf438b7 | 08-27 11:00 | legacy | 1 / 1 / 0 | 单候选（无字段） | — | 0 | — | `insufficient_evidence` | 同左 |
+| 6 | sel-3699fb1c | 08-28 12:32 | legacy | 3 / 3 / 5 | verifier（kimi-k3） | 0.00164 | 2 | ok | `abstain` | `abstain` |
+| 7 | sel-9e4c14ea | 08-28 12:39 | legacy | 3 / 3 / 5 | verifier | 0.00438 | 3 | ok | `abstain` | `abstain` |
+| 8 | sel-5fe0b270 | 08-28 12:44 | legacy | 3 / 3 / 5 | verifier | 0.00219 | 2 | ok | `abstain` | `abstain` |
+| 9 | sel-512133e4 | 08-28 13:08 | legacy | 3 / 1 / 0 | 单候选（c1、c2 `no provider/model` 配置错误） | — | 3 | ok | `objective_only_result` | 同左 |
+| 10 | sel-7f671e2f | 08-28 13:15 | legacy | 3 / 1 / 0 | 单候选（c1 配置错误、c2 被 check `smoke` 淘汰） | — | 4 | ok | `objective_only_result` | 同左 |
+| 11 | sel-8d778422 | 08-28 13:27 | legacy | 3 / 2 / 3 | verifier | 0.00877 | 8 | ok | `abstain` | `abstain` |
+| 12 | sel-4fcbc905 | 08-28 14:28 | legacy | 3 / 2 / 3 | verifier | **0.2985**（0.649 / 0.351） | 4 | ok | **`ranked_winner`** | `ranked_winner` |
+| 13 | sel-f78b5d20 | 08-28 18:37 | legacy | 3 / 3 / 5 | verifier | 0.00481 | 2 | ok | `abstain` | `abstain` |
+| 14 | sel-4b1d0031 | 08-30 09:07 | legacy | 3 / 1 / 0 | 单候选（c0、c1 timeout） | — | 5 | — | `single_candidate_fallback` | 同左 |
+| 15 | sel-290185b9 | 08-30 10:52 | legacy | 2 / 2 / 3 | verifier | 0.0258（0.4871 / 0.5129） | 2 | — | `abstain` | `ranked_winner` |
+| 16 | sel-a79f6c44 | 09-01 03:03 | autopilot | 2 / 1 / 0 | `single-candidate`（c0 timeout） | — | 7 | — | `single_candidate_fallback` | 同左 |
+| 17 | sel-cd6590de | 09-05 21:53 | manual | 2 / 2 / 2 | verifier（minimax-m3） | 0.0000000094 | 3（全为元工具） | — | `abstain` | `abstain` |
+| 18 | sel-1b5c286c | 09-06 00:56 | manual | 2 / 2 / 2 | verifier（minimax-m3） | 0.0132（0.4934 / 0.5066） | 3（`write{}` 空参报错、`write`、`read`；两候选逐字相同） | 1/1 `result-file` ok（两候选均过） | `abstain` | `abstain` |
+| 19 | sel-fa093cb5 | 09-06 03:35 | autopilot（standard，effort=low） | 2 / 2 / 2 | verifier（minimax-m3） | 0.0118（0.4941 / 0.5059） | 6（全为 pwsh 只读命令） | — | `abstain` | `abstain` |
+| 20 | sel-1c8d28ef | 09-06 20:05 | autopilot（deep） | 3 / 1 / 0 | `single-candidate`（c1、c2 timeout） | — | **0** | — | `insufficient_evidence` | 同左 |
+- 汇总 @0.08：`ranked_winner` 1 ｜ `abstain` 10 ｜ `objective_only_result` 3 ｜ `single_candidate_fallback` 3 ｜ `insufficient_evidence` 3 → **20 条 completed+winner 中 19 条不应叫 ranked_winner**；@0.025 只多出 sel-290185b9 一条（18/20）。v1.3 的 16/17 → v1.4 的 19/20：新增 3 条无一通过门禁。两档阈值结论一致——门禁上线不必等 I.4 校准完成。
+- 11 条 verifier 排序的 top-2 分差（全量原文）：中位数 0.0048；`< 0.01` 7 条、`< 0.025` 9 条、`< 0.08` 10 条；只有 sel-4fcbc905（0.2985）分开。09-05/06 三条 minimax-m3 排序（cd6590de ≈0、fa093cb5 0.0118、1b5c286c 0.0132）全部落在噪声带；其中 1b5c286c 两候选工具序列逐字相同、fa093cb5 两候选只读结论一致，是 ledger 里现成的 C0「等价候选」对照——J.5 校准出的门禁至少要高于 0.0132。
+- 「0.026」是 sel-290185b9 的极差观测（9 条中第二大），不是噪声分位数——I.4 的立场不变。
+- 5 条「N=3、5 次比较」记录里，3 条恰有一个候选 `score = 0.5`（3699fb1c、9e4c14ea、5fe0b270），412c0c1d 的 c1 为 0.50000002：listwise 聚合存在对称点，分辨力问题不只是模型。
+- 旧记录的 `nComparisons=0` 项没有 `winnerBasis` 字段：按字面读 ledger 会把 8 条兜底记录与 verifier 排序记录同样读成 `completed + winner`。
+
+### K.3 `usage` 与截断规模 → C 项闭合
+
+| selection | calls | nComparisons | output_tokens | 每次调用输出 | input_tokens | reasoning_tokens |
+| --- | --- | --- | --- | --- | --- | --- |
+| sel-412c0c1d | 5 | 5 | 777 | 155 | 53077 | 0 |
+| sel-3699fb1c | 8 | 5 | 4199 | 525 | 47924 | 0 |
+| sel-9e4c14ea | 8 | 5 | 4207 | 526 | 75550 | 0 |
+| sel-5fe0b270 | 8 | 5 | 3730 | 466 | 56786 | 0 |
+| sel-8d778422 | 4 | 3 | 2829 | 707 | 47268 | 0 |
+| sel-4fcbc905 | 4 | 3 | 1774 | 444 | 51338 | 0 |
+| sel-f78b5d20 | 32 | 5 | 13725 | 429 | 169624 | 0 |
+| sel-290185b9 | 8 | 3 | 3329 | 416 | 17168 | 0 |
+| sel-cd6590de | 2 | 2 | 598 | 299 | 10736 | 0 |
+| sel-1b5c286c | 2 | 2 | 1423 | 712 | 4318 | 0 |
+| sel-fa093cb5 | 6 | 2 | 7370 | 1228 | 31896 | 0 |
+- 每次调用输出 155–1228 token（最大 sel-fa093cb5：effort=low 仍 6 次调用 / 2 次比较），`reasoning_tokens` 全为 0（可能是中转服务不上报思考 token，但 `output_tokens` 已含全部计费输出）→ **8192 对 ranking 从未生效**；C 项在 ledger 级闭合。
+- `calls` ≠ `nComparisons`（5/5、8/5、4/3、32/5、2/2、6/2）：`llm_verifier` 内部存在位置对换 / 重试 / pivot 之类的额外调用，调度规则仍未知。sel-f78b5d20 的 32 次调用、169624 input token 是单次 ranking 成本的上限样本。
+- selection 侧截断规模：95 条候选中 `trajectoryChars > 16000` 11 条、`>= 23000`（贴近 `renderTrajectory()` 的 24000 头截上限）5 条、最大 23676 → ranker 在至少 5 个候选上看不到开头。winner `trajectoryChars > 14000`（`boundCandidateHandoff` 上限）3 条：412c0c1d 14463、8d778422 16907、a79f6c44 14593 → 这 3 个 winner 的 finalizer 拿到的是 35% / 65% 摘录。
+- legacy 侧（用户侧读数）：94/191 条 `traceChars > 16000`、最大 18052 → 全部在 16000–18050 区间；至多 1 条触发 `compactTrace()`，其余 93 条是 `buildVerifierPrompt()` 直接切尾（最多 2052 字符），恰是最终答复与最后一个 E 行所在。
+
+### K.4 副本中此前未记录的实例
+
+1. **sel-cd6590de：两位 finalist 都明确报告「任务无法执行」，仍 `completed` + `winnerBasis=verifier`。** handoff 原文：c0「Task cannot be performed」（工具目录无写文件 / shell）；c1「not reachable via any tool I currently have」。winner c0 `toolCalls=3`，三次全是元工具（`tool_slimmer_catalog`、`tool_search` ×2）。→ J.4 的 `toolCalls === 0` 代理**不足**，必须按工具类别计数或直接用 `diffStat`。这是 E-1 的第二个已发生实例，且比 H-0905 §6.2.2 的「只产解释性文本」更硬——候选自己声明做不到。
+2. **sel-a79f6c44（副本内唯一一条 autopilot completed）的 winner 提交不在目标仓库。** handoff（E01–E21）：`node --test` 子进程 spawn EPERM → 改为进程内跑测试；`git commit` 因 `index.lock: Permission denied` 失败；随后 `Remove-Item -Force .git`（删掉 worktree 的 `.git` 链接）→ `git init -b main` → 在全新仓库提交 `e0a8d9d`。`trajectoryChars=14593 > 14000` → handoff 带 `[... bounded ...]` 截断标记，finalizer 看到的是摘录。finishedAt → discardedAt = 271 s。→ 候选的「已提交」≠ 提交进目标仓库；H-0905 §0c 的「端到端闭环」旁证需重新解读；I.5 审计包必须含 `HEAD before/after` 的直接理由。
+3. **sel-5e84f540：check 命令本身失效 → 两候选被误杀。** `result-file-content` 的 `outputTail` 是 pwsh 解析错误「The term '=' is not recognized…」「-eq is not recognized…」、exit=1 → `all_candidates_eliminated`。→ 新风险 B-10：`checks.ts` 只看退出码，无法区分「候选没做对」与「check 写错」。sel-bbc7de5a 同名 check 再次淘汰候选（tail 为空，无法判定）。
+4. **sel-10582485：preflight 把 nemotron-3-super 在内置好 / 坏对上判为 0.500/0.500 而拒绝**；同一 verifier 4 小时前在 sel-412c0c1d 上被接受，并给出 0.00057 的「裁决」。→ preflight 通过 ≠ 对真实候选有分辨力；preflight 的 `PREFLIGHT_GOOD/BAD` 对与 C1 实验同构，可直接复用为校准入口（J.5）。
+5. **批量回收**：sel-290185b9 / 4b1d0031 / f78b5d20 的 `discardedAt` 都落在 08-30 22:24 的 4 秒内，而 winner 分别完成于 11–52 小时前 → legacy / manual winner 工作区寿命由 operator 手动 discard 决定，与 autopilot 的「下一次 idle」是两套规则（J.1-13）；期间任何事后核验都依赖 operator 没有先点 discard。
+6. **模型配置错误进入候选池**：sel-512133e4 的两名对手因 `agent … has no provider/model` 未起跑，sel-7f671e2f 一名对手因 `pi-ai provider "kimi" has no configured model` 未起跑——三条「单幸存者」里有两条的幸存原因是配置错误而非任务表现；配置快照（I.5）应在起跑前校验模型可解析。
+7. **sel-1c8d28ef（全量最新一条，v1.4 新增）：autopilot deep 把 source 的「收口汇报」当成任务，起 3 个候选，两个 `candidate-timeout`，唯一幸存者 `toolCalls=0`、handoff 只有 4 个事件（E01–E04），仍 `completed` + winner（autopilot 流程随即 relay 给 source；ledger 不记录送达）。** 任务原文（E01）是 source agent 的完成汇报——「已继续完成并收口…`npm test` 173 passed…真实 live 证据 sel-fa093cb5 / sel-70bb7aa4」——不含任何待做动作；winner c0 的全部输出是「任务已标记完成，我确认该状态」。deep 档（N=3 / K=2）为此消耗 400 s。→ 同时命中 E-1（无工具成 winner）与 E-2（single-candidate 兜底），并暴露一个此前未列的缺陷：autopilot 触发判定不区分「任务」与「状态汇报」。J.4 规则下应为 `insufficient_evidence` 且不投递。finishedAt → discardedAt = 345 s。
+8. **sel-70bb7aa4 → sel-fa093cb5（v1.4 新增）：同一 smoke 任务 15 分钟内两次 autopilot，effort=max 撞绝对预算失败（744 s，两候选均已完成，6569 / 9596 字），改 effort=low 后「完成」——完成的是分差 0.0118 的抛硬币。** 任务是对 2 文件 fixture（`# live smoke`，detached HEAD `6e5e96d`）的只读 git 检查；两候选都给出正确且一致的结论（detached HEAD、工作树 clean），verifier 6 次调用 / 7370 output token 给出 0.4941 / 0.5059。这就是 H-0905 头部「autopilot 低强度 M3 完成真实 2 次比较」的记录：它证明管线跑通与非阻塞，不证明选优——「pipeline success ≠ quality improvement」的直接实例。`policy.contextChars=646`：候选拿到的上下文包只有 646 字。
+9. **sel-1b5c286c（v1.4 新增）：两候选工具序列逐字相同（`write{}` 空参报错 → `write` → `read`），`result-file` check 双过，verifier 仍给 0.4934 / 0.5066 并记 `winnerBasis=verifier`。** 确定性证据已判平局，LLM 成为唯一 tie-breaker 且被记为「依据」——E-7 的最干净实例，也是现成的 C0 对照点（等价候选分差 0.0132）。同一 fixture 18 分钟前的 sel-ac011a39 用 kimi-k3 做 verifier 撞绝对预算：两候选 `result-file` 均 exit 0 / `check-ok`，确定性证据足以给出 `objective_only_result`，却整条记 `failed`——verifier 不可用时没有降级路径（K.5 `verifier_unavailable` 的第 13、14 个实例）。
+10. **autopilot winner 的 finishedAt → discardedAt：82 s（fa093cb5）/ 271 s（a79f6c44）/ 345 s（1c8d28ef）。** 82 s 内 source 完成「收 relay → 检查 winner 工作区 → 集成 → 测试」几乎不可能，更符合「relay 送达后 source 很快 idle → 清理」或「未消费即清理」；但 ledger 仍无 relay 入队 / 消费事件，B-9 维持 live-only。附：末 9 行 finalist handoff 中运行时 NOTICE 快照占 11–35%（1b5c286c 两候选各 35%），verifier 比较的文本里有大量两侧完全相同的模板。
+
+### K.5 对 J.4 / I.2 / I.5 的修正
+
+- has-work 门禁：`toolCalls > 0` 代理不够（K.4-1），改为「执行类工具调用 `> 0` ∨ `diffStat` 非空」；元工具白名单在 `renderTrajectory()` 计数处过滤即可。
+- 新增候选级 `check-invalid`（B-10）：退出码非 0 且 `outputTail` 匹配解释器解析错误特征（pwsh「is not recognized as a name of a cmdlet」等），或 check 在已知通过样本上也失败 → 该轮 checks 记 `checksInvalid=true`、不淘汰候选、outcome 最高 `llm-only`，不得记 `all_candidates_eliminated`。
+- selection 级新增 `verifier_unavailable`：非 completed 的 19 条里 14 条是 verifier 侧不可用 / 预算 / 中止（其中 sel-ac011a39 两候选 checks 全过却整条 failed，K.4-9）——必须与 `abstain` 严格区分，基础设施故障不是裁决。
+- 临时阈值：0.08 与 0.025 在 9 条历史记录上的差别只有 sel-290185b9 一条，无论取哪档结论不变——**门禁上线不必等 I.4 校准**，回放直接支持 I.1 的立场。
+- I.5 审计包必须含 `HEAD before/after` 与 worktree `.git` 完整性检查（K.4-2 的候选删除并重建了 `.git`），以及 checks 的完整 `outputTail`（K.4-3 只靠 2000 字符尾部才被发现）。
+
+### K.6 裁决变化
+
+- 方向不变、证据等级上调：J 说的是「源码上没有门禁」，K 说的是「ledger 上 16/17 条 completed+winner 不该叫 ranked_winner」。
+- 本机核查对 F 项的表述「不是加严而是缺失」成立，与 J.6 一致；C 项由 `usage`（ranking 侧）与 94/191（legacy 侧）双向闭合。
+- B-9 保持「待 live 复现」：ledger 没有 relay 入队 / idle 事件的时序字段；a79f6c44 的 271 s 与「relay 轮结束后 idle」「排队期间 idle」两种解释都相容，不能从 `discardedAt` 单独判定。
+- 本机核查指出的最大盲区（候选执行成功 ≠ 结果正确）已有实例：a79f6c44 的「已提交」发生在候选自建的仓库里；winner gate 修好后仍需 G-4 后置审计才能回答「交付了吗」。
+- v1.4（09-08）：ledger 证据缺口已闭合（47/47 行），裁决不变、证据等级再升一级——「16/17」变为「19/20」，且全量唯一一条自动路径 verifier winner（sel-fa093cb5）本身就是 abstain 案例。「先修 winner 状态与证据门禁、evidence visibility 并行、8192 与大评测集后置」维持；P0 内新增子项：autopilot 触发判定排除「状态汇报」类消息（K.4-7）；`verifier_unavailable` 时若 checks 齐全应降级为 `objective_only_result` 而非 `failed`（K.4-9）。
+- 下一步材料：`llm_verifier.select()` 调度（calls / nComparisons 实测 2/2、2/2、6/2）；live `/state`；relay 入队 / 消费事件（B-9）。
+
+## 未知清单（只有本机能核）
+
+**v1.3 已闭合 / 部分闭合**
+
+- ✅ `.data/selections.jsonl`：**47/47 行已直读**（K 节；第 39–47 行来自 证据附件｜selections.jsonl 物理第 39–47 行（2026-09-08），99,219 字节，SHA-256 `2c0a5155…c52c` 与本机一致，9/9 行解析成功；附件在客户端的预览是否完整显示与证据无关——本页读的是附件原文件）
+- ✅ `.data/records.jsonl` `traceChars` 大于 16000 的记录数：**94/191**，最大 18052（用户本机核查读数，本页未直读）→ legacy 尾截为已发生缺陷（E-4、K.3）
+- ✅ selection 侧输出预算是否触顶：ledger `usage` 每次调用不超过 1228 output token（K.3，sel-fa093cb5）→ 否；但 `llm_verifier` 内部的 max_tokens 实值本身仍未知
+- ✅ H-0905 头部「autopilot 低强度 M3 完成真实 2 次比较」的 selection ID：**sel-fa093cb5**（原文核对：autopilot、effort=low、minimax-m3、nComparisons=2、0.4941 / 0.5059、回放 `abstain`，见 K.4-8）
+
+**仍未知**
+
+- `llm_verifier.select()` 内部：每次比较的 max_tokens / temperature / seed 调度；`calls` 为何是 `nComparisons` 的 1–6 倍（位置对换？重试？pivot？）
+- 当前 live `selectionModelStrategy`、`selectionModels`、`verifierEffort` 实值（`GET /state`）
+- B-9：ledger 无 relay 入队 / idle 事件时序字段，**待 live 复现**（方法见 J.2）
+- `verificationPasses`（末 9 行三条 verifier-completed 记录均为 1）的语义：更像评估轮数而非「通过的验证数」，易被误读为「已验证」——待源码确认（审计口径第 5 类：可能被错误命名的状态）
+- `/verify` 报告是否被用于人工判定交付可信（决定 J.4-E 的位次）
+- `src/selection/live.ts` 的 worktree 快照与 `sandboxMode` 细节（未读）
+- sel-a79f6c44 之后 source 的集成提交是否真的包含 winner 的 diff（H-0905 §0c 只有旁证；候选自己的提交 `e0a8d9d` 在其重建的仓库里）
+
+---
+
+类型：审计（决策输入）｜时间：2026-09-07｜状态：当前（v1.4，含二轮复核第 I 节、源码级复核第 J 节、ledger 级回放第 K 节；2026-09-08 以第 39–47 行原文补齐 K）｜证据来源：见页首口径；第 I 节含用户侧本地读数；第 J 节为 GitHub 仓库 main 源码直读；第 K 节为 selections_jsonl 页 + 证据附件页合计 47/47 行直读 + 用户本机核查读数（records.jsonl 94/191）｜影响范围：架构页 P0 定义与首条表述、事实基线 callout、问题清单 K1（需拆 legacy / BoN 两条路径）｜下一动作与验收：I.7 第 1–3 步（替代 G-1 ～ G-3 的顺序）；验收标准见 D-3 表与 I.4。

@@ -17,12 +17,32 @@ export interface TrajectoryRender {
   eventCount: number
   renderedLines: number
   toolCalls: number
+  /** Tool calls excluding catalog/meta discovery tools. The winner gate counts
+   *  only execution evidence: a candidate whose toolCalls are all tool_search
+   *  or tool_slimmer_catalog never touched the workspace (ruling K.4-1). */
+  execToolCalls: number
   truncatedCells: number
   totalChars: number
 }
 
 const DEFAULT_CELL_CAP = 2000
 const DEFAULT_TOTAL_CAP = 24000
+
+/** Meta/navigation tools that never modify the workspace or execute anything.
+ *  tool_call is a dispatcher: its inner name is not visible in the event we
+ *  see, so it conservatively counts as meta (never as execution evidence). */
+const META_TOOLS = new Set([
+  'tool_search',
+  'tool_describe',
+  'tool_call',
+  'tool_slimmer_catalog',
+  'tool_slimmer_update_config',
+  'list_agents',
+])
+
+export function isMetaToolName(name: unknown): boolean {
+  return typeof name === 'string' && META_TOOLS.has(name)
+}
 
 function asText(content: unknown): string {
   if (typeof content === 'string') return content
@@ -59,6 +79,7 @@ export function renderTrajectory(
   let cursor = 0
   let truncatedCells = 0
   let toolCalls = 0
+  let execToolCalls = 0
   let included = 0
   for (const ev of events) {
     if (typeof ev.seq === 'number' && ev.seq < fromSeq) continue
@@ -86,6 +107,7 @@ export function renderTrajectory(
     }
     if (ev.type === 'tool/call') {
       toolCalls += 1
+      if (!isMetaToolName(data.name)) execToolCalls += 1
       const s = summarize(data.arguments, cellCap)
       if (s.truncated) truncatedCells += 1
       push('TOOL CALL ' + String(data.name ?? 'unknown') + ': ' + s.text)
@@ -112,6 +134,7 @@ export function renderTrajectory(
     eventCount: included,
     renderedLines: lines.length,
     toolCalls,
+    execToolCalls,
     truncatedCells,
     totalChars: text.length,
   }

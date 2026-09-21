@@ -2,20 +2,30 @@
 
 DSH plugin for adaptive best-of-N candidate generation, objective filtering, verifier ranking, and source-agent finalization.
 
-> Current status (2026-09-05): the full candidate-selection pipeline has completed live end to end. `sel-1b5c286c` (manual, N=2, K=1, P=0, effort=max, verifier=minimaxai/minimax-m3, 202 Accepted) ran workspaces → preflight → two real candidate rollouts → objective checks → verifier tournament (2 comparisons, winnerBasis=verifier, scores 0.4934/0.5066, winner=c1) → winner retained → operator discard 200, workspaces gone. Earlier same-day runs pin the two failure modes that used to block this: ranking under kimi-k3 at max effort exceeded its budget (`sel-7fad98df`), and the legacy 300s selection-time budget was too small even for minimax-m3 at max effort (`sel-ac011a39`) — the ceiling is now 600s. The discard path itself was broken by a foreign-git-repo lease-discovery bug and is fixed with a regression test. HANDOFF.md remains the authoritative takeover document.
+> Current status (2026-09-08): the 裁决9.8 evidence-semantics overhaul has landed and is gate-green (191/191 tests). Selections now end in an explicit `outcome` state machine — `ranked_winner | objective_only_result | single_candidate_fallback | insufficient_evidence | abstain | verifier_unavailable` — guarded by a has-work gate (execution-class tool calls or a real worktree diff), a no-search-space dedupe, a **calibrated margin gate** (top-2 margin < 0.03 ⇒ abstain; 0.03 = 2.2× the measured identical-candidate noise ceiling, see below), and harness-error detection that stops broken check commands from eliminating candidates. Candidate models are probed for liveness before planning. A `single_candidate_fallback` is retained but never framed as a chosen best, and every outcome has its own relay contract. Every selection writes an audit pack to `.data/selection-artifacts/<id>.json` before any cleanup. Legacy five-lane citation audits now trust only prompt-visible evidence IDs, and trace compaction uses one shared 16000-char budget so the final answer cannot be truncated away.
 >
-> Current usable defaults: free Kimi relay at `https://chat.holisthoom.top/v1`, verifier `minimaxai/minimax-m3`, `selectionMode=auto`, and feedback off by default. Automatic selection uses a small `N=2/K=1/P=0` standard tournament (`deep` uses N=3 and at least K=2) so the source turn is not blocked by a long relay call. The larger N/K/P values remain explicit operator controls. `kimi-k3` and the older DeepSeek route remain selectable, but are not sensible max-effort defaults while their relay latency is unstable.
+> **Calibration round 1 (2026-09-08, `eval/calibration/run.mjs`, minimax-m3 @ effort=low, 36 select frames / 48 underlying calls, 0 failures):** C0 identical-pair noise sat at median 0.0039 / q95 0.0123 / max 0.0135 with **no positional bias** and no 0.5-pinning; C1 oracle-separated pairs (preflight good/bad, both orders) separated at margin ≈ 0.462 with 6/6 correct signs; C2 near pairs (5/5 vs 4/5 tests) separated at 0.31–0.42, 6/6 correct. The margin gate therefore moved 0.08 → **0.03** (still marked provisional until replicated across ≥5 fixtures). The relay's verifier does discriminate: same-candidate ≈ coin flip, real gaps ≈ 33× the noise floor.
+>
+> Live evidence boundary, kept honest: every pre-gate `winnerBasis=verifier` record sits inside the measured noise band (only sel-4fcbc905, margin 0.2985, clears even the old 0.08 bound). What is now proven: the pipeline cannot silently claim a winner from noise; what remains unproven: that its choices improve end-delivered quality on real tasks.
+>
+> Current usable defaults: free Kimi relay at `https://chat.holisthoom.top/v1`, verifier `nvidia/nemotron-3-super-120b-a12b`, and feedback off by default. The verifier route was re-probed on 2026-09-13 (HTTP 200, protocol tags + logprobs, ~6s per call); `z-ai/glm-5.3-flash` was retired as a default because at `effort=max` its reasoning phase ran for minutes and starved the lane deadline. Both verifier and candidate model IDs are operator-editable; the candidate provider catalog is discovery metadata, while configured custom IDs are probed directly. Automatic selection uses a small `N=2/K=1/P=0` standard tournament (`deep` uses N=3 and at least K=2) so the source turn is not blocked by a long relay call. The larger N/K/P values remain explicit operator controls.
+>
+> **Relay account-pool execution (2026-09-16):** the relay assigns its upstream accounts PER REQUEST round-robin, so plugin-side concurrency is what actually engages the pool — a serial verifier chain always hits "the current account" and stalls whole when it is rate-limited. Three knobs now implement the parallel/smooth/tiered model: `selectionVerifierWorkers` (tournament ThreadPool concurrency; `0`=auto 4 — concurrent calls land on independent accounts, call-count identity `calls = nComparisons × criteriaCount × K` unaffected), `verifierMinIntervalMs` (token-bucket dispatch spacing shared by the five-lane verifier and the tournament sidecar, `0`=off), and `verifierSmallModel` (mechanical session lanes — completion/evidence — run a cheap tier like `nvidia/nemotron-3-ultra-550b-a55b`; adversarial/repair lanes and the tournament keep the main model). Inside the tournament the sidecar also retries each HTTP 429 up to twice with small backoffs: the round-robin has already advanced, so the retry lands on a different account instead of waiting for the stuck one.
 
 ## Architecture
 
 ~~~text
 source task
-  -> autopilot admission and standard/deep N/K policy
+  -> autopilot admission and standard/deep N/K policy (task kind classification filters status reports)
   -> isolated Git worktrees and real child rollouts
-  -> turn/timeout/progress/check elimination
+  -> turn/timeout/progress/check elimination (shell-parse errors never eliminate)
+  -> has-work gate: code/file tasks need exec-class tool calls or a real diff
+  -> no-search-space dedupe when survivors produce identical diffs
   -> Kimi verifier preflight and strict ranking validation
-  -> bounded winner/finalist evidence relayed to the original source agent
+  -> margin gate: noise-band ties abstain; only a cleared margin is a winner
+  -> outcome-labeled relay to the original source agent (winner / fallback / abstain / insufficient_evidence)
   -> source agent inspects, integrates, tests, and delivers
+  -> autopilot winner/fallback audited (HEAD before/after) and cleaned on source idle/dispose
 ~~~
 
 The plugin does not merge candidate files by itself. It injects a finalizer contract into the original source turn. Candidate workspaces and excerpts are untrusted evidence.
@@ -32,25 +42,32 @@ Two paths coexist:
 | selectionMode | auto |
 | candidate provider | kimi |
 | candidate model strategy | quality-first (default); exploration is explicit opt-in |
-| candidate models | minimaxai/minimax-m3,nvidia/nemotron-3-super-120b-a12b,nemotron-3-ultra-550b-a55b,kimi-k3,deepseek-ai/deepseek-v4-pro-0813 (quality order) |
+| candidate models | nvidia/nemotron-3-super-120b-a12b (default; quality order is fully operator-editable; custom IDs are probed directly even when absent from `/models`) |
 | standard / deep | N=2 / N=3 |
 | evaluation rounds K | 1 by default; deep is clamped to at least 2 |
 | pivot iterations P | 0 by default (higher values are explicit quality runs) |
 | verifier effort (思考强度) | low by default for automatic runs (off/low/high/max), shared by lane and tournament verifiers |
 | lane timeout / output cap | 180000ms / 8192 tokens (max) |
-| autopilot candidate timeout | 300000ms |
+| autopilot candidate timeout | 600000ms |
 | selection timeout | 600000ms, clamped to 30000..600000ms (ceiling raised 2026-09-05 for max-effort ranking) |
-| verifier | minimaxai/minimax-m3 via https://chat.holisthoom.top/v1 and KIMI_API_KEY |
+| verifier | nvidia/nemotron-3-super-120b-a12b via https://chat.holisthoom.top/v1 and KIMI_API_KEY |
 | verifier workers | 1 |
+| margin gate | 0.03 (`selectionMarginThreshold`, range 0..0.5; calibration round 1, still provisional) |
+| candidate model probing | on (`selectionProbeEnabled`) — dead catalog entries are dropped before planning |
+| source post-audit tests | off (`selectionPostAuditTestCommand`, default empty) |
 
 The source/finalizer model belongs to the original DSH session and is not fixed or recorded by the selection ledger. Historical 900000ms and preflight ranking failures used kimi-k3, not GPT.
 
 ## Important Contracts
 
-- Autopilot requires a resolvable Git repository and an exact dirty-worktree snapshot. Unknown ignored source/config files fail instead of disappearing.
+- Autopilot requires a resolvable Git repository and an exact dirty-worktree snapshot. Unknown ignored source/config files fail instead of disappearing. Admission refuses status reports and session-control messages; the task kind (code-change / analysis-text) is classified deterministically at admission and stored in the record.
 - Candidate rollouts are parallel; worktree preparation and objective checks are sequential.
-- Caller-supplied checks run through pwsh in the candidate cwd. They are not a command allowlist sandbox, and Windows timeout does not kill grandchildren.
-- Multiple survivors require a valid verifier ranking. A sole survivor is explicitly objective-check-only or single-candidate and gets no synthetic score.
+- Caller-supplied checks run through pwsh in the candidate cwd. They are not a command allowlist sandbox, and Windows timeout does not kill grandchildren. A check whose own shell failed to parse the command (harness error) is marked invalid and never eliminates a candidate.
+- Selections conclude with exactly one `outcome`: `ranked_winner` (margin cleared the gate), `objective_only_result` (verifier unavailable, strictly ordered by passing checks), `single_candidate_fallback` (one survivor, never compared — retained but never called a winner), `insufficient_evidence` (survivors without verifiable work), `abstain` (margin inside the noise band), or `verifier_unavailable` (infrastructure failure with full objective pass). Historical `winnerBasis=verifier` records predate this gate and are retrospectively abstains (only sel-4fcbc905, margin 0.2985, survives the provisional 0.08 gate).
+- The margin gate is provisional at 0.08 (`selectionMarginThreshold`) until the C0/C1/C2 calibration experiment replaces it; each record carries `margin`, `marginThreshold`, `marginCondition`, and `marginProvisional` so later reviews know exactly which gate produced the verdict.
+- Analysis-text tasks have no deterministic evidence layer and are exempt from the has-work gate (capped at `llmOnly`, never `verified`); every other task that gets a worktree is held to executable evidence.
+- Multiple survivors require a valid verifier ranking WITH a cleared margin. A sole survivor is an explicit fallback with no synthetic score and an explicitly different relay contract.
+- Every settled selection and every discard writes an audit pack to `.data/selection-artifacts/<selectionId>.json` BEFORE its workspace can be reclaimed: effective config snapshot (immune to later reload drift), per-candidate diff stats and check tails, margin/threshold/condition, outcome, and the source-integration post-audit (`delivered` is granted only when evidence exists; it defaults to `unknown`).
 - All intensity knobs are operator-settable in the GUI, settings, or POST /config. The usable automatic defaults are deliberately small: standard N=2/K=1/P=0, deep N=3/K>=2, verifier effort 'low', lane budget 180s/8192 tokens, and selection budget 600s. Raise N/K/P or effort for deliberate quality runs; the source turn is no longer held open while automatic selection completes.
 - verifierEffort reaches BOTH verifier paths: lane calls carry thinking/reasoning_effort fields (off explicitly disables), and the selection sidecar scopes DEEPSEEK_EFFORT per request (never leaks across requests).
 - Preflight and ranking each use their own absolute deadline derived from the same normalized timeout value; transient retries are capped at two attempts.

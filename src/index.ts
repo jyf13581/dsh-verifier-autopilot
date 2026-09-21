@@ -9,8 +9,12 @@ import { buildVerifierPrompt, shouldRequestFeedback, decideFeedback, noDefectLan
 import { VerificationCoordinator, type ScheduleEntry, type RunContext } from './coordinator.js'
 
 import { SelectionHost, SelectionApiError, defaultSelectionsFile } from './selection/host.js'
+import { runChecks } from './selection/checks.js'
+import { evaluateDelivery } from './selection/candidates.js'
 import { buildAutopilotContext, buildAutopilotRelay, planAutopilotTask, type AutopilotMode, type CandidateModelStrategy } from './selection/autopilot.js'
 import { resolveAutopilotSourceCwd } from './selection/live.js'
+import { gitRepoState } from './selection/live.js'
+import { createModelProber, type ModelProber } from './selection/probe.js'
 
 export { VerificationCoordinator } from './coordinator.js'
 export { SelectionHost } from './selection/host.js'
@@ -72,6 +76,30 @@ export interface Config {
   selectionPivots: number
   selectionCandidateTimeoutMs: number
   selectionSelectTimeoutMs: number
+  /** Provisional top-2 margin gate for the winner state machine (ruling I.1);
+   *  replaced by the calibrated quantile once the I.4 experiment lands. */
+  selectionMarginThreshold: number
+  /** Probe candidate models for liveness before planning (default true):
+   *  catalog membership is not availability (ruling 6.4 kimi-k3 window). */
+  selectionProbeEnabled: boolean
+  /** Optional explicit test command for the integration post-audit. Empty
+   *  (default) = the audit never runs user tests, so delivered=yes stays
+   *  unreachable — as the ruling demands until the operator opts in. */
+  selectionPostAuditTestCommand: string
+  /** Verifier tournament concurrency (server-side ThreadPool workers).
+   *  0 = auto (AUTO_VERIFIER_WORKERS=4): the relay's per-request account
+   *  round-robin spreads concurrent calls across independent accounts, so one
+   *  rate-limited account stalls only its own call. Explicit 1..16 overrides.
+   *  Parallelism is capped by the account pool size in practice. */
+  selectionVerifierWorkers: number
+  /** Token-bucket smoothing: minimum spacing (ms) between verifier request
+   *  dispatches, shared by the five-lane verifier and the tournament sidecar.
+   *  0 (default) = off. Spreads self-inflicted rate-limit bursts. */
+  verifierMinIntervalMs: number
+  /** Cheap-tier model for mechanical session-verifier lanes (completion /
+   *  evidence). Empty (default) = every lane uses `model`. Opt-in layered
+   *  model usage: only hard lanes stay on the main verifier model. */
+  verifierSmallModel: string
 }
 
 export const Config = z.object({
@@ -88,10 +116,13 @@ export const Config = z.object({
   // currently live-proven strict route; kimi-k3 remains selectable but its max
   // effort latency is not a sensible default.
   timeoutMs: z.number().step(1).min(5000).max(180000).default(180000),
-  maxTokens: z.number().step(1).min(256).max(8192).default(8192),
+  maxTokens: z.number().step(1).min(256).max(65536).default(64000),
   temperature: z.number().min(0).max(1).default(0.2),
   baseURL: z.string().default('https://chat.holisthoom.top/v1'),
-  model: z.string().default('minimaxai/minimax-m3'),
+  // Live-proven strict route (2026-09-13: HTTP 200, protocol tags + 96 logprobs, ~5.8s).
+  // z-ai/glm-5.3-flash was removed as a default: at effort=max it spent minutes
+  // reasoning before emitting the protocol lines, which broke lane deadlines.
+  model: z.string().default('nvidia/nemotron-3-super-120b-a12b'),
   apiKeyEnv: z.string().default('KIMI_API_KEY'),
   verifierEffort: z.union(['off', 'low', 'high', 'max']).default('low'),
   allowLabelFallback: z.boolean().default(false),
@@ -102,9 +133,10 @@ export const Config = z.object({
   selectionMode: z.union(['off', 'auto', 'always']).default('auto'),
   selectionModelStrategy: z.union(['quality-first', 'exploration']).default('quality-first'),
   selectionProvider: z.string().default('kimi'),
-  // Free Kimi relay default: M3 is the live-proven strict route; the older
-  // kimi-k3 route remains selectable but is too slow at max effort.
-  selectionModels: z.string().default('minimaxai/minimax-m3,nvidia/nemotron-3-super-120b-a12b,nemotron-3-ultra-550b-a55b,kimi-k3,deepseek-ai/deepseek-v4-pro-0813'),
+  // Default candidate route: strictly protocol-proven and ~6s per call, so the
+  // automatic tournament stays inside its deadline. The pool remains a fully
+  // operator-editable quality order (custom IDs are probed directly).
+  selectionModels: z.string().default('nvidia/nemotron-3-super-120b-a12b'),
   // A small tournament is the usable automatic default. Higher N/K/P remain
   // explicit operator controls for deliberate quality runs.
   selectionStandardCandidates: z.number().step(1).min(2).max(5).default(2),
@@ -112,8 +144,23 @@ export const Config = z.object({
   selectionEvaluations: z.number().step(1).min(1).max(8).default(1),
   // 枢轴迭代数 k：O(N·k) 的比较成本，下游按幸存者数自动收敛。
   selectionPivots: z.number().step(1).min(0).max(5).default(0),
-  selectionCandidateTimeoutMs: z.number().step(1000).min(30000).max(1800000).default(300000),
+  selectionCandidateTimeoutMs: z.number().step(1000).min(30000).max(1800000).default(600000),
   selectionSelectTimeoutMs: z.number().step(1000).min(30000).max(600000).default(600000),
+  // 临时噪声门限（ruling I.1）：top-2 margin 低于它一律 abstain。2026-09-08
+  // 校准首轮（C0 24 次同文复跑）噪声 q95=0.0123、最大 0.0135、位置偏差≈0；
+  // 0.03 = 观测噪声上限的 2.2 倍，仍标 provisional 待多 fixture 复核。
+  selectionMarginThreshold: z.number().min(0).max(0.5).default(0.03),
+  selectionProbeEnabled: z.boolean().default(true),
+  // 后置审计可选测试命令（G-4）：空 = 绝不自动跑用户仓库的测试，delivered
+  // 只可能到 unknown/no。
+  selectionPostAuditTestCommand: z.string().max(2000).default(''),
+  // 锦标赛验证并发：0=自动（4）；1..16 显式。中转站按请求轮询分号，并发
+  // 请求天然摊到不同账号，单账号限速只卡它自己那一路。
+  selectionVerifierWorkers: z.number().step(1).min(0).max(16).default(0),
+  // 令牌桶平滑：验证请求发送的最小间隔（ms）；0=关闭。避免突发打满限额。
+  verifierMinIntervalMs: z.number().step(1).min(0).max(60000).default(0),
+  // 分层小模型：会话验证的机械 lane（completion/evidence）改用小模型；空=全部用主模型。
+  verifierSmallModel: z.string().max(200).default(''),
 })
 
 const API_PREFIX = '/@dsh-external/dsh-verifier-autopilot/api'
@@ -466,7 +513,18 @@ function turnBounds(events: readonly EventRecord[]): { start: EventRecord; end: 
   return start ? { start, end, turn } : undefined
 }
 
-export function compactTrace(rendered: readonly string[]): { trace: string; toolEventCount: number; traceChars: number; evidenceSignalCount: number; passSignalCount: number; evidenceSummaryChars: number } {
+/** Single prompt budget shared with buildVerifierPrompt (ruling J.4-E-3):
+ *  a compacted trace must NEVER exceed what the prompt builder accepts, so the
+ *  old 18000→16000 double truncation can never tail-cut the final answer. */
+export const TRACE_BUDGET_CHARS = 16000
+
+function visibleIdsOf(text: string): number[] {
+  const ids = new Set<number>()
+  for (const match of text.matchAll(/\[E(\d+)\]/g)) ids.add(Number(match[1]))
+  return [...ids].sort((a, b) => a - b)
+}
+
+export function compactTrace(rendered: readonly string[]): { trace: string; visibleIds: number[]; droppedRanges: string[]; toolEventCount: number; traceChars: number; evidenceSignalCount: number; passSignalCount: number; evidenceSummaryChars: number } {
   // Lines may carry a stable "[E07] " citation prefix; classification always
   // looks at the bare text so numbering can never change compaction or stats.
   const bareOf = (item: string): string => item.replace(/^\[E\d+\] /, '')
@@ -478,8 +536,19 @@ export function compactTrace(rendered: readonly string[]): { trace: string; tool
   const importantToolLines = toolLines.filter(item => bareOf(item).startsWith('TOOL RESULT:') && /(?:PASS|build: complete|score|confidence|valid|finish|completed|success)/is.test(bareOf(item)))
   const selectedToolLines = [...toolLines.slice(0, 3), '[... middle tool events omitted ...]', ...importantToolLines.slice(-8), ...toolLines.slice(-8)]
   const toolEvidence = selectedToolLines.map(item => item.slice(0, 700)).join('\n').slice(0, 8000)
-  const trace = fullTrace.length <= 18000 ? fullTrace : [fullTrace.slice(0, 5000), '[... tool evidence ...]', toolEvidence, '[... trajectory tail ...]', fullTrace.slice(-5000)].join('\n')
-  return { trace, toolEventCount: toolLines.length, traceChars: trace.length, evidenceSignalCount: evidenceSignals.length, passSignalCount: evidenceSignals.filter(item => /PASS/i.test(item)).length, evidenceSummaryChars: evidenceSummary.length }
+  // One budget, one rule: anything over 16000 compacts to head/tools/tail that
+  // provably fits the same 16000 the prompt builder accepts (head 3500 + tools
+  // ≤8000 + tail 3500 + markers ≈ 15.1k max). The final answer (last lines)
+  // always survives.
+  let trace = fullTrace
+  let droppedRanges: string[] = []
+  if (fullTrace.length > TRACE_BUDGET_CHARS) {
+    const head = fullTrace.slice(0, 3500)
+    const tail = fullTrace.slice(-3500)
+    trace = [head, '[... tool evidence ...]', toolEvidence, '[... trajectory tail ...]', tail].join('\n')
+    droppedRanges = ['middle ' + (fullTrace.length - head.length - tail.length) + ' chars of conversation text (non-excerpted portion)']
+  }
+  return { trace, visibleIds: visibleIdsOf(trace), droppedRanges, toolEventCount: toolLines.length, traceChars: trace.length, evidenceSignalCount: evidenceSignals.length, passSignalCount: evidenceSignals.filter(item => /PASS/i.test(item)).length, evidenceSummaryChars: evidenceSummary.length }
 }
 
 /** Provenance class of a rendered line. Only tool results are independent
@@ -495,8 +564,11 @@ function evidenceKindOf(event: EventRecord): EvidenceKind {
   return 'other'
 }
 
-/** Exported for the evaluation harness: builds problem + compacted trace exactly as production does. */
-export function traceFor(events: readonly EventRecord[], bounds: { start: EventRecord; end: EventRecord; turn?: number }): { problem: string; hasCurrentDirectTask: boolean; hasAnyDirectTask: boolean; trace: string; evidenceIds: number[]; verdictLineIds: number[]; evidenceKinds: Record<string, EvidenceKind>; stats: { eventCount: number; renderedEventCount: number; toolEventCount: number; traceChars: number; evidenceSignalCount: number; passSignalCount: number; evidenceSummaryChars: number } } {
+/** Exported for the evaluation harness: builds problem + compacted trace exactly as production does.
+ *  `evidenceIds` is the FULL rendered set (statistics only); citation audits
+ *  must run against `visibleEvidenceIds` — the ids that actually survived
+ *  compaction into the verifier prompt (ruling J.4-E, B-6). */
+export function traceFor(events: readonly EventRecord[], bounds: { start: EventRecord; end: EventRecord; turn?: number }): { problem: string; hasCurrentDirectTask: boolean; hasAnyDirectTask: boolean; trace: string; evidenceIds: number[]; visibleEvidenceIds: number[]; verdictLineIds: number[]; evidenceKinds: Record<string, EvidenceKind>; stats: { eventCount: number; renderedEventCount: number; toolEventCount: number; traceChars: number; evidenceSignalCount: number; passSignalCount: number; evidenceSummaryChars: number } } {
   const startSeq = bounds.start.seq ?? 0
   const endSeq = bounds.end.seq ?? Number.MAX_SAFE_INTEGER
   const turn = Number(bounds.start.data?.turn ?? bounds.end.data?.turn)
@@ -544,6 +616,7 @@ export function traceFor(events: readonly EventRecord[], bounds: { start: EventR
     trace: compacted.trace,
     stats,
     evidenceIds: numbered.map(item => item.id),
+    visibleEvidenceIds: compacted.visibleIds,
     verdictLineIds: numbered.filter(item => item.verdictMarker).map(item => item.id),
     evidenceKinds: Object.fromEntries(numbered.map(item => [String(item.id), item.kind])),
   }
@@ -556,12 +629,12 @@ function cleanConfig(config: Config): Record<string, unknown> {
 function validateConfigPatch(value: unknown): Partial<Config> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('config-object-required')
   const input = value as Record<string, unknown>
-  const allowed = new Set<keyof Config>(['enabled', 'autoFeedback', 'routes', 'scoreThreshold', 'disagreementThreshold', 'maxFeedbackPerSession', 'timeoutMs', 'maxTokens', 'temperature', 'baseURL', 'model', 'apiKeyEnv', 'verifierEffort', 'allowLabelFallback', 'divergenceGuard', 'divergenceGuardMedian', 'skipStatusContinuation', 'selectionNotify', 'selectionMode', 'selectionModelStrategy', 'selectionProvider', 'selectionModels', 'selectionStandardCandidates', 'selectionDeepCandidates', 'selectionEvaluations', 'selectionPivots', 'selectionCandidateTimeoutMs', 'selectionSelectTimeoutMs'])
+  const allowed = new Set<keyof Config>(['enabled', 'autoFeedback', 'routes', 'scoreThreshold', 'disagreementThreshold', 'maxFeedbackPerSession', 'timeoutMs', 'maxTokens', 'temperature', 'baseURL', 'model', 'apiKeyEnv', 'verifierEffort', 'allowLabelFallback', 'divergenceGuard', 'divergenceGuardMedian', 'skipStatusContinuation', 'selectionNotify', 'selectionMode', 'selectionModelStrategy', 'selectionProvider', 'selectionModels', 'selectionStandardCandidates', 'selectionDeepCandidates', 'selectionEvaluations', 'selectionPivots', 'selectionCandidateTimeoutMs', 'selectionSelectTimeoutMs', 'selectionMarginThreshold', 'selectionProbeEnabled', 'selectionPostAuditTestCommand', 'selectionVerifierWorkers', 'verifierMinIntervalMs', 'verifierSmallModel'])
   const output: Partial<Config> = {}
   for (const key of Object.keys(input) as Array<keyof Config>) {
     if (!allowed.has(key)) throw new Error('unknown-config-key:' + key)
     const item = input[key]
-    if (key === 'enabled' || key === 'autoFeedback' || key === 'allowLabelFallback' || key === 'divergenceGuard' || key === 'skipStatusContinuation' || key === 'selectionNotify') {
+    if (key === 'enabled' || key === 'autoFeedback' || key === 'allowLabelFallback' || key === 'divergenceGuard' || key === 'skipStatusContinuation' || key === 'selectionNotify' || key === 'selectionProbeEnabled') {
       if (typeof item !== 'boolean') throw new Error('config-boolean-required:' + key)
       output[key] = item as never
       continue
@@ -578,6 +651,22 @@ function validateConfigPatch(value: unknown): Partial<Config> {
     }
     if (key === 'verifierEffort') {
       if (item !== 'off' && item !== 'low' && item !== 'high' && item !== 'max') throw new Error('config-verifier-effort-invalid')
+      output[key] = item as never
+      continue
+    }
+    if (key === 'selectionPostAuditTestCommand') {
+      // Explicit operator-provided post-audit test command; empty is the
+      // default and must be accepted.
+      if (typeof item !== 'string') throw new Error('config-string-required:' + key)
+      if (/[\u0000-\u0008\u000B-\u001F\u007F]/.test(item) || item.length > 2000) throw new Error('config-invalid-string:' + key)
+      output[key] = item as never
+      continue
+    }
+    if (key === 'verifierSmallModel') {
+      // Layered-model opt-in; empty (default) must be accepted so the operator
+      // can always clear it and fall back to the single-model verifier.
+      if (typeof item !== 'string') throw new Error('config-string-required:' + key)
+      if (/[\u0000-\u0008\u000B-\u001F\u007F]/.test(item) || item.length > 200) throw new Error('config-invalid-string:' + key)
       output[key] = item as never
       continue
     }
@@ -603,9 +692,9 @@ function validateConfigPatch(value: unknown): Partial<Config> {
       continue
     }
     if (typeof item !== 'number' || !Number.isFinite(item)) throw new Error('config-number-required:' + key)
-    const integer = key === 'routes' || key === 'maxFeedbackPerSession' || key === 'timeoutMs' || key === 'maxTokens' || key === 'selectionStandardCandidates' || key === 'selectionDeepCandidates' || key === 'selectionEvaluations' || key === 'selectionPivots' || key === 'selectionCandidateTimeoutMs' || key === 'selectionSelectTimeoutMs'
+    const integer = key === 'routes' || key === 'maxFeedbackPerSession' || key === 'timeoutMs' || key === 'maxTokens' || key === 'selectionStandardCandidates' || key === 'selectionDeepCandidates' || key === 'selectionEvaluations' || key === 'selectionPivots' || key === 'selectionCandidateTimeoutMs' || key === 'selectionSelectTimeoutMs' || key === 'selectionVerifierWorkers' || key === 'verifierMinIntervalMs'
     if (integer && !Number.isInteger(item)) throw new Error('config-integer-required:' + key)
-    const range: Record<string, [number, number]> = { routes: [1, 5], scoreThreshold: [0, 1], disagreementThreshold: [0, 1], maxFeedbackPerSession: [0, 3], timeoutMs: [5000, 180000], maxTokens: [256, 8192], temperature: [0, 1], divergenceGuardMedian: [0, 1], selectionStandardCandidates: [2, 5], selectionDeepCandidates: [2, 5], selectionEvaluations: [1, 8], selectionPivots: [0, 5], selectionCandidateTimeoutMs: [30000, 1800000], selectionSelectTimeoutMs: [30000, 600000] }
+    const range: Record<string, [number, number]> = { routes: [1, 5], scoreThreshold: [0, 1], disagreementThreshold: [0, 1], maxFeedbackPerSession: [0, 3], timeoutMs: [5000, 180000], maxTokens: [256, 65536], temperature: [0, 1], divergenceGuardMedian: [0, 1], selectionStandardCandidates: [2, 5], selectionDeepCandidates: [2, 5], selectionEvaluations: [1, 8], selectionPivots: [0, 5], selectionCandidateTimeoutMs: [30000, 1800000], selectionSelectTimeoutMs: [30000, 600000], selectionMarginThreshold: [0, 0.5], selectionVerifierWorkers: [0, 16], verifierMinIntervalMs: [0, 60000] }
     const bounds = range[key]
     if (bounds && (item < bounds[0] || item > bounds[1])) throw new Error('config-out-of-range:' + key)
     output[key] = item as never
@@ -661,6 +750,17 @@ export class VerifierHost {
   /** Background selections are cancelled when their source session disappears. */
   private readonly autopilotActive = new Map<string, Set<string>>()
 
+  /** Candidate-model liveness prober, memoized per (baseURL, key) pair so
+   *  config churn never keeps a stale credential around. */
+  private proberState: { baseURL: string; apiKey: string; instance: ModelProber } | null = null
+
+  private proberFor(baseURL: string, apiKey: string): ModelProber {
+    if (!this.proberState || this.proberState.baseURL !== baseURL || this.proberState.apiKey !== apiKey) {
+      this.proberState = { baseURL, apiKey, instance: createModelProber({ baseURL, apiKey }) }
+    }
+    return this.proberState.instance
+  }
+
   constructor(private readonly ctx: HostContext, config: Config, options: { recordsFile?: string | null; feedbackTimeoutMs?: number; selectionsFile?: string | null; selectionsTesting?: ConstructorParameters<typeof SelectionHost>[0]['testing'] } = {}) {
     this.config = config
     this.recordsFile = options.recordsFile === undefined ? null : options.recordsFile
@@ -679,10 +779,14 @@ export class VerifierHost {
         } catch { return undefined }
       },
       resolveKey: (ref) => resolveKey(this.ctx.credentials, ref),
-      verifier: () => ({ model: this.config.model, baseURL: this.config.baseURL, apiKeyEnv: this.config.apiKeyEnv, effort: this.config.verifierEffort }),
+      verifier: () => ({ model: this.config.model, baseURL: this.config.baseURL, apiKeyEnv: this.config.apiKeyEnv, effort: this.config.verifierEffort, maxWorkers: this.config.selectionVerifierWorkers, minIntervalMs: this.config.verifierMinIntervalMs }),
       candidateTimeoutMsDefault: () => this.config.selectionCandidateTimeoutMs,
       nEvaluationsDefault: () => this.config.selectionEvaluations,
       pivotsDefault: () => this.config.selectionPivots,
+      marginThresholdDefault: () => this.config.selectionMarginThreshold,
+      selectTimeoutMsDefault: () => this.config.selectionSelectTimeoutMs,
+      // I.5 audit pack sits next to the ledger; disabled when the ledger is.
+      artifactsDir: options.selectionsFile == null ? null : path.join(path.dirname(options.selectionsFile), 'selection-artifacts'),
       selectionsFile: options.selectionsFile === undefined ? null : options.selectionsFile,
       testing: options.selectionsTesting,
       notify: (record) => this.notifySelectionSettlement(record),
@@ -725,11 +829,43 @@ export class VerifierHost {
     const sourceCwd = await resolveAutopilotSourceCwd(task, agent.session.header?.cwd)
     if (!sourceCwd) return decision
 
-    let availableModels: string[] = []
+    let availableModels: string[] = preferredModels.slice()
+    let catalogAvailable = true
     try {
-      availableModels = (await this.ctx.llm?.listModels(this.config.selectionProvider) ?? []).map((model) => model.id)
-    } catch { return decision }
+      const catalogModels = await this.ctx.llm?.listModels(this.config.selectionProvider)
+      if (catalogModels) availableModels = [...new Set([...preferredModels, ...catalogModels.map((model) => model.id)])]
+    } catch {
+      // A provider catalog is discovery metadata, not an allowlist. Keep the
+      // operator-supplied model IDs and let the real probe decide liveness.
+      catalogAvailable = false
+    }
     payload.signal.throwIfAborted()
+    // Liveness before planning (ruling P-C): the catalog lists models that may
+    // be dead for days. Probe every configured model, including custom IDs that
+    // a provider catalog does not advertise, and drop only confirmed failures.
+    let probeEvidence: Record<string, boolean> | undefined
+    if (this.config.selectionProbeEnabled) {
+      try {
+        const probeKey = await resolveKey(this.ctx.credentials, this.config.apiKeyEnv)
+        if (probeKey) {
+          const prober = this.proberFor(this.config.baseURL, probeKey)
+          const alive: string[] = []
+          const dead: string[] = []
+          for (const model of preferredModels) {
+            (await prober.probe(model) ? alive : dead).push(model)
+          }
+          if (alive.length > 0 || dead.length === 0) {
+            const deadSet = new Set(dead)
+            availableModels = [...alive, ...availableModels.filter((m) => !deadSet.has(m) && !alive.includes(m))]
+            if (dead.length > 0 || !catalogAvailable) probeEvidence = Object.fromEntries(dead.map((m) => [m, false]).concat(alive.map((m) => [m, true])))
+          } else if (dead.length > 0) {
+            // All configured models are dead: never roll the whole pool onto a
+            // corpse or silently weaken the selection gates.
+            return decision
+          }
+        }
+      } catch { /* probing is advisory only when the provider key is unavailable */ }
+    }
     const plan = planAutopilotTask(task, availableModels, policy)
     if (!plan.admitted || !plan.depth || !plan.candidateCount || !plan.nEvaluations || !plan.candidateOptions || !plan.candidateInstructions || !plan.criteria) return decision
 
@@ -754,6 +890,7 @@ export class VerifierHost {
         selectTimeoutMs: plan.selectTimeoutMs,
         useSourceSeed: false,
         trigger: 'autopilot',
+        taskKind: plan.taskKind,
         policy: {
           depth: plan.depth,
           modelStrategy: plan.modelStrategy ?? 'quality-first',
@@ -761,6 +898,8 @@ export class VerifierHost {
           nEvaluations: plan.nEvaluations,
           pivots: this.config.selectionPivots,
           verifierEffort: this.config.verifierEffort,
+          taskKind: plan.taskKind,
+          probes: probeEvidence,
           contextChars: context.length,
           models: plan.candidateOptions.map((route) => route.model),
         },
@@ -782,10 +921,21 @@ export class VerifierHost {
         current?.delete(selectionId as string)
         if (current && current.size === 0) this.autopilotActive.delete(sourceId)
         payload.signal.removeEventListener('abort', cancel)
-        if (record.status !== 'completed' || !record.winner || this.disposed || this.ctx.agents?.get(sourceId) !== agent) return
-        const pending = this.autopilotCleanup.get(sourceId) ?? new Set<string>()
-        pending.add(selectionId as string)
-        this.autopilotCleanup.set(sourceId, pending)
+        // Ruling I.2: relay every terminal outcome, not only winners — an
+        // abstain or insufficient_evidence is exactly the information the
+        // source turn needs. Outcome-less legacy records never reach here.
+        if (record.status !== 'completed' || !record.outcome || this.disposed) return
+        if (this.ctx.agents?.get(sourceId) !== agent) return
+        const retained = record.winner ?? record.fallback
+        if (retained) {
+          const pending = this.autopilotCleanup.get(sourceId) ?? new Set<string>()
+          pending.add(selectionId as string)
+          this.autopilotCleanup.set(sourceId, pending)
+        }
+        record.timing = { ...(record.timing ?? {}), relayedAt: Date.now() }
+        // Ledger + artifact must see relayedAt now, not at some later discard:
+        // a hot reload between relay and cleanup would otherwise erase the mark.
+        this.selections.pubRecord(record)
         void Promise.resolve(agent.followup(createUserMessage({
           source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
           content: [{ type: 'text', text: buildAutopilotRelay(record) }],
@@ -811,9 +961,66 @@ export class VerifierHost {
     if (!pending) return
     for (const selectionId of [...pending]) {
       try {
+        // G-4 post-audit BEFORE discard: compare the source repo state against
+        // the start-time snapshot. Audited-but-unevidenced integration reports
+        // 'no'; observed HEAD/dirty evidence without running tests can only be
+        // 'unknown' — 'yes' requires deterministic passing tests, which this
+        // hook intentionally never runs on the user's repository.
+        const rec = this.selections.getSelection(selectionId)
+        const slot = rec ? (rec.winner ?? rec.fallback) : undefined
+        if (rec && slot && slot.discardedAt === undefined && !rec.delivery) {
+          const cwd = typeof rec.configSnapshot?.sourceCwd === 'string' ? rec.configSnapshot.sourceCwd as string : undefined
+          if (!cwd) {
+            rec.delivery = { audited: false, delivered: 'unknown', note: 'no source cwd in config snapshot' }
+          } else {
+            try {
+              const state = await gitRepoState(cwd)
+              if (!state) {
+                rec.delivery = { audited: false, delivered: 'unknown', note: 'source repo unreadable at audit time' }
+              } else {
+                const before = rec.sourceHeadAtStart ?? null
+                const headChanged = before !== null && state.head !== null ? state.head !== before : null
+                const testCommand = this.config.selectionPostAuditTestCommand.trim()
+                let testsExit: number | null = null
+                let testsRan = false
+                let postAuditError: string | undefined
+                if (testCommand && (headChanged === true || state.dirtyEntries > 0)) {
+                  try {
+                    const results = await runChecks(cwd, [{ name: 'post-audit', command: testCommand, timeoutMs: 120000 }])
+                    testsExit = results[0]?.exitCode ?? null
+                    testsRan = true
+                  } catch (runError) {
+                    postAuditError = runError instanceof Error ? runError.message.slice(0, 200) : String(runError).slice(0, 200)
+                  }
+                }
+                const verdict = evaluateDelivery({
+                  audited: true,
+                  headChanged,
+                  dirtyEntries: state.dirtyEntries,
+                  testsConfigured: testCommand.length > 0,
+                  testsExit: testsRan ? testsExit : null,
+                })
+                rec.delivery = {
+                  audited: true,
+                  headBefore: before,
+                  headAfter: state.head,
+                  headChanged,
+                  dirtyEntries: state.dirtyEntries,
+                  ...(testsRan ? { postAuditTestExit: testsExit } : {}),
+                  delivered: verdict.delivered,
+                  note: verdict.note + (postAuditError ? ' [test runner error: ' + postAuditError + ']' : ''),
+                }
+              }
+            } catch {
+              rec.delivery = { audited: false, delivered: 'unknown', note: 'audit raised' }
+            }
+          }
+          rec.timing = { ...(rec.timing ?? {}), auditedAt: Date.now() }
+        }
         const removed = await this.selections.discardWinner(selectionId)
-        const record = this.selections.getSelection(selectionId)
-        if (removed || !record?.winner || record.winner.discardedAt !== undefined) pending.delete(selectionId)
+        const after = this.selections.getSelection(selectionId)
+        const slotAfter = after ? (after.winner ?? after.fallback) : undefined
+        if (removed || !slotAfter || slotAfter.discardedAt !== undefined) pending.delete(selectionId)
       } catch { /* keep it queued for the next idle/dispose retry */ }
     }
     if (pending.size === 0) this.autopilotCleanup.delete(sourceSessionId)
@@ -830,11 +1037,14 @@ export class VerifierHost {
     const agent = this.ctx.agents?.get(sid)
     if (!agent || typeof agent.followup !== 'function') return
     const scores = record.scores?.map((s) => (s === null ? 'null' : s.toFixed(3))).join('/')
-    const text = record.status === 'completed' && record.winner
-      ? '[Selection 结算] ' + record.selectionId + ' 已完成：winner=c' + record.winner.index
+    const slot = record.winner ?? record.fallback
+    const text = record.status === 'completed' && slot
+      ? '[Selection 结算] ' + record.selectionId + ' 已完成：outcome=' + (record.outcome ?? 'legacy')
+        + '，' + (record.winner ? 'winner=c' + record.winner.index : 'fallback=c' + slot.index + '（未经候选间比较，非选优结论）')
         + (scores ? '（scores ' + scores + '，比较 ' + (record.nComparisons ?? 0) + ' 次）' : '')
-        + '。loser/淘汰候选已回收（会话与工作区均已删除）。winner 会话在侧栏会话列表可直接打开继续；workspace 保留于 ' + record.winner.workspace + '，面板里可"丢弃 winner"彻底清理。此消息为结算通知，无需回复。'
-      : '[Selection 结算] ' + record.selectionId + ' 结束：status=' + record.status + (record.error ? '（' + record.error + '）' : '') + '，候选已全部回收。此消息为结算通知，无需回复。'
+        + (record.margin !== undefined ? '（margin ' + record.margin.toFixed(4) + ' / 阈值 ' + (record.marginThreshold ?? 'n/a') + (record.marginProvisional ? '，临时' : '') + '）' : '')
+        + '。loser/淘汰候选已回收（会话与工作区均已删除）。保留对象的工作区位于 ' + slot.workspace + '，面板里可"丢弃 winner"彻底清理。此消息为结算通知，无需回复。'
+      : '[Selection 结算] ' + record.selectionId + ' 结束：status=' + record.status + (record.outcome ? '，outcome=' + record.outcome : '') + (record.error ? '（' + record.error + '）' : '') + '，候选已全部回收。此消息为结算通知，无需回复。'
     try {
       void Promise.resolve(agent.followup(createUserMessage({
         source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/selection', form: 'notice', summary: boundContextSummary('选择结算：' + record.selectionId) },
@@ -851,6 +1061,36 @@ export class VerifierHost {
     if (typeof created === 'function') this.disposers.push(created)
     const disposed = events.on('agent/disposed', payload => this.detach(payload?.agent))
     if (typeof disposed === 'function') this.disposers.push(disposed)
+    this.recoverAutopilotRelays()
+  }
+
+  /** Reload recovery (live incident sel-ac04cfd7, 2026-09-09): a plugin hot
+   *  reload disposes the background waiter, so a settled autopilot fallback/
+   *  winner could sit retained forever with its relay never delivered. On
+   *  startup, re-deliver the relay for any newly-settled record whose source
+   *  agent is still alive, and re-register the retained workspace so idle /
+   *  dispose cleanup picks it up exactly once. */
+  private recoverAutopilotRelays(): void {
+    for (const record of this.selections.listSelections()) {
+      if (record.trigger !== 'autopilot' || record.status !== 'completed') continue
+      if (!record.outcome) continue
+      const slot = record.winner ?? record.fallback
+      if (!slot || slot.discardedAt !== undefined) continue
+      if (record.timing?.relayedAt) continue
+      const sourceId = record.sourceSessionId
+      if (!sourceId) continue
+      const agent = this.ctx.agents?.get(sourceId)
+      if (!agent) continue
+      const pending = this.autopilotCleanup.get(sourceId) ?? new Set<string>()
+      pending.add(record.selectionId)
+      this.autopilotCleanup.set(sourceId, pending)
+      record.timing = { ...(record.timing ?? {}), relayedAt: Date.now() }
+      this.selections.pubRecord(record)
+      void Promise.resolve(agent.followup(createUserMessage({
+        source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
+        content: [{ type: 'text', text: buildAutopilotRelay(record) }],
+      }))).catch(() => undefined)
+    }
   }
 
   async dispose(): Promise<void> {
@@ -972,7 +1212,7 @@ export class VerifierHost {
       // Trace building and gating live inside the same containment boundary as
       // the provider call: a crash here yields a failed record instead of a
       // permanently 'running' record and an unhandled rejection.
-      const { problem, hasCurrentDirectTask, hasAnyDirectTask, trace, stats, evidenceIds, verdictLineIds, evidenceKinds } = traceFor(agent.session.events, bounds)
+      const { problem, hasCurrentDirectTask, hasAnyDirectTask, trace, stats, visibleEvidenceIds, verdictLineIds, evidenceKinds } = traceFor(agent.session.events, bounds)
       record.traceStats = stats
       // No-op gate: bare status continuations with zero tool evidence are recorded
       // as 'skipped' (kept observable) but never scored, so they cannot consume
@@ -992,7 +1232,7 @@ export class VerifierHost {
       const aggregate = await verifyFive(config, this.ctx.credentials, prompt, { signal: options.signal })
       record.aggregate = aggregate
       const kindsById = new Map<number, string>(Object.entries(evidenceKinds).map(([id, kind]) => [Number(id), String(kind)]))
-      record.citationAudit = auditAggregateCitations(aggregate, evidenceIds, verdictLineIds, kindsById)
+      record.citationAudit = auditAggregateCitations(aggregate, visibleEvidenceIds, verdictLineIds, kindsById)
       record.finishedAt = Date.now()
       record.status = aggregate.valid.length === 0 ? 'failed' : aggregate.valid.length < Math.min(3, config.routes) ? 'partial' : 'completed'
       const feedbackDecision = decideFeedback(aggregate, config)
@@ -1016,7 +1256,7 @@ export class VerifierHost {
           } else {
             const summary = aggregate.score === null ? '评分不可用' : '平均完成度 ' + aggregate.score.toFixed(2) + ', 分歧 ' + (aggregate.dispersion ?? 0).toFixed(2)
             const findings = aggregate.valid
-              .filter(item => item.finding && !/no concrete defect/i.test(item.finding) && auditFindingCitation(item.findingFull ?? item.finding, evidenceIds, verdictLineIds, kindsById).independentCitation)
+              .filter(item => item.finding && !/no concrete defect/i.test(item.finding) && auditFindingCitation(item.findingFull ?? item.finding, visibleEvidenceIds, verdictLineIds, kindsById).independentCitation)
               .map(item => 'lane ' + item.route + '/' + (item.lane ?? 'unknown') + ': ' + String(item.finding).slice(0, 260))
               .slice(0, 3)
             const feedback = '[Verifier feedback] ' + summary + '。有工具证据支持的具体问题：' + findings.join('；') + '。仅在复查工具结果后确认问题才修复；否则继续完成原始任务并交付，不要为了提高审查分数修改代码。'
@@ -1353,19 +1593,25 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
 export function apply(ctx: HostContext, config?: Config): void {
   const defaults: Config = {
     enabled: true, autoFeedback: false, routes: 5, scoreThreshold: 0.62, disagreementThreshold: 0.12,
-    maxFeedbackPerSession: 1, timeoutMs: 180000, maxTokens: 8192, temperature: 0.2,
-    baseURL: 'https://chat.holisthoom.top/v1', model: 'minimaxai/minimax-m3', apiKeyEnv: 'KIMI_API_KEY',
+    maxFeedbackPerSession: 1, timeoutMs: 180000, maxTokens: 64000, temperature: 0.2,
+    baseURL: 'https://chat.holisthoom.top/v1', model: 'nvidia/nemotron-3-super-120b-a12b', apiKeyEnv: 'KIMI_API_KEY',
     verifierEffort: 'low',
     allowLabelFallback: false,
     divergenceGuard: true, divergenceGuardMedian: 0.75,
     skipStatusContinuation: true,
     selectionNotify: true,
     selectionMode: 'auto', selectionModelStrategy: 'quality-first', selectionProvider: 'kimi',
-    selectionModels: 'minimaxai/minimax-m3,nvidia/nemotron-3-super-120b-a12b,nemotron-3-ultra-550b-a55b,kimi-k3,deepseek-ai/deepseek-v4-pro-0813',
+    selectionModels: 'nvidia/nemotron-3-super-120b-a12b',
     selectionStandardCandidates: 2, selectionDeepCandidates: 3, selectionEvaluations: 1,
     selectionPivots: 0,
-    selectionCandidateTimeoutMs: 300000,
+    selectionCandidateTimeoutMs: 600000,
     selectionSelectTimeoutMs: 600000,
+    selectionMarginThreshold: 0.03,
+    selectionProbeEnabled: true,
+    selectionPostAuditTestCommand: '',
+    selectionVerifierWorkers: 0,
+    verifierMinIntervalMs: 0,
+    verifierSmallModel: '',
   }
   const initial = validateConfigPatch({ ...defaults, ...(config ?? {}) }) as Config
   const host = new VerifierHost(ctx, initial, { recordsFile: defaultRecordsFile(), selectionsFile: defaultSelectionsFile() })

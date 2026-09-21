@@ -14,7 +14,7 @@ import { fileURLToPath } from "node:url"
 import { VerifierBridge, BridgeError } from "../lib/selection/bridge.js"
 import { SelectionRunner } from "../lib/selection/candidates.js"
 import { retryTransientBridge } from "../lib/selection/retry.js"
-import { buildAutopilotRelay } from "../lib/selection/autopilot.js"
+import { buildAutopilotRelay, planAutopilotTask } from "../lib/selection/autopilot.js"
 import { runChecks } from "../lib/selection/checks.js"
 import { renderTrajectory } from "../lib/selection/trajectory.js"
 import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync } from "node:fs"
@@ -65,6 +65,46 @@ test("compactTrace always prepends the extracted-evidence summary block", () => 
   assert.ok(withSignals.trace.includes("vitest 12 passed"))
   const empty = compactTrace(["USER: hello"])
   assert.ok(empty.trace.startsWith("[EXTRACTED TOOL EVIDENCE] none"))
+})
+
+// ---------- 2026-09-08 裁决 9.8 / J.4-E: legacy evidence visibility ----------
+
+test("compactTrace: dropped middle evidence must not pass citation audit (ruling J.4-E)", () => {
+  // 400 numbered lines, far over the 16000 budget: [E150] is a plain tool
+  // result with NO signal keywords, so neither the summary nor the tail
+  // excerpts keep it. Auditing against pre-compaction ids called this
+  // "supported"; against the visible set it is correctly unknown.
+  const rendered = []
+  for (let i = 1; i <= 400; i += 1) {
+    if (i === 150) rendered.push("[E150] TOOL RESULT: plain nondescript output no1 " + "z".repeat(90))
+    else if (i % 2 === 0) rendered.push("[E" + String(i).padStart(2, "0") + "] ASSISTANT: talking point " + i + " " + "x".repeat(90))
+    else rendered.push("[E" + String(i).padStart(2, "0") + "] TOOL CALL quiet_tool: args " + "y".repeat(90))
+  }
+  const stats = compactTrace(rendered)
+  assert.ok(stats.trace.length <= 16000, "single unified budget: prompt never re-truncates the trace")
+  assert.ok(stats.droppedRanges.length > 0, "compaction must disclose what it dropped")
+  assert.ok(!stats.visibleIds.includes(150), "dropped middle evidence leaves the visible id set")
+  assert.ok(stats.visibleIds.includes(400), "the final line id always survives")
+  const kinds = new Map([[150, "tool-result"]])
+  const audit = auditFindingCitation("seeing odd behavior [E150]", stats.visibleIds, [], kinds)
+  assert.ok(audit.unknownIds.includes(150), "citing invisible evidence is unknown, not supported")
+  assert.equal(audit.independentCitation, false, "dropped evidence never earns independent-citation credit")
+})
+
+test("buildVerifierPrompt keeps the final numbered line under a long trace (J.4-E-3)", () => {
+  const events = [{ type: "user/message", seq: 0, data: { turn: 1, content: [{ type: "text", text: "do the task" }], source: { kind: "user" } } },
+    { type: "turn/start", seq: 1, data: { turn: 1 } }]
+  for (let i = 2; i < 460; i += 1) {
+    events.push({ type: "assistant/message", seq: i, data: { turn: 1, message: { role: "assistant", content: [{ type: "text", text: "musing " + i + " " + "m".repeat(90) }] } } })
+  }
+  events.push(
+    { type: "assistant/message", seq: 460, data: { turn: 1, message: { role: "assistant", content: [{ type: "text", text: "FINAL ANSWER MARKER: delivered" }] } } },
+    { type: "turn/end", seq: 461, data: { turn: 1, reason: { kind: "completed" } } },
+  )
+  const { trace } = traceFor(events, { start: events[1], end: events.at(-1), turn: 1 })
+  const prompt = buildVerifierPrompt("task", trace, "criterion")
+  assert.ok(prompt.includes("FINAL ANSWER MARKER"), "the final answer line survives prompt assembly")
+  assert.ok(trace.length <= 16000 + 1000, "trace is bounded by the shared budget")
 })
 
 // ---------- de-anchoring: historical verdicts and noise stay out ----------
@@ -914,7 +954,8 @@ function hostOverrides(overrides = {}) {
     selectionMode: "auto", selectionModelStrategy: "quality-first", selectionProvider: "kimi",
     selectionModels: "minimaxai/minimax-m3,nvidia/nemotron-3-super-120b-a12b,nemotron-3-ultra-550b-a55b,kimi-k3,deepseek-ai/deepseek-v4-pro-0813",
     selectionStandardCandidates: 2, selectionDeepCandidates: 3, selectionEvaluations: 2, selectionPivots: 2,
-    selectionCandidateTimeoutMs: 30000, selectionSelectTimeoutMs: 30000,
+    selectionCandidateTimeoutMs: 30000, selectionSelectTimeoutMs: 30000, selectionMarginThreshold: 0.03, selectionProbeEnabled: false,
+    selectionVerifierWorkers: 0, verifierMinIntervalMs: 0, verifierSmallModel: "",
     ...overrides,
   }
 }
@@ -2489,15 +2530,20 @@ function makeFakeFactory(opts = {}) {
         _release: null,
         followup(m) { agent.followups.push(m) },
         whenIdle() {
+          // The runtime re-mints the seed prefix as seq 0..seedLength-1 with
+          // the candidate's own rollout AFTER it. Default fake events are the
+          // own-rollout part, so they are offset past the seed; script events
+          // own their exact seq values (some tests bake the seed in by hand).
+          const own = (events) => events.map((ev) => (typeof ev.seq === "number" ? { ...ev, seq: ev.seq + (spec.seedLength ?? 0) } : ev))
           if (script.hang) {
             // A live hung agent still accrues events mid-flight (partial
             // progress visible to anyone watching): the abandonment monitor
             // reads exactly this region.
-            if (script.partial) agent.session = { events: agent.session.events.concat(fakeEvents(i)) }
+            if (script.partial) agent.session = { events: agent.session.events.concat(own(fakeEvents(i))) }
             return new Promise((resolve) => { agent._release = resolve })
           }
           return new Promise((resolve) => setTimeout(() => {
-            agent.session = { events: script.events || fakeEvents(i) }
+            agent.session = { events: script.events ? script.events : own(fakeEvents(i)) }
             resolve()
           }, script.idleDelay ?? 5))
         },
@@ -2528,7 +2574,9 @@ function fakeBridge(impl) {
     async select(req) {
       calls.push(req)
       if (impl) return impl(req)
-      return { index: 0, bestPreview: String(req.candidates[0]).slice(0, 50), scores: req.candidates.map(() => 0.5), ranking: req.candidates.map((_, i) => i), nComparisons: req.candidates.length, criteria: ["c1"], usage: { calls: 1, input_tokens: 1, cached_input_tokens: 0, uncached_input_tokens: 1, output_tokens: 1, reasoning_tokens: 0, cache_hit_rate: 0 } }
+      // Decisive default: margin 0.5 clears the provisional 0.03 noise gate,
+      // so plumbing tests keep exercising the ranked_winner path.
+      return { index: 0, bestPreview: String(req.candidates[0]).slice(0, 50), scores: req.candidates.map((_, i) => (i === 0 ? 0.9 : 0.4)), ranking: req.candidates.map((_, i) => i), nComparisons: req.candidates.length, criteria: ["c1"], usage: { calls: 1, input_tokens: 1, cached_input_tokens: 0, uncached_input_tokens: 1, output_tokens: 1, reasoning_tokens: 0, cache_hit_rate: 0 } }
     },
   }
 }
@@ -2552,7 +2600,7 @@ function mkSelectionHost(over = {}) {
   if (over.defaultRoute !== null) ctx.setService("agentDefaultModel", { currentSelection: () => over.defaultRoute ?? { provider: "kimi", model: "kimi-k3" } })
   const factory = makeFakeFactory(over.factoryOpts ?? {})
   const bridge = fakeBridge(over.bridgeImpl)
-  const host = new VerifierHost(ctx, hostOverrides(), {
+  const host = new VerifierHost(ctx, hostOverrides(over.config ?? {}), {
     selectionsTesting: { factory, workspaces: realWorkspaces, bridge },
   })
   const source = ctx.spawnAgent(fakeAgent("sess-A", completedTurnEvents(1)))
@@ -2645,7 +2693,7 @@ test("selhost: manual /select releases live winner while retaining workspace and
   assert.equal(factory.calls[0].parentSession, "sess-A")
   assert.equal(factory.calls[0].seedLength, 5, "balanced seed prefix length rides along")
   assert.equal(bridge.calls.length, 1)
-  assert.equal(bridge.calls[0].maxWorkers, 1, "verifier tournament stays within the free relay's per-user concurrency limit")
+  assert.equal(bridge.calls[0].maxWorkers, 4, "auto concurrency (selectionVerifierWorkers=0) spreads tournament calls across the relay's per-request account pool")
   assert.deepEqual(host.selections.snapshot().retainedWinners, [], "manual winner releases its live handle at settlement")
   assert.equal(factory.handles[final.winner.index].disposed, true, "persisted session and workspace do not require a live agent handle")
   // Settlement notice lands in the SOURCE session (the operator keeps working
@@ -2863,15 +2911,15 @@ test("selection: transient verifier failures retry with bounded telemetry", asyn
     factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge,
     sleep: async (delayMs) => { delays.push(delayMs) },
   })
-  const { record, winner } = await runner.run(selInput({ candidateCount: 2 }))
+  const { record, retained } = await runner.run(selInput({ candidateCount: 2 }))
   assert.equal(record.status, "completed")
   assert.equal(record.winner.index, 1)
   assert.equal(record.rankingAttempts, 2)
   assert.deepEqual(record.rankingRetryErrors, ["429 pending request"])
   assert.deepEqual(delays, [2000])
   assert.equal(bridge.calls.length, 2)
-  await winner.handle.dispose()
-  await realWorkspaces.remove(winner.workspace)
+  await retained.handle.dispose()
+  await realWorkspaces.remove(retained.workspace)
 })
 
 test("selection: non-retriable verifier failure is attempted once and cleans every child", async () => {
@@ -2945,7 +2993,7 @@ test("selection: happy path — check-eliminates one candidate, winner maps back
     usage: { calls: 3, input_tokens: 30, cached_input_tokens: 0, uncached_input_tokens: 30, output_tokens: 9, reasoning_tokens: 0, cache_hit_rate: 0 },
   }))
   const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
-  const { record, winner } = await runner.run(selInput({ checks: PASS_CHECK }))
+  const { record, retained } = await runner.run(selInput({ checks: PASS_CHECK }))
   assert.equal(record.status, "completed")
   assert.equal(record.candidates.length, 3)
   assert.equal(record.candidates[1].status, "eliminated", "candidate 1 lacks pass.txt")
@@ -2956,7 +3004,7 @@ test("selection: happy path — check-eliminates one candidate, winner maps back
   assert.equal(record.winner.index, 2, "survivor index 1 maps back to original candidate 2")
   assert.deepEqual(record.ranking, [2, 0], "ranking is reported in original indices")
   assert.deepEqual(record.scores, [0.4, null, 0.6], "scores align to original indices with null holes")
-  assert.ok(winner && winner.candidateIndex === 2)
+  assert.ok(retained && retained.candidateIndex === 2)
   assert.equal(factory.handles[2].disposed, false, "winner stays alive")
   assert.ok(existsSync(record.winner.workspace), "winner workspace survives")
   for (const i of [0, 1]) {
@@ -2983,13 +3031,13 @@ test("selection: agent-create failure is contained to that candidate", async () 
   const factory = makeFakeFactory({ failAt: [1], passAt: [0, 2] })
   const bridge = fakeBridge()
   const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
-  const { record, winner } = await runner.run(selInput({ checks: PASS_CHECK }))
+  const { record, retained } = await runner.run(selInput({ checks: PASS_CHECK }))
   assert.equal(record.status, "completed")
   assert.equal(record.candidates[1].status, "failed")
   assert.ok(String(record.candidates[1].error).startsWith("agent-create:"))
   assert.deepEqual(record.candidates[1].eliminatedBy, ["run-failed"])
   assert.ok(bridge.calls.length === 1 && bridge.calls[0].candidates.length === 2)
-  assert.ok(winner && [0, 2].includes(winner.candidateIndex))
+  assert.ok(retained && [0, 2].includes(retained.candidateIndex))
 })
 
 test("selection: abort mid-run leaves no orphans and no winner", async () => {
@@ -3007,30 +3055,269 @@ test("selection: abort mid-run leaves no orphans and no winner", async () => {
   for (const c of record.candidates) assert.ok(!existsSync(c.workspace))
 })
 
-test("selection: N=1 never calls the verifier and wins by default", async () => {
+test("selection: N=1 never calls the verifier and retains as fallback (never a winner claim)", async () => {
   const factory = makeFakeFactory({})
   const bridge = fakeBridge()
   const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
-  const { record, winner } = await runner.run(selInput({ candidateCount: 1, checks: undefined }))
+  const { record, retained } = await runner.run(selInput({ candidateCount: 1, checks: undefined }))
   assert.equal(record.status, "completed")
   assert.equal(bridge.calls.length, 0, "single candidate must not spend verifier calls")
   assert.equal(record.nComparisons, 0)
   assert.deepEqual(record.scores, [null])
+  assert.equal(record.outcome, "single_candidate_fallback")
   assert.equal(record.winnerBasis, "single-candidate")
-  assert.ok(winner && winner.candidateIndex === 0 && !factory.handles[0].disposed)
+  assert.equal(record.winner, undefined, "a fallback is never crowned winner")
+  assert.equal(record.fallback.index, 0)
+  assert.ok(retained && retained.candidateIndex === 0 && !factory.handles[0].disposed)
 })
 
-test("selection: exactly one survivor skips the verifier and wins by default", async () => {
+test("selection: exactly one survivor skips the verifier and falls back with objective basis", async () => {
   const factory = makeFakeFactory({ failAt: [0, 2], passAt: [1] })
   const bridge = fakeBridge()
   const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
-  const { record, winner } = await runner.run(selInput({ checks: PASS_CHECK }))
+  const { record, retained } = await runner.run(selInput({ checks: PASS_CHECK }))
   assert.equal(record.status, "completed")
   assert.equal(bridge.calls.length, 0)
-  assert.ok(winner && winner.candidateIndex === 1)
+  assert.ok(retained && retained.candidateIndex === 1)
   assert.deepEqual(record.ranking, [1])
   assert.deepEqual(record.scores, [null, null, null])
+  assert.equal(record.outcome, "single_candidate_fallback")
   assert.equal(record.winnerBasis, "objective-check-only")
+  assert.equal(record.winner, undefined)
+  assert.equal(record.fallback.index, 1)
+})
+
+// ---------- 2026-09-08 裁决 9.8 winner gate（I.2/I.3、K.5、F1–F4）----------
+
+test("winner gate: exact tie abstains — never a verifier winner (B-8)", async () => {
+  const factory = makeFakeFactory({})
+  const bridge = fakeBridge(() => ({ index: 0, bestPreview: "", scores: [0.5, 0.5], ranking: [0, 1], nComparisons: 2, criteria: ["c1"] }))
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  const { record, retained } = await runner.run(selInput({ candidateCount: 2 }))
+  assert.equal(record.status, "completed")
+  assert.equal(record.outcome, "abstain")
+  assert.equal(record.winnerBasis, undefined, "a tied tournament carries no verifier basis")
+  assert.equal(record.winner, undefined, "abstain crowns nobody")
+  assert.equal(retained, undefined, "abstain retains no workspace")
+  assert.equal(record.margin, 0)
+  assert.equal(record.marginProvisional, true)
+  assert.ok(record.note && record.note.includes("noise band"))
+  for (const h of factory.handles) assert.equal(h.disposed, true, "tied candidates are disposed")
+})
+
+test("winner gate: near-tie inside the provisional noise band abstains (F1)", async () => {
+  const factory = makeFakeFactory({})
+  const bridge = fakeBridge(() => ({ index: 0, bestPreview: "", scores: [0.51, 0.49], ranking: [0, 1], nComparisons: 2, criteria: ["c1"] }))
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  const { record } = await runner.run(selInput({ candidateCount: 2, taskKind: "code-change" }))
+  assert.equal(record.outcome, "abstain")
+  assert.ok(Math.abs((record.margin ?? 0) - 0.02) < 1e-9, "margin records the near-tie spread within float tolerance")
+  assert.equal(record.marginThreshold, 0.03)
+  assert.equal(record.marginCondition, "m@default")
+  assert.equal(record.llmOnly, true, "no objective checks ran, so the tournament was LLM-only")
+  assert.equal(record.winner, undefined)
+  assert.equal(record.winnerBasis, undefined, "ruling: the old ledger's winnerBasis=verifier on a 0.02 margin was exactly the false claim being removed")
+})
+
+test("winner gate: margins straddle the calibrated 0.03 boundary correctly", async () => {
+  // Calibration rounds 1+2 put the noise ceiling at 0.0138; 0.03 sits ~2x over it.
+  // Below the gate: abstain. Above it: ranked_winner.
+  const mk = () => {
+    const factory = makeFakeFactory({})
+    const bridge = fakeBridge(() => ({ index: 0, bestPreview: "", scores: [0.512, 0.488], ranking: [0, 1], nComparisons: 2, criteria: ["c1"] }))
+    return new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  }
+  const below = await mk().run(selInput({ candidateCount: 2, taskKind: "code-change" }))
+  assert.equal(below.record.outcome, "abstain")
+  assert.ok((below.record.margin ?? 0) < 0.03)
+  const mk2 = () => {
+    const factory = makeFakeFactory({})
+    const bridge = fakeBridge(() => ({ index: 0, bestPreview: "", scores: [0.55, 0.5], ranking: [0, 1], nComparisons: 2, criteria: ["c1"] }))
+    return new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  }
+  const above = await mk2().run(selInput({ candidateCount: 2, taskKind: "code-change" }))
+  assert.equal(above.record.outcome, "ranked_winner")
+  assert.ok((above.record.margin ?? 0) > 0.03)
+  assert.equal(above.record.winnerBasis, "verifier")
+})
+
+test("winner gate: a decisive margin ranks the winner honestly", async () => {
+  const factory = makeFakeFactory({})
+  const bridge = fakeBridge(() => ({ index: 1, bestPreview: "", scores: [0.2, 0.85], ranking: [1, 0], nComparisons: 3, criteria: ["c1"] }))
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  const { record, retained } = await runner.run(selInput({ candidateCount: 2 }))
+  assert.equal(record.outcome, "ranked_winner")
+  assert.equal(record.winnerBasis, "verifier")
+  assert.equal(record.winner.index, 1)
+  assert.equal(retained.candidateIndex, 1)
+  assert.ok(Math.abs((record.margin ?? 0) - 0.65) < 1e-9, "margin is the decisive spread within float tolerance")
+})
+
+test("ranking input: deterministic evidence block precedes every trajectory (I.6/J.4)", async () => {
+  const factory = makeFakeFactory({})
+  const bridge = fakeBridge()
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  await runner.run(selInput({ candidateCount: 2, taskKind: "code-change" }))
+  assert.equal(bridge.calls.length, 1)
+  for (const payload of bridge.calls[0].candidates) {
+    const headEnd = payload.indexOf("[TRAJECTORY")
+    assert.ok(payload.startsWith("[DETERMINISTIC EVIDENCE"), "runner-collected evidence leads the payload")
+    assert.ok(headEnd > 0, "trajectory sits after the evidence block")
+    assert.ok(payload.includes("Task kind: code-change"))
+    assert.ok(payload.includes("Execution-class tool calls: 1"), "exec-class count is visible; meta tools excluded")
+    assert.ok(payload.includes("Objective checks: none configured"), "absent checks are disclosed, not implied")
+    assert.ok(payload.includes("Worktree diff: unavailable"), "non-git workspaces say so explicitly")
+  }
+})
+
+test("winner gate: meta-tool-only rollouts fail the has-work gate (F4 / K.4-1)", async () => {
+  const metaOnly = (i) => [
+    { type: "user/message", seq: 0, data: { content: [{ type: "text", text: "inspect the repo " + i }], source: { kind: "user" } } },
+    { type: "turn/start", seq: 1, data: { turn: 1 } },
+    { type: "tool/call", seq: 2, data: { turn: 1, name: "tool_search", arguments: { query: "find tools" } } },
+    { type: "tool/result", seq: 3, data: { turn: 1, message: { content: [{ type: "text", text: "catalog listing" }] } } },
+    { type: "assistant/message", seq: 4, data: { turn: 1, message: { role: "assistant", content: [{ type: "text", text: "looks fine to me " + i }] } } },
+    { type: "turn/end", seq: 5, data: { turn: 1, reason: { kind: "completed" } } },
+  ]
+  const factory = makeFakeFactory({ scripts: { 0: { events: metaOnly(0) }, 1: { events: metaOnly(1) } } })
+  let selectCalled = 0
+  const bridge = fakeBridge(() => { selectCalled += 1; return { index: 0, bestPreview: "", scores: [0.9, 0.1], ranking: [0, 1], nComparisons: 2, criteria: ["c1"] } })
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  const { record } = await runner.run(selInput({ candidateCount: 2, taskKind: "code-change" }))
+  assert.equal(record.outcome, "insufficient_evidence")
+  assert.equal(selectCalled, 0, "workless survivors never reach the verifier")
+  assert.equal(record.winner, undefined)
+  assert.deepEqual(record.candidates[0].eliminatedBy, ["insufficient-evidence"])
+  assert.equal(record.candidates[0].execToolCalls, 0, "tool_search is meta, not execution evidence")
+})
+
+test("winner gate: identical diff surfaces dedupe to fallback before ranking (F3)", async () => {
+  const factory = makeFakeFactory({})
+  let selectCalled = 0
+  const bridge = fakeBridge(() => { selectCalled += 1; return { index: 0, bestPreview: "", scores: [0.9, 0.1], ranking: [0, 1], nComparisons: 2, criteria: ["c1"] } })
+  const sameStat = { files: 1, insertions: 3, deletions: 1, untracked: 0, fingerprint: "abc123" }
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge, diffStat: async () => sameStat })
+  const { record, retained } = await runner.run(selInput({ candidateCount: 2, taskKind: "code-change" }))
+  assert.equal(record.noSearchSpace, true)
+  assert.equal(record.outcome, "single_candidate_fallback")
+  assert.equal(selectCalled, 0, "no search space → no verifier spend")
+  assert.equal(record.winnerBasis, "single-candidate")
+  assert.ok(retained && retained.candidateIndex === 0)
+  assert.equal(record.fallback.index, 0)
+})
+
+test("winner gate: analysis-text tasks are exempt from the has-work gate (I.3)", async () => {
+  const textOnly = (i) => [
+    { type: "user/message", seq: 0, data: { content: [{ type: "text", text: "analyze design " + i }], source: { kind: "user" } } },
+    { type: "turn/start", seq: 1, data: { turn: 1 } },
+    { type: "assistant/message", seq: 2, data: { turn: 1, message: { role: "assistant", content: [{ type: "text", text: "analysis " + i }] } } },
+    { type: "turn/end", seq: 3, data: { turn: 1, reason: { kind: "completed" } } },
+  ]
+  const factory = makeFakeFactory({ scripts: { 0: { events: textOnly(0) }, 1: { events: textOnly(1) } } })
+  const bridge = fakeBridge()
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  const { record } = await runner.run(selInput({ candidateCount: 2, taskKind: "analysis-text" }))
+  assert.equal(record.outcome, "ranked_winner", "pure analysis never gets eliminated for lacking tool calls")
+  assert.equal(record.llmOnly, true)
+  assert.equal(record.winner.index, 0)
+})
+
+test("checks gate: shell harness errors never eliminate a candidate (B-10)", async () => {
+  const factory = makeFakeFactory({})
+  const bridge = fakeBridge()
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  const badCheck = [{ name: "broken", command: "= -eq 3", timeoutMs: 10000 }]
+  const { record } = await runner.run(selInput({ candidateCount: 2, checks: badCheck, taskKind: "code-change" }))
+  assert.equal(record.status, "completed")
+  assert.equal(record.checksUnreliable, true)
+  assert.equal(record.candidates[0].checksInvalid, true)
+  assert.equal(record.candidates[0].objectiveEvidence, "none", "an invalid check grants no objective evidence")
+  assert.equal(bridge.calls.length, 1, "candidates reached the verifier instead of being gate-massacred")
+  assert.equal(record.outcome, "ranked_winner")
+})
+
+test("winner gate: verifier outage with full objective pass degrades to verifier_unavailable, never failed-with-nothing (K.5)", async () => {
+  const factory = makeFakeFactory({ passAt: [0, 1] })
+  const bridge = fakeBridge(() => { throw new BridgeError("verifier_timeout", "verifier selection exceeded its absolute budget", false) })
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  const { record } = await runner.run(selInput({ candidateCount: 2, checks: PASS_CHECK, taskKind: "code-change" }))
+  assert.equal(record.status, "completed")
+  assert.equal(record.outcome, "verifier_unavailable")
+  assert.equal(record.llmOnly, undefined, "objective evidence existed; the run was not LLM-only")
+  assert.ok(record.note && record.note.includes("ranking failed"))
+  assert.equal(record.winner, undefined, "a broken verifier must never fabricate a winner (sel-ac011a39)")
+})
+
+test("relay text: fallback and abstain never promise a chosen best", async () => {
+  const { buildAutopilotRelay } = await import("../lib/selection/autopilot.js")
+  const base = { selectionId: "sel-x", sourceSessionId: "s", startedAt: 1, finishedAt: 2, status: "completed", candidates: [] }
+  const fb = buildAutopilotRelay({ ...base, outcome: "single_candidate_fallback", winnerBasis: "single-candidate", fallback: { index: 0, sessionId: "a", workspace: "W" } })
+  assert.ok(fb.includes("SINGLE-SURVIVOR FALLBACK"))
+  assert.ok(fb.includes("NEVER compared"), "the relay must state that no comparison happened")
+  assert.ok(!fb.includes("ranked by the verifier"), "fallback copy must not imply selection")
+  const ab = buildAutopilotRelay({ ...base, outcome: "abstain", margin: 0.01, marginThreshold: 0.03, marginProvisional: true, marginCondition: "m@low" })
+  assert.ok(ab.includes("noise band"))
+  assert.ok(!ab.includes("FINALIZER CONTRACT"), "abstain carries no finalizer contract")
+  const insuff = buildAutopilotRelay({ ...base, outcome: "insufficient_evidence" })
+  assert.ok(insuff.includes("Do NOT integrate"), "insufficient evidence must stop integration")
+  const ranked = buildAutopilotRelay({ ...base, outcome: "ranked_winner", winnerBasis: "verifier", winner: { index: 0, sessionId: "a", workspace: "W" }, margin: 0.3, marginThreshold: 0.03, marginProvisional: true, marginCondition: "m@low", finalists: [] })
+  assert.ok(ranked.includes("FINALIZER CONTRACT"))
+  assert.ok(ranked.includes("winner"), "a cleared margin keeps the winner framing")
+})
+
+test("post-audit delivery: yes needs integration AND passing configured tests (G-4)", async () => {
+  const { evaluateDelivery } = await import("../lib/selection/candidates.js")
+  // not audited
+  assert.deepEqual(evaluateDelivery({ audited: false, headChanged: null, dirtyEntries: null, testsConfigured: false }).delivered, "unknown")
+  // audited, nothing integrated
+  assert.equal(evaluateDelivery({ audited: true, headChanged: false, dirtyEntries: 0, testsConfigured: false }).delivered, "no")
+  // integrated but no test command configured -> honest unknown
+  assert.equal(evaluateDelivery({ audited: true, headChanged: true, dirtyEntries: 0, testsConfigured: false }).delivered, "unknown")
+  // integrated and tests pass -> yes
+  assert.equal(evaluateDelivery({ audited: true, headChanged: true, dirtyEntries: 0, testsConfigured: true, testsExit: 0 }).delivered, "yes")
+  // integrated but tests fail -> no
+  assert.equal(evaluateDelivery({ audited: true, headChanged: false, dirtyEntries: 3, testsConfigured: true, testsExit: 1 }).delivered, "no")
+})
+
+test("recovery: a reload re-delivers a settled autopilot relay lost with the old host (sel-ac04cfd7 incident)", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-recover-"))
+  try {
+    const ledger = path.join(base, "selections.jsonl")
+    const ctx = fakeContext()
+    const source = ctx.spawnAgent(fakeAgent("sess-src", completedTurnEvents(1)))
+    // Seed a ledger that finished under a previous host: settled autopilot
+    // fallback, no relayedAt — exactly the orphan shape from sel-ac04cfd7.
+    writeFileSync(ledger, JSON.stringify({
+      selectionId: "sel-orphan", sourceSessionId: "sess-src", startedAt: 1, finishedAt: 2,
+      status: "completed", trigger: "autopilot", outcome: "single_candidate_fallback",
+      candidates: [], fallback: { index: 0, sessionId: "cand-1", workspace: path.join(base, "c0") },
+    }) + "\n")
+    mkdirSync(path.join(base, "c0"), { recursive: true })
+    const host2 = new VerifierHost(ctx, hostOverrides({ enabled: false }), {
+      selectionsFile: ledger,
+      selectionsTesting: { factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge: fakeBridge() },
+    })
+    host2.start()
+    assert.ok(source.followups.length >= 1, "the lost relay is re-delivered after reload")
+    assert.ok(source.followups.at(-1).source.form === "relay")
+    assert.ok(source.followups.at(-1).content[0].text.includes("SINGLE-SURVIVOR FALLBACK"))
+    const countAfterFirst = source.followups.length
+    host2.start() // idempotence guard: a second start must not re-relay
+    assert.equal(source.followups.length, countAfterFirst, "recovery is idempotent (record carries relayedAt)")
+    const ledgerText = readFileSync(ledger, "utf8")
+    assert.ok(ledgerText.includes("relayedAt"), "relay delivery is persisted, not only in memory")
+    const host3 = new VerifierHost(ctx, hostOverrides({ enabled: false }), {
+      selectionsFile: ledger,
+      selectionsTesting: { factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge: fakeBridge() },
+    })
+    host3.start()
+    assert.equal(source.followups.length, countAfterFirst, "third generation skips delivery because relayedAt survived the reload")
+    await host3.dispose()
+    await host2.dispose()
+    assert.ok(!existsSync(path.join(base, "c0")), "idle/dispose afterwards still owns workspace cleanup")
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
 })
 
 test("selection: a candidate whose turn ends in error is failed, never sent to the verifier", async () => {
@@ -3065,8 +3352,9 @@ test("selection: seed prefix never enters the verifier trajectory payload", asyn
   const childEvents = (i) => seedEvents.concat([
     { type: "user/message", seq: 2, data: { content: [{ type: "text", text: "OWN-TASK-" + i }], source: { kind: "user" } } },
     { type: "turn/start", seq: 3, data: { turn: 1 } },
-    { type: "assistant/message", seq: 4, data: { message: { role: "assistant", content: [{ type: "text", text: "own work " + i }] } } },
-    { type: "turn/end", seq: 5, data: { turn: 1, reason: { kind: "completed" } } },
+    { type: "tool/call", seq: 4, data: { turn: 1, name: "write", arguments: { file: "own-" + i + ".txt" } } },
+    { type: "assistant/message", seq: 5, data: { message: { role: "assistant", content: [{ type: "text", text: "own work " + i }] } } },
+    { type: "turn/end", seq: 6, data: { turn: 1, reason: { kind: "completed" } } },
   ])
   const factory = makeFakeFactory({ scripts: { 0: { events: childEvents(0) }, 1: { events: childEvents(1) } } })
   const bridge = fakeBridge()
@@ -3079,7 +3367,7 @@ test("selection: seed prefix never enters the verifier trajectory payload", asyn
     assert.ok(!payload.includes("SEED-CONTEXT-MARKER"), "seed history must not leak into the verifier input")
     assert.ok(/OWN-TASK-\d/.test(payload), "the candidate's own rollout must be present")
   }
-  assert.equal(record.candidates[0].eventCount, 4, "only the candidate's own events are counted")
+  assert.equal(record.candidates[0].eventCount, 5, "only the candidate's own events are counted")
 })
 
 test("selection: persistent transient bridge failure exhausts retries and reclaims every candidate", async () => {
@@ -3347,11 +3635,11 @@ test("selection: a failed run sweeps its empty workspace root; a winner's root s
   })
   const done = await okRunner.run(selInput({ candidateCount: 2 }))
   assert.equal(done.record.status, "completed")
-  assert.ok(done.winner)
+  assert.ok(done.retained)
   const root = path.join(SEL_TMP, done.record.selectionId)
   assert.equal(existsSync(root), true, "winner run root retained")
-  assert.equal(existsSync(done.winner.workspace), true, "winner workspace retained")
-  const loser = done.record.candidates[1 - done.winner.candidateIndex]
+  assert.equal(existsSync(done.retained.workspace), true, "retained workspace survives")
+  const loser = done.record.candidates[1 - done.retained.candidateIndex]
   assert.equal(existsSync(loser.workspace), false, "loser workspace removed as before")
   rmSync(root, { recursive: true, force: true })
 })
@@ -3385,6 +3673,53 @@ test("selection: disposed losers lose BOTH workspace and session record; the win
   for (const p of purged) assert.equal(existsSync(path.join(storeTmp, projectStoreKey(p))), false, "loser store dirs gone")
   rmSync(path.join(SEL_TMP, selectionId), { recursive: true, force: true })
   rmSync(storeTmp, { recursive: true, force: true })
+})
+
+test("selhost: record carries the effective config snapshot that reload drift cannot rewrite (F5)", async () => {
+  const ctx = fakeContext()
+  ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+  const host = new VerifierHost(ctx, hostOverrides({ selectionMarginThreshold: 0.2 }), {
+    selectionsTesting: { factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge: fakeBridge() },
+  })
+  ctx.spawnAgent(fakeAgent("sess-A", completedTurnEvents(1)))
+  const routes = apiRoutes(host)
+  const res = fakeRes()
+  await routes.find((r) => r.path.endsWith("/select")).handler(fakeReq({ sourceSessionId: "sess-A", candidateCount: 2 }), res)
+  assert.equal(res.status, 202)
+  const id = JSON.parse(res.bodyText).selection.selectionId
+  const final = await waitFor(() => { const s = host.selections.getSelection(id); return s && s.status !== "running" ? s : null })
+  assert.equal(final.status, "completed")
+  assert.equal(final.outcome, "ranked_winner")
+  assert.equal(final.marginThreshold, 0.2, "the threshold at run time is recorded, not a later reload value")
+  assert.equal(final.marginProvisional, true)
+  assert.equal(final.marginCondition, "mock@max")
+  assert.equal(final.configSnapshot.verifierModel, "mock")
+  assert.equal(final.configSnapshot.verifierEffort, "max")
+  assert.equal(final.configSnapshot.selectTimeoutMs, 30000)
+  assert.equal(final.configSnapshot.trigger, "manual")
+  assert.equal(final.configSnapshot.marginThreshold, 0.2)
+  assert.deepEqual(final.configSnapshot.candidateOptions, [{ provider: null, model: null, shared: true }], "a manual run without an explicit pool records the honestly-absent default route")
+  await host.selections.dispose()
+})
+
+test("selhost: a real selection without any Git source cwd fails closed instead of running in the host process directory", async () => {
+  // 2026-09-13 incident: a manual /select with no source cwd degraded the
+  // workspace adapter to a blank dir, the candidate wrote through
+  // process.cwd(), and percent.js/percent.test.js landed inside the installed
+  // @deepseek-ai/dsh package — the runtime then died on a native assertion.
+  // A live (non-injected) host must refuse that shape outright.
+  const ctx = fakeContext()
+  ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+  const host = new VerifierHost(ctx, hostOverrides(), { selectionsTesting: { bridge: fakeBridge() } })
+  await assert.rejects(
+    () => host.selections.start({ problem: "write files", candidateCount: 2 }),
+    (error) => {
+      assert.equal(error.code, "source-cwd-required")
+      return true
+    },
+  )
+  assert.equal(host.selections.listSelections().length, 0, "no placeholder record is created for a refused run")
+  await host.selections.dispose()
 })
 
 test("selhost: discard removes the winner workspace + session record and rejects a second discard", async () => {
@@ -3422,6 +3757,55 @@ test("selhost: discard removes the winner workspace + session record and rejects
   assert.equal(d2.status, 404, "second discard finds nothing discardable")
   await host.selections.dispose()
   rmSync(storeTmp, { recursive: true, force: true })
+})
+
+test("selhost: audit pack directory holds record + traces + patches, captured before cleanup (F6)", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-artifact-"))
+  try {
+    const { SelectionHost } = await import("../lib/selection/host.js")
+    const ctx = fakeContext()
+    ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+    const ledgerFile = path.join(base, "led", "s.jsonl")
+    let n = 0
+    const candidates = ["alpha", "beta"]
+    const host = new VerifierHost(ctx, hostOverrides(), {
+      selectionsFile: ledgerFile,
+      selectionsTesting: {
+        factory: makeFakeFactory({}),
+        workspaces: realWorkspaces,
+        bridge: fakeBridge(),
+        diffStat: async () => ({ files: 1, insertions: 3, deletions: 0, untracked: 1, fingerprint: "fp" + (n++), __: 0 }),
+        diffFull: async (cwd) => ({ patch: "diff --git a/notes.md b/notes.md\n+hello-from-" + path.basename(cwd) + "\n", truncated: false, untrackedFiles: ["NEW.txt"] }),
+      },
+    })
+    ctx.spawnAgent(fakeAgent("sess-A", completedTurnEvents(1)))
+    const res = fakeRes()
+    await apiRoutes(host).find((r) => r.path.endsWith("/select")).handler(fakeReq({ sourceSessionId: "sess-A", candidateCount: 2 }), res)
+    assert.equal(res.status, 202)
+    const id = JSON.parse(res.bodyText).selection.selectionId
+    await waitFor(() => { const s = host.selections.getSelection(id); return s && s.status !== "running" ? s : null })
+    const dir = path.join(base, "led", "selection-artifacts", id)
+    assert.ok(existsSync(path.join(dir, "record.json")), "record.json lands in the per-selection directory")
+    const rec = JSON.parse(readFileSync(path.join(dir, "record.json"), "utf8")).record
+    assert.equal(rec.outcome, "ranked_winner", "diverse fingerprints keep the tournament")
+    for (const i of [0, 1]) {
+      const trace = readFileSync(path.join(dir, "traces", "c" + i + ".txt"), "utf8")
+      assert.ok(trace.includes("TOOL CALL"), "candidate " + i + " trajectory text is preserved")
+      const patch = readFileSync(path.join(dir, "diffs", "c" + i + ".patch"), "utf8")
+      assert.ok(patch.includes("hello-from-c" + i), "candidate " + i + " diff text preserved even after workspace disposal")
+    }
+    await host.selections.dispose()
+    // discard refreshes record.json (discardedAt) without touching traces/diffs
+    const discardRoute = apiRoutes(host).find((r) => r.path.endsWith("/selections/discard"))
+    const dres = fakeRes()
+    await discardRoute.handler(fakeReq({ selectionId: id }), dres)
+    assert.equal(dres.status, 200)
+    const rec2 = JSON.parse(readFileSync(path.join(dir, "record.json"), "utf8")).record
+    assert.ok(rec2.winner.discardedAt, "discardedAt rewritten into record.json")
+    assert.ok(existsSync(path.join(dir, "traces", "c0.txt")), "traces survive a discard refresh")
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
 })
 
 test("selhost: settlement file dedupes later discard lines over the original record", async () => {
@@ -3488,6 +3872,103 @@ test("autopilot policy: named-session continuation is status control, not a refa
   assert.equal(real.admitted, true, "an actual implementation task remains eligible")
 })
 
+test("autopilot policy: a completion report is never admitted as a task (K.4-7)", async () => {
+  const { planAutopilotTask } = await import("../lib/selection/autopilot.js")
+  const config = {
+    mode: "auto", provider: "kimi", preferredModels: ["minimaxai/minimax-m3"], modelStrategy: "quality-first",
+    standardCandidates: 2, deepCandidates: 3, nEvaluations: 2, candidateTimeoutMs: 30000, selectTimeoutMs: 30000,
+  }
+  // sel-1c8d28ef burned a deep selection on a source agent's own收尾汇报.
+  const report = "本轮已全部完成并收口：npm test 173/173 全部通过，证据 sel-fa093cb5 已记录。\n\n验证通过，交付如下汇总。"
+  const plan = planAutopilotTask(report, ["minimaxai/minimax-m3"], config)
+  assert.equal(plan.admitted, false)
+  assert.equal(plan.reason, "status-report")
+  const imperativeReport = planAutopilotTask("之前已完成一半，请继续修复剩下的错误", ["minimaxai/minimax-m3"], config)
+  assert.equal(imperativeReport.admitted, true, "continued work with an imperative verb is still a task")
+})
+
+test("autopilot policy: task-kind classification separates code from analysis (I.3)", async () => {
+  const { planAutopilotTask, classifyTaskKind } = await import("../lib/selection/autopilot.js")
+  assert.equal(classifyTaskKind("Fix src/a.ts and run the tests"), "code-change")
+  assert.equal(classifyTaskKind("新建 README.md 并提交"), "code-change")
+  assert.equal(classifyTaskKind("分析这个模块的耦合情况并给出评审意见"), "analysis-text")
+  assert.equal(classifyTaskKind("review the queue design and explain the tradeoffs"), "analysis-text")
+  assert.equal(classifyTaskKind("hello world plain text"), "unknown")
+  const config = {
+    mode: "always", provider: "kimi", preferredModels: ["minimaxai/minimax-m3"], modelStrategy: "quality-first",
+    standardCandidates: 2, deepCandidates: 3, nEvaluations: 2, candidateTimeoutMs: 30000, selectTimeoutMs: 30000,
+  }
+  const plan = planAutopilotTask("审查淘汰策略和裁决逻辑并给出结论", ["minimaxai/minimax-m3"], config)
+  assert.equal(plan.taskKind, "analysis-text", "policy carries the admission-time task kind into the ledger")
+})
+
+// ---------- P-C: candidate-model liveness probing ----------
+
+test("model prober: liveness beats catalog membership, with caching and cooldown", async () => {
+  const { createModelProber } = await import("../lib/selection/probe.js")
+  const calls = []
+  let now = 1000
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body)
+    calls.push(body.model)
+    if (body.model === "dead-model") throw new Error("relay timeout")
+    return { ok: true, status: 200 }
+  }
+  const prober = createModelProber({ baseURL: "http://relay.local/v1", apiKey: "k", fetchImpl, now: () => now })
+  assert.equal(await prober.probe("good-model"), true)
+  assert.equal(await prober.probe("dead-model"), false)
+  assert.equal(await prober.probe("dead-model"), false, "dead verdict is memoized inside the cooldown window")
+  assert.deepEqual(calls, ["good-model", "dead-model"], "the memoized dead model is not re-probed repeatedly")
+  assert.equal(await prober.probe("good-model"), true)
+  now += 130_000
+  assert.equal(await prober.probe("dead-model"), false, "after cooldown the dead model is re-probed once")
+  assert.equal(calls.length, 3, "cache hit + window re-probe account for exactly three fetches")
+  prober.markDead("good-model", "rollout failed")
+  assert.equal(prober.snapshot()["good-model"].ok, false, "explicit failures push the model into the dead window")
+})
+
+test("model prober: default fetch targets chat/completions with the api key", async () => {
+  const { createModelProber } = await import("../lib/selection/probe.js")
+  let seen = null
+  const fetchImpl = async (url, init) => { seen = { url, init }; return { ok: true, status: 200 } }
+  const prober = createModelProber({ baseURL: "http://relay.local/v1/", apiKey: "k", fetchImpl })
+  assert.equal(await prober.probe("m"), true)
+  assert.equal(seen.url, "http://relay.local/v1/chat/completions")
+  assert.equal(seen.init.headers.authorization, "Bearer k")
+  assert.equal(JSON.parse(seen.init.body).max_tokens, 1)
+})
+
+test("autopilot pre-step: all-dead preferred pool fails closed, never a ghost tournament", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-probe-"))
+  try {
+    const repo = makeGitRepo(base, "source")
+    const ctx = fakeContext()
+    ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+    ctx.credentials = { resolve: async () => ({ value: "probe-test-key" }) }
+    ctx.llm = { async listModels() { return [{ id: "kimi-k3" }, { id: "ghost" }] } }
+    const ApolloSignals = { started: 0 }
+    const host = new VerifierHost(ctx, hostOverrides({ enabled: false, selectionProbeEnabled: true }), {
+      selectionsTesting: { factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge: fakeBridge() },
+    })
+    // Force both catalog models to report dead by poking the fetch used by the prober.
+    const source = ctx.spawnAgent(fakeAgent("sess-dead", completedTurnEvents(1)))
+    source.session.header = { cwd: repo }
+    const origFetch = globalThis.fetch
+    globalThis.fetch = async () => ({ ok: false, status: 410, body: null })
+    host.start()
+    try {
+      const preStep = source.handlers.get("agent/pre-step")[0]
+      const direct = { id: "u1", role: "user", content: [{ type: "text", text: "Fix src/x.ts and run the tests" }], source: { kind: "user" } }
+      const decision = await preStep({ messages: [direct], turn: 1, step: 1, signal: new AbortController().signal }, async () => ({ kind: "enter", messages: [direct] }))
+      assert.equal(decision.kind, "enter", "source turn proceeds normally")
+      assert.equal(host.selections.listSelections().length, 0, "no selection started when every preferred model is dead")
+    } finally {
+      globalThis.fetch = origFetch
+    }
+    await host.dispose()
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
 test("autopilot policy: quality-first repeats the strongest available route and exploration rotates explicitly", async () => {
   const { planAutopilotTask } = await import("../lib/selection/autopilot.js")
   const base = {
@@ -3504,6 +3985,9 @@ test("autopilot policy: quality-first repeats the strongest available route and 
   const exploration = planAutopilotTask(task, ["kimi-k3", "deepseek-ai/deepseek-v4-pro-0813", "minimaxai/minimax-m3"], { ...base, modelStrategy: "exploration" })
   assert.equal(exploration.modelStrategy, "exploration")
   assert.deepEqual(exploration.candidateOptions.map(route => route.model), ["kimi-k3", "deepseek-ai/deepseek-v4-pro-0813", "minimaxai/minimax-m3"], "exploration is the only mode that rotates the quality-ranked pool")
+  const custom = planAutopilotTask(task, ["z-ai/glm-5.3-flash"], { ...base, preferredModels: ["z-ai/glm-5.3-flash"], modelStrategy: "quality-first" })
+  assert.equal(custom.admitted, true)
+  assert.deepEqual(custom.candidateOptions.map(route => route.model), ["z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash", "z-ai/glm-5.3-flash"], "operator-supplied model IDs are valid without a fixed model allowlist")
   assert.equal(new Set(quality.candidateInstructions).size, 3, "independent candidates retain distinct strategy instructions")
 })
 
@@ -3723,5 +4207,163 @@ test("selhost: dispose waits for active runner cleanup before resolving", async 
   await disposing
   assert.equal(host.getSelection(started.selectionId).status, "aborted")
   assert.equal(existsSync(path.join(SEL_TMP, started.selectionId)), false)
+})
+
+// ---------- relay account-pool execution: concurrency, smoothing, tiering ----------
+
+test("effectiveVerifierWorkers: 0=auto(4), explicit pass-through, clamp at 16", async () => {
+  const { effectiveVerifierWorkers, AUTO_VERIFIER_WORKERS } = await import("../lib/selection/host.js")
+  assert.equal(AUTO_VERIFIER_WORKERS, 4)
+  assert.equal(effectiveVerifierWorkers(undefined), 4, "undefined -> auto")
+  assert.equal(effectiveVerifierWorkers(null), 4, "null -> auto")
+  assert.equal(effectiveVerifierWorkers(0), 4, "0 -> auto")
+  assert.equal(effectiveVerifierWorkers(-3), 4, "negative -> auto")
+  assert.equal(effectiveVerifierWorkers(Number.NaN), 4, "NaN -> auto")
+  assert.equal(effectiveVerifierWorkers(1), 1)
+  assert.equal(effectiveVerifierWorkers(7), 7)
+  assert.equal(effectiveVerifierWorkers(99), 16, "clamped to 16")
+})
+
+test("config API: account-pool execution knobs accept valid values, defaults are auto/off, ranges enforced", async () => {
+  const { host } = mkSelectionHost()
+  try {
+    const defaults = JSON.parse(JSON.stringify(host.getConfig()))
+    assert.equal(defaults.selectionVerifierWorkers, 0, "workers default to auto")
+    assert.equal(defaults.verifierMinIntervalMs, 0, "smoothing defaults to off")
+    assert.equal(defaults.verifierSmallModel, "", "small model defaults to off")
+
+    const routes = apiRoutes(host)
+    const configRoute = routes.find((r) => r.path.endsWith("/config"))
+
+    const ok = fakeRes()
+    await configRoute.handler(fakeReq({ selectionVerifierWorkers: 8, verifierMinIntervalMs: 500, verifierSmallModel: "small/mock" }), ok)
+    assert.equal(ok.status, 200, "valid account-pool knobs are accepted")
+    const cfg = JSON.parse(ok.bodyText).config
+    assert.equal(cfg.selectionVerifierWorkers, 8)
+    assert.equal(cfg.verifierMinIntervalMs, 500)
+    assert.equal(cfg.verifierSmallModel, "small/mock")
+
+    for (const [name, patch] of [
+      ["selectionVerifierWorkers", { selectionVerifierWorkers: 17 }],
+      ["verifierMinIntervalMs", { verifierMinIntervalMs: 60001 }],
+      ["verifierSmallModel", { verifierSmallModel: "x".repeat(201) }],
+    ]) {
+      const bad = fakeRes()
+      await configRoute.handler(fakeReq(patch), bad)
+      assert.equal(bad.status, 400, `${name} out of range is rejected`)
+      assert.ok(String(JSON.parse(bad.bodyText).error).includes(name))
+    }
+
+    const badFrac = fakeRes()
+    await configRoute.handler(fakeReq({ selectionVerifierWorkers: 1.5 }), badFrac)
+    assert.equal(badFrac.status, 400, "non-integer workers rejected")
+
+    const clear = fakeRes()
+    await configRoute.handler(fakeReq({ verifierSmallModel: "" }), clear)
+    assert.equal(clear.status, 200, "clearing the small model back to '' is accepted")
+    assert.equal(JSON.parse(clear.bodyText).config.verifierSmallModel, "")
+  } finally { await host.dispose().catch(() => {}) }
+})
+
+function laneSuccessResponseBody() {
+  return { choices: [{ finish_reason: "stop", message: { role: "assistant", content: ["Analysis.", "finding: no concrete defect found", "<score_A> K </score_A>", "<score_B> M </score_B>"].join(LF) }, logprobs: { content: scorePositions() } }] }
+}
+
+test("verifyFive: layered small model drives only the mechanical lanes (completion/evidence)", async () => {
+  const { verifyFive } = await import("../lib/verifier.js")
+  const seen = []
+  const original = globalThis.fetch
+  globalThis.fetch = async (_url, init) => {
+    seen.push(JSON.parse(String(init.body)).model)
+    return { ok: true, status: 200, json: async () => laneSuccessResponseBody() }
+  }
+  try {
+    const aggregate = await verifyFive(Object.assign({}, testConfig, { routes: 5, verifierSmallModel: "small/mock" }), testCredentials, "prompt")
+    assert.equal(aggregate.valid.length, 5)
+    assert.deepEqual(seen, ["small/mock", "mock", "mock", "small/mock", "mock"],
+      "lane1 completion + lane4 evidence use the cheap tier; requirements/adversarial/repair stay on the main model")
+  } finally { globalThis.fetch = original }
+})
+
+test("verifyFive: without verifierSmallModel every lane keeps the main model", async () => {
+  const { verifyFive } = await import("../lib/verifier.js")
+  const seen = []
+  const original = globalThis.fetch
+  globalThis.fetch = async (_url, init) => {
+    seen.push(JSON.parse(String(init.body)).model)
+    return { ok: true, status: 200, json: async () => laneSuccessResponseBody() }
+  }
+  try {
+    const aggregate = await verifyFive(Object.assign({}, testConfig, { routes: 5 }), testCredentials, "prompt")
+    assert.equal(aggregate.valid.length, 5)
+    assert.ok(seen.every(model => model === "mock"), "tiering is opt-in: no small model configured means no lane changes")
+  } finally { globalThis.fetch = original }
+})
+
+test("verifyFive: token-bucket smoother spaces concurrent lane dispatches", async () => {
+  const { verifyFive } = await import("../lib/verifier.js")
+  const stamps = []
+  const original = globalThis.fetch
+  globalThis.fetch = async () => {
+    stamps.push(Date.now())
+    return { ok: true, status: 200, json: async () => laneSuccessResponseBody() }
+  }
+  try {
+    const aggregate = await verifyFive(Object.assign({}, testConfig, { routes: 5, verifierMinIntervalMs: 40 }), testCredentials, "prompt")
+    assert.equal(aggregate.valid.length, 5, "smoothing never drops lanes")
+    stamps.sort((a, b) => a - b)
+    const spread = stamps[4] - stamps[0]
+    assert.ok(spread >= 120, `five dispatches spread >=4x40ms apart (measured ${spread}ms)`)
+  } finally { globalThis.fetch = original }
+})
+
+test("createRequestSmoother: min-interval serializes acquires; 0 is a no-op", async () => {
+  const { createRequestSmoother } = await import("../lib/verifier.js")
+  const noop = createRequestSmoother(0)
+  const t0 = Date.now()
+  await noop.acquire()
+  await noop.acquire()
+  assert.ok(Date.now() - t0 < 30, "zero interval never delays")
+  const smoother = createRequestSmoother(50)
+  const t1 = Date.now()
+  await smoother.acquire()
+  await smoother.acquire()
+  await smoother.acquire()
+  const spread = Date.now() - t1
+  assert.ok(spread >= 90, `three acquires spaced >=2x50ms apart (measured ${spread}ms)`)
+})
+
+test("selhost: explicit selectionVerifierWorkers pins and clamps the tournament concurrency; minIntervalMs rides along", async () => {
+  const pinOne = mkSelectionHost({ config: { selectionVerifierWorkers: 1 } })
+  try {
+    const routes = apiRoutes(pinOne.host)
+    const selectRoute = routes.find((r) => r.path.endsWith("/select"))
+    const res = fakeRes()
+    await selectRoute.handler(fakeReq({ sourceSessionId: "sess-A", candidateCount: 2 }), res)
+    assert.equal(res.status, 202)
+    const id = JSON.parse(res.bodyText).selection.selectionId
+    await waitFor(() => {
+      const s = pinOne.host.selections.getSelection(id)
+      return s && s.status !== "running" ? s : null
+    })
+    assert.equal(pinOne.bridge.calls[0].maxWorkers, 1, "explicit 1 keeps the legacy serial tournament")
+    assert.equal(pinOne.bridge.calls[0].minIntervalMs, 0, "default smoothing is off")
+  } finally { await pinOne.host.dispose().catch(() => {}) }
+
+  const clamped = mkSelectionHost({ config: { selectionVerifierWorkers: 99, verifierMinIntervalMs: 120 } })
+  try {
+    const routes = apiRoutes(clamped.host)
+    const selectRoute = routes.find((r) => r.path.endsWith("/select"))
+    const res = fakeRes()
+    await selectRoute.handler(fakeReq({ sourceSessionId: "sess-A", candidateCount: 2 }), res)
+    assert.equal(res.status, 202)
+    const id = JSON.parse(res.bodyText).selection.selectionId
+    await waitFor(() => {
+      const s = clamped.host.selections.getSelection(id)
+      return s && s.status !== "running" ? s : null
+    })
+    assert.equal(clamped.bridge.calls[0].maxWorkers, 16, "99 clamps to the 16-worker ceiling")
+    assert.equal(clamped.bridge.calls[0].minIntervalMs, 120, "smoothing interval reaches the tournament request")
+  } finally { await clamped.host.dispose().catch(() => {}) }
 })
 

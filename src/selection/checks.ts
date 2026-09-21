@@ -19,6 +19,22 @@ export interface CheckResult {
   durationMs: number
   /** Bounded tail of combined stdout+stderr, for the record. */
   outputTail: string
+  /** True when the failure output is a shell interpreter/parse error, i.e. the
+   *  check command itself never ran (pwsh quoted-argument mangling killed it
+   *  before any candidate artifact was examined — sel-5e84f540, ruling B-10).
+   *  Such failures must not eliminate a candidate. */
+  harnessError?: boolean
+}
+
+const HARNESS_ERROR_PATTERNS = [
+  /\bis not recognized as\b/i,
+  /(?:ParserError|UnexpectedToken|MissingExpression|Missing closing|Missing statement|syntax error)/i,
+]
+
+/** A failed check whose entire tail is shell-level interpreter noise proves
+ *  nothing about the candidate; the check command itself was broken. */
+export function isHarnessError(outputTail: string): boolean {
+  return HARNESS_ERROR_PATTERNS.some((pattern) => pattern.test(outputTail))
 }
 
 export interface RunChecksOptions {
@@ -61,6 +77,7 @@ function runOne(cwd: string, check: ObjectiveCheck, options: RunChecksOptions): 
         exitCode,
         durationMs: (options.now ?? Date.now)() - start,
         outputTail: output,
+        harnessError: exitCode === 0 ? undefined : (isHarnessError(output) || undefined),
       })
     }
     // kill() terminates pwsh.exe only; grandchildren spawned INSIDE the check
