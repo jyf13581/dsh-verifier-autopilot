@@ -178,7 +178,7 @@ export function createSettingsSourceHooks(host: { replaceConfig(next: Config): v
   }
 }
 
-export function cleanConfig(config: Config): Record<string, unknown> {
+export function cleanConfig(config: Config): Config {
   return { ...config, apiKeyEnv: config.apiKeyEnv }
 }
 

@@ -20,6 +20,7 @@ import {
   type EventRecord,
 } from './evidence.js'
 import { appendJsonlLedger, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from './ledger.js'
+import type { StateResponse, VerificationRecord, WebRoute } from './protocol.js'
 import { SelectionHost } from './selection/host.js'
 import { runChecks } from './selection/checks.js'
 import { evaluateDelivery } from './selection/candidates.js'
@@ -29,7 +30,7 @@ import { createModelProber, type ModelProber } from './selection/probe.js'
 
 export type Credentials = { resolve?: (ref: string) => Promise<{ value?: string } | undefined> }
 export type Agent = { id: string; session: { events: readonly EventRecord[]; header?: { cwd?: string; parentSession?: string } }; ctx: Context; followup: (message: UserMessage) => void | Promise<void> }
-export type WebRoute = { kind: 'exact'; path: string; handler: (req: any, res: any) => void | Promise<void> }
+export type { WebRoute } from './protocol.js'
 export type HostContext = Context & { webServer: { register(route: WebRoute): () => void }; credentials?: Credentials; agents?: { list(): Agent[]; get(id: string): Agent | undefined }; llm?: { listModels(provider: string): Promise<Array<{ id: string; provider?: string }>> } }
 
 /** Phase 2 durability: finished records append to a JSONL trail so history
@@ -74,29 +75,7 @@ export class VerifyAbortedError extends Error {
   }
 }
 
-export type RecordState = {
-  id: string
-  sessionId: string
-  turn: number
-  turnEndSeq: number
-  status: 'running' | 'completed' | 'partial' | 'failed' | 'skipped'
-  startedAt: number
-  finishedAt?: number
-  aggregate?: AggregateResult
-  feedbackSent: boolean
-  feedbackError?: string
-  /** set when the divergence guard blocked a would-be feedback trigger */
-  suppressedFeedback?: { median: number; noDefectLanes: number; validLanes: number }
-  /** Feedback is intentionally withheld when no valid lane supplied an
-   * independent tool-result citation for a concrete defect. */
-  feedbackSuppressed?: { reason: 'no-independent-evidence'; defectFindings: number; independentFindings: number }
-  /** set when the turn was classified as pure no-op noise and verification was skipped */
-  skippedReason?: string
-  /** aggregated [E*] citation audit over valid lanes' findings */
-  citationAudit?: { defectFindings: number; defectFindingsWithoutCitation: number; findingsCitingUnknownIds: number; findingsCitingHistoricalVerdict: number; findingsWithoutIndependentCitation: number }
-  traceStats?: { eventCount: number; renderedEventCount: number; toolEventCount: number; traceChars: number; evidenceSignalCount: number; passSignalCount: number; evidenceSummaryChars: number }
-  error?: string
-}
+export type RecordState = VerificationRecord
 
 const DEFAULT_FEEDBACK_TIMEOUT_MS = 15_000
 
@@ -698,7 +677,7 @@ export class VerifierHost {
     return outcome.value
   }
 
-  snapshot(): Record<string, unknown> {
+  snapshot(): StateResponse {
     return { config: cleanConfig(this.config), agents: this.agents.size, records: this.records.slice(0, 20), selection: this.selections.snapshot() }
   }
 

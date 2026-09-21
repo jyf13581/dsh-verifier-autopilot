@@ -21,7 +21,9 @@ export {
 } from './evidence.js'
 export type { EvidenceKind, EventRecord, FindingCitationAudit, TurnClassification, TurnKind, TurnShape } from './evidence.js'
 export { LEDGER_VERSION, atomicWriteFile, appendJsonlLedger, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from './ledger.js'
-export { API_PREFIX, API_RATE_LIMITS, apiRoutes, createRateLimiter, json, readJson } from './api.js'
+export { API_RATE_LIMITS, apiRoutes, createRateLimiter, json, readJson } from './api.js'
+export { API_PREFIX, MODEL_OPTIONS } from './protocol.js'
+export type { ApiErrorResponse, ConfigRequest, ConfigResponse, ModelOption, SelectionIdRequest, SelectionItemResponse, SelectionSnapshot, SelectionView, SelectionsListResponse, State, StateResponse, VerificationRecord, VerifyRequest, VerifyResponse, WebRequest, WebResponse } from './protocol.js'
 export type { RateLimiter } from './api.js'
 
 

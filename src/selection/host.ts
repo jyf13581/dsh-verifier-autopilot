@@ -33,6 +33,7 @@ import { IsolatedWorkspaceManager, gitDiffStat, gitDiffFull, gitRepoState, makeL
 import type { TrajectoryEvent } from './trajectory.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
 import { appendJsonlLedger, atomicWriteFile, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from '../ledger.js'
+import type { SelectionSnapshot } from '../protocol.js'
 
 export interface SelectionsAgentProvider {
   list(): Array<{ id: string }>
@@ -767,7 +768,7 @@ export class SelectionHost {
     return true
   }
 
-  snapshot(): Record<string, unknown> {
+  snapshot(): SelectionSnapshot {
     return {
       active: this.active?.selectionId ?? null,
       retainedWinners: [...this.winners.keys()],

@@ -8,31 +8,36 @@ import {
   buildVerifierPrompt, normalizeBaseUrl, resolveKey, verifyFive, verifyRoute,
 } from './verifier.js'
 import { SelectionApiError } from './selection/host.js'
-import {
-  VERIFICATION_HISTORY_LIMIT, VerifierHost, VerifyAbortedError, type WebRoute,
-} from './host.js'
+import { VERIFICATION_HISTORY_LIMIT, VerifierHost, VerifyAbortedError } from './host.js'
+import { API_PREFIX, type HeaderValue, type WebRequest, type WebResponse, type WebRoute } from './protocol.js'
 
-export const API_PREFIX = '/@dsh-external/dsh-verifier-autopilot/api'
-export function json(res: any, status: number, body: unknown): void {
+export function json(res: WebResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
   res.end(JSON.stringify(body))
 }
 
-export async function readJson(req: any): Promise<any> {
+export async function readJson<T = unknown>(req: WebRequest): Promise<T> {
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    const buffer = Buffer.isBuffer(chunk)
+      ? chunk
+      : chunk instanceof Uint8Array ? Buffer.from(chunk) : Buffer.from(String(chunk))
     size += buffer.length
     if (size > 64 * 1024) throw new Error('body-too-large')
     chunks.push(buffer)
   }
-  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
+  return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as T
 }
 
 /** Fixed-window quota for provider-spending endpoints (Phase 1 egress policy):
  *  local callers get bounded /eval, /probe, and manual /verify spend per minute
  *  instead of an unthrottled lever on the external provider. */
+function headerText(value: HeaderValue): string {
+  if (typeof value === 'string') return value
+  return value ? [...value].join(',') : ''
+}
+
 export const API_RATE_LIMITS = { evalPerMinute: 120, probePerMinute: 60, verifyPerMinute: 60, selectPerHour: 12 }
 
 /** Sliding-window limiter on a stamp log: no fixed-window boundary burst
@@ -58,7 +63,7 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
   // require `authorization: Bearer <token>` on mutating / provider-spending
   // endpoints. Read-only views stay open to the local operator.
   const requiredToken = process.env.DSH_VA_API_TOKEN || ''
-  const authorized = (req: { headers?: Record<string, unknown> }): boolean => !requiredToken || req?.headers?.authorization === 'Bearer ' + requiredToken
+  const authorized = (req: WebRequest): boolean => !requiredToken || headerText(req.headers.authorization) === 'Bearer ' + requiredToken
   const state: WebRoute = { kind: 'exact', path: API_PREFIX + '/state', handler: (req, res) => {
     if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     json(res, 200, host.snapshot())
@@ -66,7 +71,7 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
   const config: WebRoute = { kind: 'exact', path: API_PREFIX + '/config', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) return json(res, 415, { ok: false, error: 'json-required' })
+    if (!headerText(req.headers['content-type']).toLowerCase().startsWith('application/json')) return json(res, 415, { ok: false, error: 'json-required' })
     try { host.setConfig(await readJson(req)); json(res, 200, { ok: true, config: host.getConfig() }) } catch (error) { json(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) }) }
   } }
   const verify: WebRoute = { kind: 'exact', path: API_PREFIX + '/verify', handler: async (req, res) => {
@@ -94,7 +99,7 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
   const evalRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/eval', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) return json(res, 415, { ok: false, error: 'json-required' })
+    if (!headerText(req.headers['content-type']).toLowerCase().startsWith('application/json')) return json(res, 415, { ok: false, error: 'json-required' })
     let body: Record<string, unknown>
     try {
       body = await readJson(req) as Record<string, unknown>
@@ -209,7 +214,7 @@ export function apiRoutes(host: VerifierHost): WebRoute[] {
   const selectRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/select', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    if (!(req.headers['content-type'] ?? '').toLowerCase().startsWith('application/json')) return json(res, 415, { ok: false, error: 'json-required' })
+    if (!headerText(req.headers['content-type']).toLowerCase().startsWith('application/json')) return json(res, 415, { ok: false, error: 'json-required' })
     let body: Record<string, unknown>
     try {
       body = await readJson(req) as Record<string, unknown>
