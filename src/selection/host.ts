@@ -14,7 +14,7 @@
  */
 
 import path from 'node:path'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { VerifierBridge, type BridgeSelectRequest, type BridgeSelectResult } from './bridge.js'
@@ -32,6 +32,7 @@ import type { SelectionAgentHandle } from './candidates.js'
 import { IsolatedWorkspaceManager, gitDiffStat, gitDiffFull, gitRepoState, makeLiveCandidateFactory } from './live.js'
 import type { TrajectoryEvent } from './trajectory.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
+import { appendJsonlLedger, atomicWriteFile, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from '../ledger.js'
 
 export interface SelectionsAgentProvider {
   list(): Array<{ id: string }>
@@ -260,27 +261,9 @@ function normalizeLoadedSelection(record: SelectionRecord): SelectionRecord {
   return { ...record, status: 'failed', error: 'interrupted-by-reload', finishedAt: record.finishedAt ?? Date.now() }
 }
 
-function parseSelectionsFile(file: string): SelectionRecord[] {
-  let raw: string
-  try { raw = readFileSync(file, 'utf8') } catch { return [] }
-  // Settlement updates (e.g. winner.discardedAt) append a LATER line for the
-  // same selectionId: keep the last occurrence per id.
-  const byId = new Map<string, SelectionRecord>()
-  for (const line of raw.split(String.fromCharCode(10))) {
-    const text = line.trim()
-    if (!text) continue
-    try {
-      const value = JSON.parse(text) as SelectionRecord
-      if (value && typeof value === 'object' && typeof value.selectionId === 'string') byId.set(value.selectionId, value)
-    } catch { /* skip torn lines */ }
-  }
-  return [...byId.values()].reverse().slice(0, SELECTIONS_HISTORY_LIMIT).map(normalizeLoadedSelection)
-}
-
-function writeSelectionsFile(file: string, records: readonly SelectionRecord[]): void {
-  mkdirSync(path.dirname(file), { recursive: true })
-  const chronological = [...records].reverse()
-  writeFileSync(file, chronological.map((r) => JSON.stringify(r)).join(String.fromCharCode(10)) + String.fromCharCode(10), 'utf8')
+function isSelectionRecord(value: unknown): value is SelectionRecord {
+  return Boolean(value && typeof value === 'object'
+    && typeof (value as Partial<SelectionRecord>).selectionId === 'string')
 }
 
 function safeChecks(input: unknown): ObjectiveCheck[] | undefined {
@@ -794,9 +777,13 @@ export class SelectionHost {
 
   private loadSelections(file: string): void {
     try {
-      if (!existsSync(file)) return
-      const loaded = parseSelectionsFile(file)
-      if (statSync(file).size > SELECTIONS_FILE_MAX_BYTES) writeSelectionsFile(file, loaded)
+      const loaded = readJsonlLedger(file, {
+        limit: SELECTIONS_HISTORY_LIMIT,
+        validate: isSelectionRecord,
+        idOf: record => record.selectionId,
+        normalize: normalizeLoadedSelection,
+      })
+      if (ledgerExceeds(file, SELECTIONS_FILE_MAX_BYTES)) compactJsonlLedger(file, loaded)
       this.selections.push(...loaded)
     } catch { /* observability must never break selection */ }
   }
@@ -815,11 +802,11 @@ export class SelectionHost {
     const file = this.selectionsFile
     if (!file) return
     try {
-      if (existsSync(file) && statSync(file).size > SELECTIONS_FILE_MAX_BYTES) {
-        writeSelectionsFile(file, this.selections.slice(0, SELECTIONS_HISTORY_LIMIT))
+      if (ledgerExceeds(file, SELECTIONS_FILE_MAX_BYTES)) {
+        compactJsonlLedger(file, this.selections.slice(0, SELECTIONS_HISTORY_LIMIT))
         return
       }
-      appendFileSync(file, JSON.stringify(record) + String.fromCharCode(10))
+      appendJsonlLedger(file, record)
     } catch { /* observability must never break selection */ }
   }
 
@@ -838,18 +825,18 @@ export class SelectionHost {
       const selDir = path.join(dir, record.selectionId)
       mkdirSync(path.join(selDir, 'traces'), { recursive: true })
       mkdirSync(path.join(selDir, 'diffs'), { recursive: true })
-      writeFileSync(path.join(selDir, 'record.json'), JSON.stringify({ artifactWrittenAt: this.now(), record }, null, 1) + String.fromCharCode(10))
+      atomicWriteFile(path.join(selDir, 'record.json'), JSON.stringify({ artifactWrittenAt: this.now(), record }, null, 1) + String.fromCharCode(10))
       if (artifacts) {
         for (let i = 0; i < artifacts.traces.length; i += 1) {
           const trace = artifacts.traces[i]
           if (typeof trace === 'string' && trace) {
-            writeFileSync(path.join(selDir, 'traces', 'c' + i + '.txt'), trace)
+            atomicWriteFile(path.join(selDir, 'traces', 'c' + i + '.txt'), trace)
           }
         }
         for (let i = 0; i < artifacts.diffPatches.length; i += 1) {
           const d = artifacts.diffPatches[i]
           if (d) {
-            writeFileSync(
+            atomicWriteFile(
               path.join(selDir, 'diffs', 'c' + i + '.patch'),
               d.patch + String.fromCharCode(10) + '# truncated=' + d.truncated + '; untracked=' + (d.untrackedFiles.join(' ') || 'none') + String.fromCharCode(10),
             )

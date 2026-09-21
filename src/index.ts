@@ -1,11 +1,11 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { installSettingsSection } from '@deepseek-ai/dsh-settings'
 import { createUserMessage, boundContextSummary, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import { buildVerifierPrompt, shouldRequestFeedback, decideFeedback, noDefectLaneCount, verifyFive, verifyRoute, resolveKey, normalizeBaseUrl, type AggregateResult, type RouteResult } from './verifier.js'
 import { VerificationCoordinator, type ScheduleEntry, type RunContext } from './coordinator.js'
+import { appendJsonlLedger, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from './ledger.js'
 import { Config, DEFAULT_CONFIG, SETTINGS_NAMESPACE, cleanConfig, createSettingsSourceHooks, validateConfigPatch } from './config.js'
 import {
   PLUGIN_SOURCE_NAME, auditAggregateCitations, auditFindingCitation,
@@ -34,6 +34,7 @@ export {
   turnGateDecision,
 } from './evidence.js'
 export type { EvidenceKind, EventRecord, FindingCitationAudit, TurnClassification, TurnKind, TurnShape } from './evidence.js'
+export { LEDGER_VERSION, atomicWriteFile, appendJsonlLedger, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from './ledger.js'
 
 type Credentials = { resolve?: (ref: string) => Promise<{ value?: string } | undefined> }
 type Agent = { id: string; session: { events: readonly EventRecord[]; header?: { cwd?: string; parentSession?: string } }; ctx: Context; followup: (message: UserMessage) => void | Promise<void> }
@@ -62,32 +63,22 @@ function normalizeLoadedRecord(record: RecordState): RecordState {
   return { ...record, status: 'failed', error: 'interrupted-by-reload', finishedAt: record.finishedAt ?? Date.now() }
 }
 
-function parseRecordsFile(file: string): RecordState[] {
-  let raw: string
-  try { raw = readFileSync(file, 'utf8') } catch { return [] }
-  const out: RecordState[] = []
-  for (const line of raw.split('\n')) {
-    const text = line.trim()
-    if (!text) continue
-    try {
-      const value = JSON.parse(text) as RecordState
-      if (value && typeof value === 'object' && typeof value.id === 'string' && typeof value.status === 'string') out.push(value)
-    } catch { /* skip torn or corrupt lines */ }
-  }
-  // The file is chronological (oldest first); Host state is newest-first.
-  return out.reverse().slice(0, HISTORY_LIMIT).map(normalizeLoadedRecord)
+function isRecordState(value: unknown): value is RecordState {
+  return Boolean(value && typeof value === 'object'
+    && typeof (value as Partial<RecordState>).id === 'string'
+    && typeof (value as Partial<RecordState>).status === 'string')
 }
 
 function loadPersistedRecords(file: string): RecordState[] {
-  try {
-    if (!existsSync(file)) return []
-    if (statSync(file).size > RECORDS_FILE_MAX_BYTES) {
-      const tail = parseRecordsFile(file)
-      try { writeFileSync(file, tail.slice().reverse().map(record => JSON.stringify(record)).join('\n') + '\n') } catch { /* best-effort compaction */ }
-      return tail
-    }
-    return parseRecordsFile(file)
-  } catch { return [] }
+  const loaded = readJsonlLedger(file, {
+    limit: HISTORY_LIMIT,
+    validate: isRecordState,
+    normalize: normalizeLoadedRecord,
+  })
+  if (ledgerExceeds(file, RECORDS_FILE_MAX_BYTES)) {
+    try { compactJsonlLedger(file, loaded) } catch { /* best-effort compaction */ }
+  }
+  return loaded
 }
 
 export class VerifyAbortedError extends Error {
@@ -751,10 +742,8 @@ export class VerifierHost {
 
   private persist(record: RecordState): void {
     if (!this.recordsFile) return
-    try {
-      mkdirSync(path.dirname(this.recordsFile), { recursive: true })
-      appendFileSync(this.recordsFile, JSON.stringify(record) + '\n')
-    } catch { /* observability must never break verification */ }
+    try { appendJsonlLedger(this.recordsFile, record) }
+    catch { /* observability must never break verification */ }
   }
 
   /** Newest-first history view with optional filters for the /records endpoint. */
