@@ -2301,7 +2301,8 @@ test("phase3: every check requires a module that exists in the emitted files map
 // crash, abort, dispose, error passthrough. Boundary semantics run against
 // the REAL sidecar (empty/single candidates never touch the network).
 
-const BRIDGE_PY = "D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe"
+const BRIDGE_PY = process.env.DSH_VA_PYTHON
+  || (process.platform === "win32" ? "D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe" : "python3")
 const STUB_SIDECAR = fileURLToPath(new URL("./fixtures/stub_sidecar.py", import.meta.url))
 const REAL_SIDECAR = fileURLToPath(new URL("../bridge/llm_verifier_sidecar.py", import.meta.url))
 
