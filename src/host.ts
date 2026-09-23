@@ -126,6 +126,11 @@ export class VerifierHost {
   private readonly autopilotCleanup = new Map<string, Set<string>>()
   /** Background selections are cancelled when their source session disappears. */
   private readonly autopilotActive = new Map<string, Set<string>>()
+  /** One retained-winner cleanup pass per source session at a time. idle,
+   *  agent/disposed, and dispose() all trigger the pass; without this fence
+   *  two passes raced the same post-audit (running the configured test command
+   *  twice in the user's repository) and the same worktree removal. */
+  private readonly autopilotCleanupInFlight = new Map<string, { promise: Promise<void>; rerun: boolean }>()
 
   /** Candidate-model liveness prober, memoized per (baseURL, key) pair so
    *  config churn never keeps a stale credential around. */
@@ -335,7 +340,31 @@ export class VerifierHost {
     }
   }
 
-  private async cleanupAutopilotWinners(sourceSessionId: string): Promise<void> {
+  private cleanupAutopilotWinners(sourceSessionId: string): Promise<void> {
+    const inFlight = this.autopilotCleanupInFlight.get(sourceSessionId)
+    if (inFlight) {
+      // A trigger that lands mid-pass may carry new evidence (a relay just
+      // queued another retained slot): run exactly one more pass afterwards
+      // instead of a concurrent one, and let the caller await that too.
+      inFlight.rerun = true
+      return inFlight.promise
+    }
+    const entry = { rerun: false, promise: Promise.resolve() }
+    entry.promise = (async () => {
+      try {
+        do {
+          entry.rerun = false
+          await this.cleanupAutopilotWinnersOnce(sourceSessionId)
+        } while (entry.rerun)
+      } finally {
+        this.autopilotCleanupInFlight.delete(sourceSessionId)
+      }
+    })()
+    this.autopilotCleanupInFlight.set(sourceSessionId, entry)
+    return entry.promise
+  }
+
+  private async cleanupAutopilotWinnersOnce(sourceSessionId: string): Promise<void> {
     const pending = this.autopilotCleanup.get(sourceSessionId)
     if (!pending) return
     for (const selectionId of [...pending]) {
@@ -359,7 +388,9 @@ export class VerifierHost {
               } else {
                 const before = rec.sourceHeadAtStart ?? null
                 const headChanged = before !== null && state.head !== null ? state.head !== before : null
-                const testCommand = this.config.selectionPostAuditTestCommand.trim()
+                // An absent/non-string command means "no test configured", never
+                // an audit failure (embedded hosts may pass a partial config).
+                const testCommand = typeof this.config.selectionPostAuditTestCommand === 'string' ? this.config.selectionPostAuditTestCommand.trim() : ''
                 let testsExit: number | null = null
                 let testsRan = false
                 let postAuditError: string | undefined

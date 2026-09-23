@@ -257,6 +257,30 @@ the selection host. A disposed Host cannot be restarted. Selection disposal
 must terminate sidecars, candidates, retained handles, and isolated workspaces. API disconnects and configured timeouts should flow
 through existing abort signals instead of creating detached promises.
 
+Three concurrency invariants are pinned by regression tests and must survive
+future refactors:
+
+1. **Admission claims are atomic.** In `SelectionHost.start()` everything that
+   can throw or await (validation, credential resolution, factory/runner
+   construction, the source HEAD read) happens *before* the busy re-check; from
+   the claim of `this.active` to `this.active.run = run` the code is
+   synchronous and cannot fail. A refused start therefore never leaves a
+   `running` placeholder or a claim that no run will ever clear.
+2. **Retained-candidate operations are serialized per selection.** `release`,
+   `discard`, and shutdown disposal go through one FIFO per selection ID, so
+   concurrent callers (GUI double-click, idle racing `agent/disposed`,
+   `dispose()` during a discard) observe sequential semantics: one worktree
+   removal, one journal purge, and the second discard answers `false`.
+3. **Autopilot cleanup is fenced per source session.** `VerifierHost` runs at
+   most one `cleanupAutopilotWinners` pass per source at a time; triggers that
+   arrive mid-pass request exactly one follow-up pass instead of a concurrent
+   one, so the post-audit (including the configured test command in the user's
+   repository) never executes twice for the same retained slot.
+
+A runner must also treat an already-aborted signal as an abort *before* it
+provisions anything: `abort` events do not replay, and a selection started
+after its host was cancelled must not create worktrees or agents.
+
 Credential references cross configuration and API boundaries; credential
 values do not. Resolve them at the last responsible moment through
 `resolveKey()`. Pass normalized provider URLs through `normalizeBaseUrl()` and

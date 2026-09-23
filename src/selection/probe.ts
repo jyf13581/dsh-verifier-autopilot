@@ -62,6 +62,9 @@ export function createModelProber(options: ModelProberOptions): ModelProber {
         })
         ok = response.ok
         detail = 'http-' + response.status
+        // The verdict is the status line; release the connection instead of
+        // leaving an unread body to pin a keep-alive socket until GC.
+        try { await response.body?.cancel() } catch { /* already drained or closed */ }
       } catch (error) {
         ok = false
         detail = error instanceof Error ? error.message.slice(0, 120) : String(error).slice(0, 120)

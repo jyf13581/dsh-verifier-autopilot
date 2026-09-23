@@ -379,6 +379,11 @@ export class SelectionHost {
   private readonly selections: SelectionRecord[] = []
   private active: { selectionId: string; controller: AbortController; run: Promise<void> | null } | null = null
   private readonly winners = new Map<string, SelectionAgentHandle>()
+  /** Per-selection FIFO for retained-candidate operations (release,
+   *  discard, shutdown disposal). Concurrent callers — GUI double-click,
+   *  idle + agent/disposed cleanup racing, dispose() during a discard —
+   *  run strictly one after another and observe sequential semantics. */
+  private readonly winnerOps = new Map<string, Promise<unknown>>()
   private bridgeSingleton: VerifierBridge | null = null
   private workspaceManager: WorkspaceManager | null = null
   private disposed = false
@@ -519,32 +524,12 @@ export class SelectionHost {
     const key = this.deps.resolveKey ? await this.deps.resolveKey(verifierConf.apiKeyEnv) : undefined
     if (!key) throw new SelectionApiError(400, 'missing-api-key', 'verifier credential is not configured: ' + verifierConf.apiKeyEnv)
 
-    // Admission must be re-checked HERE, immediately before the claim with no
-    // await in between: the credential resolve above yields, so a busy-check at
-    // the top of this method lets two concurrent starts both pass (TOCTOU —
-    // both runners would then burn real candidates fighting over this.active).
-    if (this.disposed) throw new SelectionApiError(503, 'selection-host-disposed', 'selection host is disposed')
-    if (this.active) {
-      throw new SelectionApiError(429, 'selection-busy', 'selection ' + this.active.selectionId + ' is already running; cancel it first')
-    }
-    const selectionId = 'sel-' + randomUUID()
-    const controller = new AbortController()
-    const placeholder: SelectionRecord = {
-      selectionId,
-      sourceSessionId: sourceSessionId ?? null,
-      startedAt: this.now(),
-      finishedAt: null,
-      status: 'running',
-      trigger: body.trigger === 'autopilot' ? 'autopilot' : 'manual',
-      ...(body.policy ? { policy: body.policy } : {}),
-      candidates: [],
-      verifierModel: verifierConf.model,
-    }
-    this.active = { selectionId, controller, run: null }
-    this.selections.unshift(placeholder)
-    this.selections.splice(SELECTIONS_HISTORY_LIMIT)
-    this.emit()
-
+    // Everything from here to the claim is pure construction or read-only
+    // inspection. Nothing below may have a side effect before admission is
+    // decided, and nothing may throw AFTER the claim: a post-claim throw (e.g.
+    // the live agent factory not being wired) used to leave `this.active` set
+    // with run=null, so every later start() answered 429 selection-busy until
+    // a reload and cancel() had nothing to abort.
     const testing = this.deps.testing ?? {}
     const workspaces = testing.workspaces ?? (this.workspaceManager ??= new IsolatedWorkspaceManager(this.deps.workspaceRoot ?? defaultWorkspaceRoot()))
     const factory = testing.factory ?? (() => {
@@ -598,7 +583,8 @@ export class SelectionHost {
     }
     // I.5: source attribution for the audit pack. The HEAD pins the source
     // repo state at start; the model is read from the session header when the
-    // host exposes it (null stays honest when unknown).
+    // host exposes it (null stays honest when unknown). This is the last await
+    // before the claim, so it must stay above the admission re-check.
     let sourceHeadAtStart: string | null = null
     let sourceModel: string | null = null
     if (sourceCwd && body.trigger === 'autopilot') {
@@ -608,6 +594,36 @@ export class SelectionHost {
       const header = parent?.session.header as { model?: string } | undefined
       sourceModel = header?.model ?? null
     } catch { sourceModel = null }
+
+    // Admission must be re-checked HERE, immediately before the claim with no
+    // await in between: the credential resolve and the HEAD read above yield,
+    // so a busy-check at the top of this method lets two concurrent starts
+    // both pass (TOCTOU — both runners would then burn real candidates
+    // fighting over this.active). From the claim to `this.active.run = run`
+    // the code is synchronous and cannot throw, so dispose() always finds a
+    // run to await and a stuck claim is impossible.
+    if (this.disposed) throw new SelectionApiError(503, 'selection-host-disposed', 'selection host is disposed')
+    if (this.active) {
+      throw new SelectionApiError(429, 'selection-busy', 'selection ' + this.active.selectionId + ' is already running; cancel it first')
+    }
+    const selectionId = 'sel-' + randomUUID()
+    const controller = new AbortController()
+    const placeholder: SelectionRecord = {
+      selectionId,
+      sourceSessionId: sourceSessionId ?? null,
+      startedAt: this.now(),
+      finishedAt: null,
+      status: 'running',
+      trigger: body.trigger === 'autopilot' ? 'autopilot' : 'manual',
+      ...(body.policy ? { policy: body.policy } : {}),
+      candidates: [],
+      verifierModel: verifierConf.model,
+    }
+    this.active = { selectionId, controller, run: null }
+    this.selections.unshift(placeholder)
+    this.selections.splice(SELECTIONS_HISTORY_LIMIT)
+    this.emit()
+
     const runInput: SelectionRunInput = {
       problem,
       candidateCount,
@@ -664,7 +680,7 @@ export class SelectionHost {
         await this.finishRun(placeholder, failed, undefined)
       }
     })()
-    if (this.active?.selectionId === selectionId) this.active.run = run
+    this.active.run = run
     return { ...placeholder }
   }
 
@@ -724,9 +740,27 @@ export class SelectionHost {
     })
   }
 
+  /** Chain one retained-candidate operation behind whatever is already in
+   *  flight for the same selection. A failed predecessor never poisons the
+   *  chain; the map entry is dropped once the last operation settles. */
+  private serializeWinnerOp<T>(selectionId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.winnerOps.get(selectionId) ?? Promise.resolve()
+    const next = previous.then(operation, operation)
+    this.winnerOps.set(selectionId, next)
+    void next.then(
+      () => { if (this.winnerOps.get(selectionId) === next) this.winnerOps.delete(selectionId) },
+      () => { if (this.winnerOps.get(selectionId) === next) this.winnerOps.delete(selectionId) },
+    )
+    return next
+  }
+
   /** Release the live candidate handle while retaining its persisted session
    *  and workspace. Failed disposal stays retained so a later call can retry. */
-  async releaseWinner(selectionId: string): Promise<'released' | 'not-retained'> {
+  releaseWinner(selectionId: string): Promise<'released' | 'not-retained'> {
+    return this.serializeWinnerOp(selectionId, () => this.releaseWinnerNow(selectionId))
+  }
+
+  private async releaseWinnerNow(selectionId: string): Promise<'released' | 'not-retained'> {
     const handle = this.winners.get(selectionId)
     if (!handle) return 'not-retained'
     await handle.dispose()
@@ -738,11 +772,18 @@ export class SelectionHost {
   /** Destroy the retained candidate outright (winner OR fallback). Each
    *  operation is idempotent; discardedAt is durable only after handle,
    *  workspace, session journal, and the audit pack have all settled. */
-  async discardWinner(selectionId: string): Promise<boolean> {
+  discardWinner(selectionId: string): Promise<boolean> {
+    return this.serializeWinnerOp(selectionId, () => this.discardWinnerNow(selectionId))
+  }
+
+  private async discardWinnerNow(selectionId: string): Promise<boolean> {
     const record = this.selections.find((s) => s.selectionId === selectionId)
     const slot = record ? (record.winner ?? record.fallback) : undefined
+    // The guard is evaluated inside the per-selection chain, so a second
+    // discard that arrived while the first was still removing the worktree
+    // sees discardedAt set and answers false instead of racing the removal.
     if (!record || !slot || slot.discardedAt !== undefined) return false
-    await this.releaseWinner(selectionId)
+    await this.releaseWinnerNow(selectionId)
     const manager = this.deps.testing?.workspaces
       ?? (this.workspaceManager ??= new IsolatedWorkspaceManager(this.deps.workspaceRoot ?? defaultWorkspaceRoot()))
     await manager.remove(slot.workspace)
@@ -843,9 +884,11 @@ export class SelectionHost {
     if (active?.run) {
       try { await active.run } catch { /* the terminal record contains the failure */ }
     }
-    const handles = [...this.winners.entries()]
-    await Promise.all(handles.map(async ([id, handle]) => {
-      try { await handle.dispose(); this.winners.delete(id) } catch { /* isolated for shutdown */ }
+    // Shutdown disposal joins the same per-selection chain as release/discard,
+    // so a discard that is mid-flight when the host goes down cannot dispose
+    // the same handle twice or observe a half-removed worktree.
+    await Promise.all([...this.winners.keys()].map(async (id) => {
+      try { await this.serializeWinnerOp(id, () => this.releaseWinnerNow(id)) } catch { /* isolated for shutdown */ }
     }))
     if (this.bridgeSingleton) {
       try { await this.bridgeSingleton.dispose() } catch { /* isolated */ }

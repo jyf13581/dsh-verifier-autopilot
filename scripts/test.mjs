@@ -4402,3 +4402,185 @@ test("selhost: explicit selectionVerifierWorkers pins and clamps the tournament 
   } finally { await clamped.host.dispose().catch(() => {}) }
 })
 
+// ---------- lifecycle hardening: no stuck claims, serialized winner ops, fenced cleanup ----------
+
+test("selhost: a refusal after full admission (live factory not wired) never leaves a stuck claim", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-noclaim-"))
+  try {
+    const { SelectionHost } = await import("../lib/selection/host.js")
+    const repo = makeGitRepo(base, "source")
+    const ctx = fakeContext()
+    const host = new SelectionHost({
+      agents: ctx.agents,
+      // liveAgents is deliberately absent: every input check passes and the
+      // factory construction is the first thing that refuses. Before the
+      // reorder this happened AFTER the claim, so the host answered
+      // selection-busy forever and cancel() had no run to abort.
+      resolveKey: async () => "key",
+      defaultRoute: () => ({ provider: "kimi", model: "kimi-k3" }),
+      verifier: () => ({ model: "m", baseURL: "http://local", apiKeyEnv: "K" }),
+      workspaceRoot: SEL_TMP,
+      testing: { bridge: fakeBridge() },
+    })
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      await assert.rejects(
+        () => host.start({ problem: "do the thing", candidateCount: 2, sourceCwd: repo, useSourceSeed: false }),
+        (error) => {
+          assert.equal(error.code, "live-agents-unavailable", "attempt " + attempt + " reports the real cause, not selection-busy")
+          return true
+        },
+      )
+      assert.equal(host.activeSelectionId(), null, "no active claim survives a refused start")
+      assert.equal(host.listSelections().length, 0, "no running placeholder is left behind in history")
+    }
+    await host.dispose()
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+test("selhost: concurrent discards of one retained slot serialize — one removal, the second answers false", async () => {
+  const gate = deferred()
+  let gateRemoves = false
+  const removed = []
+  let purges = 0
+  const wsx = {
+    async prepare(sel) { const dir = path.join(SEL_TMP, sel.selectionId, "c" + sel.index); mkdirSync(dir, { recursive: true }); return dir },
+    async remove(dir) { removed.push(dir); if (gateRemoves) await gate.promise; rmSync(dir, { recursive: true, force: true }) },
+    async purgeSessionRecord() { purges += 1 },
+  }
+  const ctx = fakeContext()
+  ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+  const host = new VerifierHost(ctx, hostOverrides(), { selectionsTesting: { factory: makeFakeFactory({}), workspaces: wsx, bridge: fakeBridge() } })
+  ctx.spawnAgent(fakeAgent("sess-A", completedTurnEvents(1)))
+  const started = await host.selections.start({ sourceSessionId: "sess-A", candidateCount: 2, trigger: "manual" })
+  const final = await host.selections.waitFor(started.selectionId)
+  assert.equal(final.status, "completed")
+  const winnerWs = final.winner.workspace
+  removed.length = 0
+  purges = 0
+  gateRemoves = true
+  const first = host.selections.discardWinner(started.selectionId)
+  const second = host.selections.discardWinner(started.selectionId)
+  await quiesce(30)
+  assert.deepEqual(removed, [winnerWs], "the second discard queues behind the first instead of racing the removal")
+  gate.resolve()
+  assert.deepEqual(await Promise.all([first, second]), [true, false], "sequential semantics under concurrency")
+  assert.deepEqual(removed, [winnerWs])
+  assert.equal(purges, 1, "the session journal is purged exactly once")
+  assert.ok(host.selections.getSelection(started.selectionId).winner.discardedAt)
+  assert.equal(existsSync(winnerWs), false)
+  await host.selections.dispose()
+})
+
+test("autopilot cleanup: idle, a second idle, and agent/disposed racing on one source run a single discard pass", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-cleanup-race-"))
+  try {
+    const repo = makeGitRepo(base, "source")
+    const ctx = fakeContext()
+    ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+    ctx.llm = { async listModels() { return [{ id: "kimi-k3" }] } }
+    const gate = deferred()
+    let gateRemoves = false
+    const removed = []
+    const wsx = {
+      async prepare(sel) { const dir = path.join(SEL_TMP, sel.selectionId, "c" + sel.index); mkdirSync(dir, { recursive: true }); return dir },
+      async remove(dir) { removed.push(dir); if (gateRemoves) await gate.promise; rmSync(dir, { recursive: true, force: true }) },
+    }
+    const host = new VerifierHost(ctx, hostOverrides({ enabled: false }), { selectionsTesting: { factory: makeFakeFactory({}), workspaces: wsx, bridge: fakeBridge() } })
+    const source = ctx.spawnAgent(fakeAgent("sess-cleanup-race", completedTurnEvents(1)))
+    source.session.header = { cwd: repo }
+    host.start()
+    const preStep = source.handlers.get("agent/pre-step")[0]
+    const direct = { id: "u1", role: "user", content: [{ type: "text", text: "Refactor src/entry.ts and run the lifecycle tests" }], source: { kind: "user" } }
+    await preStep({ messages: [direct], turn: 3, step: 1, signal: new AbortController().signal }, async () => ({ kind: "enter", messages: [direct] }))
+    const record = host.selections.listSelections()[0]
+    assert.equal(record.trigger, "autopilot")
+    await waitFor(() => host.selections.getSelection(record.selectionId).status !== "running")
+    await waitFor(() => source.followups.some((message) => message.source.form === "relay"))
+    const winnerWs = host.selections.getSelection(record.selectionId).winner.workspace
+    let discardCalls = 0
+    const discard = host.selections.discardWinner.bind(host.selections)
+    host.selections.discardWinner = (id) => { discardCalls += 1; return discard(id) }
+    removed.length = 0
+    gateRemoves = true
+    fireIdle(source)
+    fireIdle(source)
+    ctx.emit("agent/disposed", { agent: source })
+    await quiesce(40)
+    assert.deepEqual(removed, [winnerWs], "three triggers, one in-flight removal")
+    assert.equal(discardCalls, 1, "the post-audit + discard pass runs once; later triggers join it")
+    gate.resolve()
+    await waitFor(() => host.selections.getSelection(record.selectionId).winner.discardedAt)
+    await quiesce(40)
+    assert.deepEqual(removed, [winnerWs], "the coalesced re-run finds nothing left to discard")
+    assert.equal(discardCalls, 1)
+    assert.equal(existsSync(winnerWs), false)
+    assert.equal(host.selections.getSelection(record.selectionId).delivery.audited, true, "the audit still happened exactly once: " + JSON.stringify(host.selections.getSelection(record.selectionId).delivery))
+    await host.dispose()
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+test("selrunner: a pre-aborted signal settles as aborted before any workspace or agent is provisioned", async () => {
+  const controller = new AbortController()
+  controller.abort()
+  let prepared = 0
+  const wsx = {
+    async prepare(sel) { prepared += 1; return realWorkspaces.prepare(sel) },
+    async remove(dir) { return realWorkspaces.remove(dir) },
+  }
+  const factory = makeFakeFactory({})
+  const runner = new SelectionRunner({ factory, workspaces: wsx, bridge: fakeBridge() })
+  const { record, retained } = await runner.run(selInput({ signal: controller.signal, selectionId: "sel-preaborted" }))
+  assert.equal(record.status, "aborted", "an already-aborted signal is an abort, not all_candidates_eliminated")
+  assert.equal(retained, undefined)
+  assert.equal(prepared, 0, "no worktree is provisioned for a dead selection")
+  assert.equal(factory.calls.length, 0, "no agent is created for a dead selection")
+  assert.equal(existsSync(path.join(SEL_TMP, "sel-preaborted")), false, "no empty run root is left behind")
+})
+
+test("selrunner: progressGuard monitors die with an aborted rollout (no orphaned interval)", async () => {
+  const factory = makeFakeFactory({ scripts: { 0: { hang: true, partial: true }, 1: { hang: true, partial: true }, 2: { hang: true, partial: true } } })
+  const bridge = progressScriptedBridge(() => 0.95)
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  const controller = new AbortController()
+  const liveTimeouts = () => process.getActiveResourcesInfo().filter((kind) => kind === "Timeout").length
+  const timeoutsBefore = liveTimeouts()
+  const running = runner.run(selInput({ signal: controller.signal, progressGuard: { intervalMs: 10, minScore: 0.5, graceChecks: 2, maxChecks: 50 } }))
+  await waitFor(() => bridge.progressCalls.length >= 3)
+  assert.ok(liveTimeouts() >= timeoutsBefore + 3, "control: one monitor interval per candidate is live mid-rollout")
+  controller.abort()
+  const { record } = await running
+  assert.equal(record.status, "aborted")
+  const timeoutsAfter = liveTimeouts()
+  assert.ok(timeoutsAfter <= timeoutsBefore, "no candidate monitor interval survives the abort (before=" + timeoutsBefore + ", after=" + timeoutsAfter + ")")
+  const calls = bridge.progressCalls.length
+  await quiesce(60)
+  assert.equal(bridge.progressCalls.length, calls, "no progress sampling continues after settlement")
+})
+
+test("api: selection lifecycle routes answer 400 for non-object bodies and a redacted 500 for cleanup failures", async () => {
+  const { host } = mkSelectionHost()
+  try {
+    const routes = apiRoutes(host)
+    for (const suffix of ["/selections/cancel", "/selections/release", "/selections/discard"]) {
+      const route = routes.find((r) => r.path.endsWith(suffix))
+      for (const body of [null, [], "sel-x"]) {
+        const res = fakeRes()
+        await route.handler(fakeReq(body), res)
+        assert.equal(res.status, 400, suffix + " rejects " + JSON.stringify(body))
+        assert.equal(JSON.parse(res.bodyText).error, "json-object-required")
+      }
+      const missing = fakeRes()
+      await route.handler(fakeReq({}), missing)
+      assert.equal(missing.status, 400)
+      assert.equal(JSON.parse(missing.bodyText).error, "selection-id-required")
+    }
+    host.selections.discardWinner = async () => { throw new Error("workspace-worktree-prune-failed: token=sk-abcdefghijklmnopqrstuvwxyz0123") }
+    const failed = fakeRes()
+    await routes.find((r) => r.path.endsWith("/selections/discard")).handler(fakeReq({ selectionId: "sel-x" }), failed)
+    assert.equal(failed.status, 500, "a cleanup failure is a JSON 500, not an unhandled rejection in the web server")
+    const body = JSON.parse(failed.bodyText)
+    assert.equal(body.ok, false)
+    assert.ok(body.error.includes("workspace-worktree-prune-failed"), "the operator still sees the reason")
+    assert.ok(!body.error.includes("sk-abcdefghijklmnopqrstuvwxyz0123"), "secrets never leave through the error channel")
+  } finally { await host.selections.dispose() }
+})

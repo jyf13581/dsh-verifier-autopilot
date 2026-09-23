@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
-import type { CandidateFactory, CandidateSpec, SelectionAgentHandle, WorkspaceManager } from './candidates.js'
+import type { CandidateFactory, CandidateSpec, DiffStatLite, SelectionAgentHandle, WorkspaceManager } from './candidates.js'
 import type { TrajectoryEvent } from './trajectory.js'
 
 interface LiveAgentLike {
@@ -510,17 +510,13 @@ function execWide(cmd: string, args: string[], cwd?: string, timeoutMs = 30000, 
   })
 }
 
-export interface DiffStatLite {
-  /** Tracked files whose worktree bytes differ from HEAD. */
-  files: number
-  insertions: number
-  deletions: number
-  /** Untracked (non-ignored) files — candidate NEW artifacts live here. */
-  untracked: number
-  /** Stable hash of the diff surface: numstat lines + untracked name:size.
-   *  Two candidates with equal fingerprints produced the same diff shape. */
-  fingerprint: string
-}
+/** The evidence shape is owned by the runner contract (candidates.ts); this
+ *  adapter produces it and re-exports the type so the two can never drift.
+ *  files = tracked files whose worktree bytes differ from HEAD; untracked =
+ *  non-ignored new files (candidate NEW artifacts live here); fingerprint =
+ *  stable hash of numstat lines + untracked name:size, so equal fingerprints
+ *  mean the same diff shape. */
+export type { DiffStatLite }
 
 /** Objective work evidence for one candidate workspace (ruling K.5 / J.4).
  *  Returns null when the workspace is not a git worktree (manual blank

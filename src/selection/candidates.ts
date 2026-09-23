@@ -448,7 +448,10 @@ export class SelectionRunner {
     const diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null> = new Array(n).fill(null)
     const seed = input.seed && input.seed.length > 0 ? input.seed : undefined
     const candidateTimeout = input.candidateTimeoutMs ?? 600000
-    let aborted = false
+    // A signal that is already aborted never fires 'abort' again: a run that
+    // starts after its host was disposed/cancelled must still see it, or it
+    // would provision worktrees and spawn agents for a dead selection.
+    let aborted = input.signal?.aborted === true
     const onAbort = () => { aborted = true }
     input.signal?.addEventListener('abort', onAbort, { once: true })
 
@@ -466,6 +469,7 @@ export class SelectionRunner {
     }
 
     try {
+      if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted before workspace preparation', false)
       // 1. Workspaces first: prepare sequentially (git worktree locks serialize).
       for (let i = 0; i < n; i += 1) {
         let workspace: string
@@ -651,6 +655,11 @@ export class SelectionRunner {
           cand.error = errText(e)
         } finally {
           clearTimeout(timer)
+          // The progress monitor must die with the candidate on EVERY exit
+          // path: after an abort or a followup failure the interval used to
+          // keep ticking (each tick returned early on status, so it never
+          // reached its maxChecks self-stop) and pinned the event loop.
+          if (monitor) { clearInterval(monitor); monitor = null }
         }
         // Trajectory accounting is best-effort and runs for finished AND
         // failed candidates alike — a crashed candidate's partial trajectory

@@ -14,12 +14,12 @@ import { VERIFICATION_HISTORY_LIMIT, VerifyAbortedError } from './host.js'
 import {
   API_PREFIX,
   type ConfigResponse, type HeaderValue, type SelectionActionResponse,
-  type SelectionItemResponse, type SelectionReleaseResponse,
+  type SelectionIdRequest, type SelectionItemResponse, type SelectionReleaseResponse,
   type SelectionSnapshot, type SelectionStartRequest, type SelectionStartResponse,
   type SelectionsListResponse, type StateResponse, type VerificationRecord,
   type VerifyResponse, type WebRequest, type WebResponse, type WebRoute,
 } from './protocol.js'
-import { normalizeBaseUrl, resolveKey, type Credentials } from './util.js'
+import { normalizeBaseUrl, redactSecrets, resolveKey, type Credentials } from './util.js'
 
 /** Structural domain seam consumed by the transport. VerifierHost satisfies it
  * at the composition root, while API tests can use a focused fake without
@@ -87,6 +87,31 @@ export function createRateLimiter(limit: number, windowMs: number, now: () => nu
   const peek = () => { prune(now()); return stamps.length < limit }
   const commit = () => { stamps.push(now()) }
   return Object.assign(function acquire() { if (!peek()) return false; commit(); return true }, { peek, commit })
+}
+
+/** Shared body contract for the selection lifecycle routes (cancel, release,
+ *  discard): a JSON object carrying a non-empty selectionId. A literal `null`
+ *  body used to reach `body.selectionId` and throw inside the async handler. */
+async function readSelectionIdRequest(req: WebRequest): Promise<{ ok: true; selectionId: string } | { ok: false; status: number; error: string }> {
+  let body: unknown
+  try {
+    body = await readJson(req)
+  } catch {
+    return { ok: false, status: 400, error: 'invalid-json-body' }
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { ok: false, status: 400, error: 'json-object-required' }
+  const selectionId = typeof (body as Partial<SelectionIdRequest>).selectionId === 'string' ? (body as SelectionIdRequest).selectionId.trim() : ''
+  if (!selectionId) return { ok: false, status: 400, error: 'selection-id-required' }
+  return { ok: true, selectionId }
+}
+
+/** One status/error mapping for every selection route: domain admission
+ *  errors keep their HTTP status and code; anything else is a bounded,
+ *  secret-redacted 500 instead of an unhandled rejection in the web server. */
+function selectionFailure(res: WebResponse, error: unknown): void {
+  if (error instanceof SelectionApiError) return json(res, error.status, { ok: false, error: error.code, message: error.message })
+  const message = error instanceof Error ? error.message : String(error)
+  json(res, 500, { ok: false, error: redactSecrets(message).slice(0, 240) })
 }
 
 /** Exported for regression tests: builds the Host API routes for this host. */
@@ -272,8 +297,7 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
       selectLimiter.commit()
       json(res, 202, { ok: true, selection } satisfies SelectionStartResponse)
     } catch (error) {
-      if (error instanceof SelectionApiError) return json(res, error.status, { ok: false, error: error.code, message: error.message })
-      json(res, 500, { ok: false, error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240) })
+      selectionFailure(res, error)
     }
   } }
   const selectionsRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections', handler: (req, res) => {
@@ -290,48 +314,47 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   const cancelSelectionRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/cancel', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    let body: Record<string, unknown>
+    const parsed = await readSelectionIdRequest(req)
+    if (!parsed.ok) return json(res, parsed.status, { ok: false, error: parsed.error })
+    const selectionId = parsed.selectionId
     try {
-      body = await readJson(req) as Record<string, unknown>
-    } catch {
-      return json(res, 400, { ok: false, error: 'invalid-json-body' })
+      if (!host.selections.cancel(selectionId)) return json(res, 404, { ok: false, error: 'selection-not-active' })
+      json(res, 200, { ok: true } satisfies SelectionActionResponse)
+    } catch (error) {
+      selectionFailure(res, error)
     }
-    const selectionId = typeof body.selectionId === 'string' ? body.selectionId.trim() : ''
-    if (!selectionId) return json(res, 400, { ok: false, error: 'selection-id-required' })
-    if (!host.selections.cancel(selectionId)) return json(res, 404, { ok: false, error: 'selection-not-active' })
-    json(res, 200, { ok: true } satisfies SelectionActionResponse)
   } }
   const releaseWinnerRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/release', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    let body: Record<string, unknown>
+    const parsed = await readSelectionIdRequest(req)
+    if (!parsed.ok) return json(res, parsed.status, { ok: false, error: parsed.error })
+    const selectionId = parsed.selectionId
     try {
-      body = await readJson(req) as Record<string, unknown>
-    } catch {
-      return json(res, 400, { ok: false, error: 'invalid-json-body' })
+      const selection = host.selections.getSelection(selectionId)
+      if (!selection || !selection.winner) return json(res, 404, { ok: false, error: 'selection-or-winner-not-found' })
+      // Manual winners release at settlement; autopilot winners release when the
+      // source turn settles. The route stays idempotent for stale GUI panels.
+      const released = await host.selections.releaseWinner(selectionId)
+      json(res, 200, { ok: true, state: released } satisfies SelectionReleaseResponse)
+    } catch (error) {
+      selectionFailure(res, error)
     }
-    const selectionId = typeof body.selectionId === 'string' ? body.selectionId.trim() : ''
-    if (!selectionId) return json(res, 400, { ok: false, error: 'selection-id-required' })
-    const selection = host.selections.getSelection(selectionId)
-    if (!selection || !selection.winner) return json(res, 404, { ok: false, error: 'selection-or-winner-not-found' })
-    // Manual winners release at settlement; autopilot winners release when the
-    // source turn settles. The route stays idempotent for stale GUI panels.
-    const released = await host.selections.releaseWinner(selectionId)
-    json(res, 200, { ok: true, state: released } satisfies SelectionReleaseResponse)
   } }
   const discardWinnerRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/discard', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    let body: Record<string, unknown>
+    const parsed = await readSelectionIdRequest(req)
+    if (!parsed.ok) return json(res, parsed.status, { ok: false, error: parsed.error })
+    const selectionId = parsed.selectionId
     try {
-      body = await readJson(req) as Record<string, unknown>
-    } catch {
-      return json(res, 400, { ok: false, error: 'invalid-json-body' })
+      // Workspace/journal removal can fail (foreign toplevel, locked worktree):
+      // that is a 500 carrying the reason, never a hung request.
+      if (!(await host.selections.discardWinner(selectionId))) return json(res, 404, { ok: false, error: 'no-discardable-winner' })
+      json(res, 200, { ok: true } satisfies SelectionActionResponse)
+    } catch (error) {
+      selectionFailure(res, error)
     }
-    const selectionId = typeof body.selectionId === 'string' ? body.selectionId.trim() : ''
-    if (!selectionId) return json(res, 400, { ok: false, error: 'selection-id-required' })
-    if (!(await host.selections.discardWinner(selectionId))) return json(res, 404, { ok: false, error: 'no-discardable-winner' })
-    json(res, 200, { ok: true } satisfies SelectionActionResponse)
   } }
   return [state, config, verify, recordsRoute, evalRoute, probe, events, selectRoute, selectionsRoute, cancelSelectionRoute, releaseWinnerRoute, discardWinnerRoute]
 }
