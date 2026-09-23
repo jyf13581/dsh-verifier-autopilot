@@ -14,7 +14,7 @@
  */
 
 import path from 'node:path'
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { VerifierBridge, type BridgeSelectRequest, type BridgeSelectResult } from './bridge.js'
@@ -32,6 +32,8 @@ import type { SelectionAgentHandle } from './candidates.js'
 import { IsolatedWorkspaceManager, gitDiffStat, gitDiffFull, gitRepoState, makeLiveCandidateFactory } from './live.js'
 import type { TrajectoryEvent } from './trajectory.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
+import { appendJsonlLedger, atomicWriteFile, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from '../ledger.js'
+import type { SelectionSnapshot, SelectionStartRequest } from '../protocol.js'
 
 export interface SelectionsAgentProvider {
   list(): Array<{ id: string }>
@@ -124,40 +126,12 @@ function safeHost(baseURL: string): string | null {
   try { return new URL(baseURL).host } catch { return null }
 }
 
-export interface StartSelectionBody {
-  sourceSessionId?: string
-  problem?: string
-  candidateCount?: number
-  criteria?: BridgeSelectRequest['criteria']
-  /** Opt-in online hopeless-rollout abandonment (HANDOFF §2.3). */
-  progressGuard?: unknown
-  groundTruthNote?: string | null
-  checks?: ObjectiveCheck[]
-  nEvaluations?: number
-  pivots?: number
-  algorithmSeed?: number
-  agentPreset?: string
-  candidateTimeoutMs?: number
-  selectTimeoutMs?: number
-  candidateModel?: string
-  candidateProvider?: string
-  /** Heterogeneous pool: one entry per candidate; entries fall back to
-   *  candidateProvider/candidateModel. When present without candidateCount,
-   *  the array length is the candidate count. */
-  candidateOptions?: unknown
-  candidateInstructions?: unknown
-  useSourceSeed?: boolean
-  /** Explicit Git source workspace for a manual run. Requires an existing
-   *  directory that resolves to a Git root; candidates get isolated
-   *  worktrees under it. Without this (and without a source session) a real
-   *  run is refused rather than executed in the host process directory. */
-  sourceCwd?: string
+/** The public/manual request is canonical in protocol.ts. These fields are
+ * internal orchestration metadata and are never accepted from HTTP callers. */
+export interface StartSelectionBody extends SelectionStartRequest {
   trigger?: 'manual' | 'autopilot'
   policy?: SelectionRecord['policy']
-  /** Task-kind lane decided at admission (autopilot sets policy.taskKind). */
   taskKind?: string
-  /** Override the provisional margin gate for this run (0..0.5). */
-  marginThreshold?: number
 }
 
 export class SelectionApiError extends Error {
@@ -187,6 +161,16 @@ export function normalizeSelectionTimeoutMs(value: unknown, fallback?: number): 
   const parsed = value === undefined ? (fallback ?? DEFAULT_SELECTION_TIMEOUT_MS) : Number(value)
   if (!Number.isFinite(parsed)) return DEFAULT_SELECTION_TIMEOUT_MS
   return Math.max(MIN_SELECTION_TIMEOUT_MS, Math.min(MAX_SELECTION_TIMEOUT_MS, Math.floor(parsed)))
+}
+
+export function normalizeMarginThreshold(value: unknown, fallback = PROVISIONAL_MARGIN_THRESHOLD): number {
+  const parsed = value === undefined ? fallback : value
+  // The wire contract says number: do not let JS coercion turn null into zero
+  // or accept numeric strings at this provider-spend boundary.
+  if (typeof parsed !== 'number' || !Number.isFinite(parsed) || parsed < 0 || parsed > 0.5) {
+    throw new SelectionApiError(400, 'margin-threshold-invalid', 'marginThreshold must be a finite number in [0,0.5]')
+  }
+  return parsed
 }
 
 /** Explicit per-request candidate timeout wins; otherwise the host-level config
@@ -260,27 +244,14 @@ function normalizeLoadedSelection(record: SelectionRecord): SelectionRecord {
   return { ...record, status: 'failed', error: 'interrupted-by-reload', finishedAt: record.finishedAt ?? Date.now() }
 }
 
-function parseSelectionsFile(file: string): SelectionRecord[] {
-  let raw: string
-  try { raw = readFileSync(file, 'utf8') } catch { return [] }
-  // Settlement updates (e.g. winner.discardedAt) append a LATER line for the
-  // same selectionId: keep the last occurrence per id.
-  const byId = new Map<string, SelectionRecord>()
-  for (const line of raw.split(String.fromCharCode(10))) {
-    const text = line.trim()
-    if (!text) continue
-    try {
-      const value = JSON.parse(text) as SelectionRecord
-      if (value && typeof value === 'object' && typeof value.selectionId === 'string') byId.set(value.selectionId, value)
-    } catch { /* skip torn lines */ }
-  }
-  return [...byId.values()].reverse().slice(0, SELECTIONS_HISTORY_LIMIT).map(normalizeLoadedSelection)
-}
+const SAFE_SELECTION_ID = /^sel-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
-function writeSelectionsFile(file: string, records: readonly SelectionRecord[]): void {
-  mkdirSync(path.dirname(file), { recursive: true })
-  const chronological = [...records].reverse()
-  writeFileSync(file, chronological.map((r) => JSON.stringify(r)).join(String.fromCharCode(10)) + String.fromCharCode(10), 'utf8')
+function isSelectionRecord(value: unknown): value is SelectionRecord {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Partial<SelectionRecord>
+  return typeof record.selectionId === 'string'
+    && SAFE_SELECTION_ID.test(record.selectionId)
+    && typeof record.status === 'string'
 }
 
 function safeChecks(input: unknown): ObjectiveCheck[] | undefined {
@@ -541,9 +512,10 @@ export class SelectionHost {
     if (!sourceCwd && !injectedHarness) {
       throw new SelectionApiError(400, 'source-cwd-required', 'candidate selection requires a resolvable Git source session or workspace: without it candidates run in the host process directory and can overwrite host files')
     }
-    const marginThreshold = body.marginThreshold === undefined
-      ? (this.deps.marginThresholdDefault?.() ?? PROVISIONAL_MARGIN_THRESHOLD)
-      : Math.max(0, Math.min(0.5, Number(body.marginThreshold)))
+    const marginThreshold = normalizeMarginThreshold(
+      body.marginThreshold,
+      this.deps.marginThresholdDefault?.() ?? PROVISIONAL_MARGIN_THRESHOLD,
+    )
     const key = this.deps.resolveKey ? await this.deps.resolveKey(verifierConf.apiKeyEnv) : undefined
     if (!key) throw new SelectionApiError(400, 'missing-api-key', 'verifier credential is not configured: ' + verifierConf.apiKeyEnv)
 
@@ -784,7 +756,7 @@ export class SelectionHost {
     return true
   }
 
-  snapshot(): Record<string, unknown> {
+  snapshot(): SelectionSnapshot {
     return {
       active: this.active?.selectionId ?? null,
       retainedWinners: [...this.winners.keys()],
@@ -794,9 +766,13 @@ export class SelectionHost {
 
   private loadSelections(file: string): void {
     try {
-      if (!existsSync(file)) return
-      const loaded = parseSelectionsFile(file)
-      if (statSync(file).size > SELECTIONS_FILE_MAX_BYTES) writeSelectionsFile(file, loaded)
+      const loaded = readJsonlLedger(file, {
+        limit: SELECTIONS_HISTORY_LIMIT,
+        validate: isSelectionRecord,
+        idOf: record => record.selectionId,
+        normalize: normalizeLoadedSelection,
+      })
+      if (ledgerExceeds(file, SELECTIONS_FILE_MAX_BYTES)) compactJsonlLedger(file, loaded)
       this.selections.push(...loaded)
     } catch { /* observability must never break selection */ }
   }
@@ -815,11 +791,11 @@ export class SelectionHost {
     const file = this.selectionsFile
     if (!file) return
     try {
-      if (existsSync(file) && statSync(file).size > SELECTIONS_FILE_MAX_BYTES) {
-        writeSelectionsFile(file, this.selections.slice(0, SELECTIONS_HISTORY_LIMIT))
+      if (ledgerExceeds(file, SELECTIONS_FILE_MAX_BYTES)) {
+        compactJsonlLedger(file, this.selections.slice(0, SELECTIONS_HISTORY_LIMIT))
         return
       }
-      appendFileSync(file, JSON.stringify(record) + String.fromCharCode(10))
+      appendJsonlLedger(file, record)
     } catch { /* observability must never break selection */ }
   }
 
@@ -833,23 +809,23 @@ export class SelectionHost {
 
   private writeArtifact(record: SelectionRecord, artifacts?: SelectionRunResult['artifacts']): void {
     const dir = this.artifactDir()
-    if (!dir) return
+    if (!dir || !SAFE_SELECTION_ID.test(record.selectionId)) return
     try {
       const selDir = path.join(dir, record.selectionId)
       mkdirSync(path.join(selDir, 'traces'), { recursive: true })
       mkdirSync(path.join(selDir, 'diffs'), { recursive: true })
-      writeFileSync(path.join(selDir, 'record.json'), JSON.stringify({ artifactWrittenAt: this.now(), record }, null, 1) + String.fromCharCode(10))
+      atomicWriteFile(path.join(selDir, 'record.json'), JSON.stringify({ artifactWrittenAt: this.now(), record }, null, 1) + String.fromCharCode(10))
       if (artifacts) {
         for (let i = 0; i < artifacts.traces.length; i += 1) {
           const trace = artifacts.traces[i]
           if (typeof trace === 'string' && trace) {
-            writeFileSync(path.join(selDir, 'traces', 'c' + i + '.txt'), trace)
+            atomicWriteFile(path.join(selDir, 'traces', 'c' + i + '.txt'), trace)
           }
         }
         for (let i = 0; i < artifacts.diffPatches.length; i += 1) {
           const d = artifacts.diffPatches[i]
           if (d) {
-            writeFileSync(
+            atomicWriteFile(
               path.join(selDir, 'diffs', 'c' + i + '.patch'),
               d.patch + String.fromCharCode(10) + '# truncated=' + d.truncated + '; untracked=' + (d.untrackedFiles.join(' ') || 'none') + String.fromCharCode(10),
             )

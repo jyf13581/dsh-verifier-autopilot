@@ -1,12 +1,16 @@
+import {
+  API_PREFIX, MODEL_OPTIONS, SETTINGS_NAMESPACE_ID,
+  type ApiErrorResponse, type ConfigResponse, type SelectionView,
+  type SelectionsListResponse, type State, type VerifyResponse,
+} from '../protocol.js'
+
 declare const require: (name: string) => any
 
 type SlotsService = { inject(name: string, callback: () => void | (() => void)): void; register(options: any, component: any): () => void }
-type SettingsValue = { enabled?: boolean; autoFeedback?: boolean; model?: string; selectionMode?: 'off' | 'auto' | 'always'; selectionModelStrategy?: 'quality-first' | 'exploration' }
+type SettingsValue = Partial<Pick<State['config'], 'enabled' | 'autoFeedback' | 'model' | 'selectionMode' | 'selectionModelStrategy'>>
 type SettingsScope = { getSnapshot(): { value?: SettingsValue; status?: string }; subscribe(listener: () => void): () => void; set(field: string, value: unknown): Promise<void> }
 type SettingsBinder = { bind(spec: { namespace: string }): SettingsScope }
 type ClientContext = { slots: SlotsService; get(name: string): unknown; settingsScope?: SettingsBinder }
-type LaneView = { route?: number; ok?: boolean; score?: number; lane?: string; finding?: string; error?: string; errorCode?: string; retried?: boolean; scoreSource?: string; durationMs?: number }
-type State = { config?: { enabled?: boolean; autoFeedback?: boolean; routes?: number; model?: string; maxTokens?: number; verifierEffort?: 'off' | 'low' | 'high' | 'max'; selectionMode?: 'off' | 'auto' | 'always'; selectionModelStrategy?: 'quality-first' | 'exploration'; selectionProvider?: string; selectionModels?: string; selectionStandardCandidates?: number; selectionDeepCandidates?: number; selectionEvaluations?: number; selectionPivots?: number; selectionMarginThreshold?: number; selectionVerifierWorkers?: number; verifierMinIntervalMs?: number; verifierSmallModel?: string }; records?: Array<{ turn: number; status: string; skippedReason?: string; citationAudit?: { defectFindings?: number; defectFindingsWithoutCitation?: number; findingsCitingUnknownIds?: number; findingsCitingHistoricalVerdict?: number; findingsWithoutIndependentCitation?: number }; feedbackSent?: boolean; feedbackSuppressed?: { reason?: string; defectFindings?: number; independentFindings?: number }; error?: string; feedbackError?: string; suppressedFeedback?: { median?: number; noDefectLanes?: number; validLanes?: number }; aggregate?: { score?: number; median?: number; dispersion?: number; confidence?: string; valid?: unknown[]; results?: LaneView[] } }> }
 
 type ReactApi = {
   createElement: (type: any, props?: Record<string, any> | null, ...children: any[]) => any
@@ -16,34 +20,10 @@ type ReactApi = {
 const { createElement: h, useEffect, useState } = require('react') as ReactApi
 
 export const inject = ['slots', 'sessions', 'settingsScope']
-const API = '/@dsh-external/dsh-verifier-autopilot/api'
-const SETTINGS_NAMESPACE = 'dsh-verifier-autopilot'
+const API = API_PREFIX
+const SETTINGS_NAMESPACE = SETTINGS_NAMESPACE_ID
 const panelStyle = { padding: 12, display: 'grid', gap: 8, fontSize: 12, borderTop: '1px solid var(--border-color, #ddd)' }
 const rowStyle = { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }
-
-/** lane 模型选项（每选项自带完整端点三元组：model + baseURL + apiKeyEnv）。
- *  门禁实测定论（HANDOFF §7.2，2026-09-13 复核）：
- *  - nvidia/nemotron-3-super-120b-a12b（relay）：默认。严格协议实测通过，
- *    HTTP 200 + score tags + logprobs，单次约 6s。
- *  - kimi-k3（relay）：可选但 max 强度下延迟不稳定。
- *  - z-ai/glm-5.3-flash（relay）：可用但 effort=max 思考耗时长，易撞超时，不作默认。
- *  - deepseek-chat（官方 api.deepseek.com）：legacy lane 备选，需单独配置官方 key。
- *  - deepseek-v4-flash（官方）：技术上过门但 reasoning 吃 4096 预算，
- *    8192 时 51s/次——生产 lane 不实用。
- *  - step-3.7-flash（relay）：长提示推理超时，仅留档。 */
-const RELAY = { baseURL: 'https://chat.holisthoom.top/v1', apiKeyEnv: 'KIMI_API_KEY' }
-const DEEPSEEK_OFFICIAL = { baseURL: 'https://api.deepseek.com', apiKeyEnv: 'DEEPSEEK_API_KEY' }
-const MODEL_OPTIONS = [
-  { id: 'nvidia/nemotron-3-super-120b-a12b', ...RELAY, note: '默认：严格协议实测通过（~6s，带 logprobs）' },
-  { id: 'z-ai/glm-5.3-flash', ...RELAY, note: '不推荐：effort=max 时思考耗时长，容易撞 lane 超时' },
-  { id: 'kimi-k3', ...RELAY, note: '可用：max 强度下延迟不稳定' },
-  { id: 'moonshotai/kimi-k3', ...RELAY, note: '可用：kimi-k3 的别名路由' },
-  { id: 'nemotron-3-ultra-550b-a55b', ...RELAY, note: '可用：~3s，更强但慢' },
-  { id: 'minimaxai/minimax-m3', ...RELAY, note: '已下线：2026-09-09 relay 返回 410（End-of-life）' },
-  { id: 'deepseek-chat', ...DEEPSEEK_OFFICIAL, note: '备选：官方 API，需单独配置 DEEPSEEK_API_KEY' },
-  { id: 'deepseek-v4-flash', ...DEEPSEEK_OFFICIAL, note: '不推荐：reasoning 吞噬 4096 预算（8192 时 51s/次）' },
-  { id: 'step-3.7-flash', ...RELAY, note: '不推荐：长提示推理超 180s 会超时' },
-]
 
 function Checkbox(props: { checked: boolean; onChange: () => void; label: string; disabled?: boolean }): any {
   return h('label', { style: { display: 'flex', alignItems: 'center', gap: 5, opacity: props.disabled ? 0.65 : 1 } }, h('input', { type: 'checkbox', checked: props.checked, disabled: props.disabled, onChange: props.onChange }), props.label)
@@ -115,41 +95,12 @@ function DurableSettingsPanel(props: { scope: SettingsScope }): any {
 }
 
 
-type SelectionView = {
-  selectionId: string
-  sourceSessionId?: string | null
-  status: string
-  stage?: string
-  trigger?: 'manual' | 'autopilot'
-  error?: string
-  policy?: { depth?: string; modelStrategy?: 'quality-first' | 'exploration'; candidateCount?: number; nEvaluations?: number; pivots?: number; verifierEffort?: string; contextChars?: number; models?: string[] }
-  candidates?: Array<{ index: number; status: string; workspace: string; agentOptions?: { model?: string }; error?: string; eliminatedBy?: string[] }>
-  winner?: { index: number; sessionId: string | null; workspace: string; discardedAt?: number }
-  fallback?: { index: number; sessionId: string | null; workspace: string; discardedAt?: number }
-  outcome?: 'ranked_winner' | 'objective_only_result' | 'single_candidate_fallback' | 'insufficient_evidence' | 'abstain' | 'verifier_unavailable'
-  delivery?: { delivered?: 'yes' | 'no' | 'unknown' }
-  noSearchSpace?: boolean
-  llmOnly?: boolean
-  margin?: number
-  marginThreshold?: number
-  marginProvisional?: boolean
-  scores?: Array<number | null>
-  ranking?: number[]
-  nComparisons?: number
-  rankingAttempts?: number
-  rankingRetryErrors?: string[]
-  winnerBasis?: 'verifier' | 'objective-check-only' | 'single-candidate'
-  usage?: { calls?: number; input_tokens?: number; cached_input_tokens?: number; output_tokens?: number }
-  startedAt?: number
-  finishedAt?: number | null
-}
-
 const STAGE_LABELS: Record<string, string> = {
   workspace: '工作区快照', preflight: '验证器预检', rollout: '候选执行', checks: '客观检查', ranking: '比较排序', settled: '结算',
 }
 
 function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsScope }): any {
-  const [data, setData] = useState<{ active: string | null; selections?: SelectionView[] } | null>(null)
+  const [data, setData] = useState<SelectionsListResponse | null>(null)
   const [hostState, setHostState] = useState<State | null>(null)
   const [status, setStatus] = useState('')
   const [saving, setSaving] = useState(false)
@@ -158,8 +109,8 @@ function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsSco
     try {
       const [selectionResponse, stateResponse] = await Promise.all([fetch(API + '/selections'), fetch(API + '/state')])
       if (!selectionResponse.ok || !stateResponse.ok) throw new Error('HTTP ' + (!selectionResponse.ok ? selectionResponse.status : stateResponse.status))
-      setData(await selectionResponse.json())
-      setHostState(await stateResponse.json())
+      setData(await selectionResponse.json() as SelectionsListResponse)
+      setHostState(await stateResponse.json() as State)
       setStatus('')
     } catch (error) {
       setStatus('状态读取失败: ' + String(error).slice(0, 100))
@@ -188,7 +139,9 @@ function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsSco
     try {
       if (props.settingsScope) await props.settingsScope.set(field, value)
       else if (!await post('/config', { [field]: value })) return
-      setHostState(previous => ({ ...previous, config: { ...previous?.config, [field]: value } }))
+      setHostState(previous => previous
+        ? ({ ...previous, config: { ...previous.config, [field]: value } } as State)
+        : previous)
       setStatus('')
     } catch (error) {
       setStatus('保存失败: ' + String(error).slice(0, 120))
@@ -331,8 +284,8 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
         for (const [field, value] of Object.entries(patch)) await scope.set(field, value)
       } else {
         const response = await fetch(API + '/config', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) })
-        const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string }
-        if (!response.ok || result.ok !== true) throw new Error(result.error ?? 'HTTP ' + response.status)
+        const result = await response.json().catch(() => ({ ok: false, error: 'invalid-response' })) as ConfigResponse | ApiErrorResponse
+        if (!response.ok || !result.ok) throw new Error(result.ok ? 'HTTP ' + response.status : result.error)
       }
       const nextState = await refresh()
       const actual = nextState?.config as Record<string, unknown> | undefined
@@ -351,8 +304,8 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
     setStatus('五路验证中...')
     try {
       const response = await fetch(API + '/verify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: props.sessionId }) })
-      const result = await response.json() as { ok?: boolean; error?: string }
-      if (!response.ok || !result.ok) throw new Error(result.error ?? 'HTTP ' + response.status)
+      const result = await response.json() as VerifyResponse | ApiErrorResponse
+      if (!response.ok || !result.ok) throw new Error(result.ok ? 'HTTP ' + response.status : result.error)
       await refresh()
     } catch (error) {
       setStatus('验证失败: ' + String(error).slice(0, 160))

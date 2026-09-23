@@ -1669,6 +1669,9 @@ test("phase1: redactSecrets strips credentials from provider-bound text without 
   assert.ok(!redactSecrets("key sk-proj-9f8e7d6c5b4a3210").includes("sk-proj-"), "hyphenated key shapes are pattern-redacted too")
   assert.ok(redactSecrets("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4").includes("[REDACTED-JWT]"), "JWT bearers are redacted")
   assert.ok(redactSecrets("token=a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6").endsWith("token=[REDACTED]"), "hex assignments are redacted with the label kept")
+  assert.equal(redactSecrets('password="abcdefghijklmnop"'), 'password="[REDACTED]"', "quoted assignments redact the whole value without leaking its first character")
+  assert.equal(redactSecrets('password="abcdefghijklmnop'), 'password="[REDACTED]', "an unterminated quote cannot bypass assignment redaction")
+  assert.equal(redactSecrets("Bearer abcdefghijklmnop"), "Bearer [REDACTED]", "opaque bearer tokens are redacted even when they are not JWTs")
   assert.equal(redactSecrets("build: complete exit=0"), "build: complete exit=0", "benign operational text is untouched")
   assert.equal(redactSecrets("[EXTRACTED TOOL EVIDENCE] none"), "[EXTRACTED TOOL EVIDENCE] none")
 })
@@ -2017,19 +2020,23 @@ test("phase2: finished records persist to JSONL and survive a Host restart", asy
     assert.ok(fs.existsSync(file), "records file is created on first terminal record")
     const lines = fs.readFileSync(file, "utf8").trim().split("\n").map(line => JSON.parse(line))
     assert.equal(lines.length, 1)
+    assert.equal(lines[0].v, 1, "new persistence rows carry the shared ledger version")
     assert.equal(lines[0].sessionId, "sess-X")
     assert.ok(lines[0].aggregate && lines[0].aggregate.results.length === 1, "per-lane details persist for post-reload diagnostics")
     host.dispose()
     server.restore()
 
     fs.appendFileSync(file, JSON.stringify({ id: "stale-running", sessionId: "sess-Z", turn: 1, status: "running", startedAt: 1 }) + "\n")
+    fs.appendFileSync(file, JSON.stringify({ id: "future-row", sessionId: "sess-future", turn: 1, status: "completed", startedAt: 1, feedbackSent: false, v: 2 }) + "\n")
     const host2 = new VerifierHost(fakeContext(), hostOverrides(), { recordsFile: file })
+    host2.start()
     host2.start()
     const recordsRoute = apiRoutes(host2).find(route => route.path.endsWith("/records"))
     const res = fakeRes()
     await recordsRoute.handler(fakeReq({}, "/records", "GET"), res)
     const body = JSON.parse(res.bodyText)
-    assert.equal(body.total, 2)
+    assert.equal(body.total, 2, "legacy unstamped rows load while unknown future ledger versions are rejected")
+    assert.equal(body.records.some(record => record.id === "future-row"), false)
     const stale = body.records.find(record => record.id === "stale-running")
     assert.equal(stale.status, "failed", "a running row from a previous life becomes honestly failed")
     assert.match(String(stale.error), /interrupted-by-reload/)
@@ -2113,8 +2120,16 @@ test("phase2b: feedback is detected structurally from its plugin source, not by 
 })
 
 test("phase2b: model and apiKeyEnv config values are sanity-constrained", async () => {
-  const { VerifierHost } = await import("../lib/index.js")
-  const host = new VerifierHost(fakeContext(), hostOverrides())
+  const { Config, DEFAULT_CONFIG, VerifierHost } = await import("../lib/index.js")
+  assert.deepEqual(Config({}), DEFAULT_CONFIG, "the exported defaults are derived from the schema, not a second handwritten table")
+  assert.equal(Object.isFrozen(DEFAULT_CONFIG), true)
+  const initial = hostOverrides()
+  const host = new VerifierHost(fakeContext(), initial)
+  initial.model = "mutated-outside-host"
+  assert.notEqual(host.getConfig().model, initial.model, "the Host owns a defensive copy of constructor config")
+  const exposed = host.getConfig()
+  exposed.model = "mutated-through-getter"
+  assert.notEqual(host.getConfig().model, exposed.model, "getConfig never leaks the mutable internal object")
   assert.throws(() => host.setConfig({ model: "bad model\nwith newline" }), /config-invalid-string:model/)
   assert.throws(() => host.setConfig({ model: "m".repeat(301) }), /config-invalid-string:model/)
   assert.throws(() => host.setConfig({ apiKeyEnv: "9bad-name" }), /config-invalid-string:apiKeyEnv/)
@@ -2143,11 +2158,12 @@ test("phase2b: verifierEffort and tournament pivot/round knobs are validated", (
 })
 
 test("phase2b: DSH_VA_API_TOKEN gates mutating endpoints while reads stay open", async () => {
-  const { VerifierHost, apiRoutes } = await import("../lib/index.js")
+  const { API_PREFIX, VerifierHost, apiRoutes } = await import("../lib/index.js")
   process.env.DSH_VA_API_TOKEN = "secret-token"
   try {
     const host = new VerifierHost(fakeContext(), hostOverrides())
     const routeList = apiRoutes(host)
+    assert.ok(routeList.every(route => route.path.startsWith(API_PREFIX + "/")), "every server route is rooted at the shared protocol prefix")
     const evalRoute = routeList.find(route => route.path.endsWith("/eval"))
     const recordsRoute = routeList.find(route => route.path.endsWith("/records"))
     let res = fakeRes()
@@ -2301,7 +2317,8 @@ test("phase3: every check requires a module that exists in the emitted files map
 // crash, abort, dispose, error passthrough. Boundary semantics run against
 // the REAL sidecar (empty/single candidates never touch the network).
 
-const BRIDGE_PY = "D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe"
+const BRIDGE_PY = process.env.DSH_VA_PYTHON
+  || (process.platform === "win32" ? "D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe" : "python3")
 const STUB_SIDECAR = fileURLToPath(new URL("./fixtures/stub_sidecar.py", import.meta.url))
 const REAL_SIDECAR = fileURLToPath(new URL("../bridge/llm_verifier_sidecar.py", import.meta.url))
 
@@ -3260,9 +3277,10 @@ test("relay text: fallback and abstain never promise a chosen best", async () =>
   assert.ok(!ab.includes("FINALIZER CONTRACT"), "abstain carries no finalizer contract")
   const insuff = buildAutopilotRelay({ ...base, outcome: "insufficient_evidence" })
   assert.ok(insuff.includes("Do NOT integrate"), "insufficient evidence must stop integration")
-  const ranked = buildAutopilotRelay({ ...base, outcome: "ranked_winner", winnerBasis: "verifier", winner: { index: 0, sessionId: "a", workspace: "W" }, margin: 0.3, marginThreshold: 0.03, marginProvisional: true, marginCondition: "m@low", finalists: [] })
+  const ranked = buildAutopilotRelay({ ...base, outcome: "ranked_winner", winnerBasis: "verifier", winner: { index: 0, sessionId: "a", workspace: "W" }, scores: [0.52, 0.48], ranking: [0, 1], margin: 0.04, marginThreshold: 0.03, marginProvisional: true, marginCondition: "m@low", finalists: [] })
   assert.ok(ranked.includes("FINALIZER CONTRACT"))
   assert.ok(ranked.includes("winner"), "a cleared margin keeps the winner framing")
+  assert.ok(ranked.includes("Separation: clear"), "relay separation uses the record's actual margin gate instead of a stale hard-coded threshold")
 })
 
 test("post-audit delivery: yes needs integration AND passing configured tests (G-4)", async () => {
@@ -3478,6 +3496,19 @@ test("selhost: /select candidateOptions rejects count mismatch and malformed ent
   res = fakeRes()
   await selectRoute.handler(fakeReq({ sourceSessionId: "sess-A", candidateOptions: [{ sandbox: true }] }), res)
   assert.equal(JSON.parse(res.bodyText).error, "candidate-options-invalid", "unknown keys rejected")
+  res = fakeRes()
+  await selectRoute.handler(fakeReq({ sourceSessionId: "sess-A", marginThreshold: "not-a-number" }), res)
+  assert.equal(res.status, 400)
+  assert.equal(JSON.parse(res.bodyText).error, "margin-threshold-invalid", "non-number boundary values are rejected before candidate admission")
+  res = fakeRes()
+  await selectRoute.handler(fakeReq({ sourceSessionId: "sess-A", marginThreshold: null }), res)
+  assert.equal(JSON.parse(res.bodyText).error, "margin-threshold-invalid", "null is not coerced to a zero margin gate")
+  res = fakeRes()
+  await selectRoute.handler(fakeReq({ sourceSessionId: "sess-A", marginThreshold: 0.6 }), res)
+  assert.equal(JSON.parse(res.bodyText).error, "margin-threshold-invalid", "out-of-range margin gates are rejected rather than silently clamped")
+  res = fakeRes()
+  await selectRoute.handler(fakeReq({ sourceSessionId: "sess-A", trigger: "autopilot" }), res)
+  assert.equal(JSON.parse(res.bodyText).error, "reserved-selection-field", "manual HTTP callers cannot claim the internal autopilot lifecycle")
   await host.selections.dispose()
 })
 
@@ -3784,6 +3815,8 @@ test("selhost: audit pack directory holds record + traces + patches, captured be
     assert.equal(res.status, 202)
     const id = JSON.parse(res.bodyText).selection.selectionId
     await waitFor(() => { const s = host.selections.getSelection(id); return s && s.status !== "running" ? s : null })
+    const ledgerRows = readFileSync(ledgerFile, "utf8").trim().split("\n").map(line => JSON.parse(line))
+    assert.ok(ledgerRows.length > 0 && ledgerRows.every(row => row.v === 1), "selection history uses the same versioned ledger contract")
     const dir = path.join(base, "led", "selection-artifacts", id)
     assert.ok(existsSync(path.join(dir, "record.json")), "record.json lands in the per-selection directory")
     const rec = JSON.parse(readFileSync(path.join(dir, "record.json"), "utf8")).record
@@ -3813,11 +3846,13 @@ test("selhost: settlement file dedupes later discard lines over the original rec
   const f = path.join(SEL_TMP, "sel-ledger-" + Date.now() + ".jsonl")
   const base = { selectionId: "sel-a", sourceSessionId: null, status: "completed", candidates: [], startedAt: 1, finishedAt: 2 }
   writeFileSync(f, JSON.stringify({ ...base, winner: { index: 0, sessionId: "s", workspace: "w" } }) + "\n"
-    + JSON.stringify({ ...base, winner: { index: 0, sessionId: "s", workspace: "w", discardedAt: 9 } }) + "\n")
+    + JSON.stringify({ ...base, winner: { index: 0, sessionId: "s", workspace: "w", discardedAt: 9 } }) + "\n"
+    + JSON.stringify({ ...base, selectionId: "sel-../../escape" }) + "\n")
   const host2 = new SelectionHost({ verifier: () => ({ model: "m", baseURL: "u", apiKeyEnv: "k" }), selectionsFile: f })
   const rec = host2.getSelection("sel-a")
   assert.equal(rec.winner.discardedAt, 9, "the later settlement line wins")
-  assert.equal(host2.listSelections().length, 1, "no duplicate history entries")
+  assert.equal(host2.listSelections().length, 1, "no duplicate history entries and unsafe persisted ids are rejected")
+  assert.equal(host2.getSelection("sel-../../escape"), undefined, "a ledger id can never become an audit-pack path traversal")
   await host2.dispose()
 })
 

@@ -18,55 +18,78 @@ from typing import Any, Dict, List, NoReturn, Optional
 
 os.environ.setdefault("DEEPSEEK_EFFORT", "off")
 
+_LLM_VERIFIER_IMPORT_ERROR: Optional[ImportError] = None
+
 try:
     import llm_verifier
     from llm_verifier.fine_grained_reward import (
         MissingAPIKeyError, USAGE, create_openai_client)
-except ImportError as exc:  # fatal: nothing to do without the library
-    print("llm_verifier import failed: %s" % exc, file=sys.stderr)
-    sys.exit(1)
+except ImportError as exc:
+    # Validation and the one-candidate short circuit are deliberately usable
+    # without the optional verifier environment. This keeps protocol tests and
+    # health diagnostics truthful on a plain Python installation while every
+    # provider-spending path still fails closed below.
+    llm_verifier = None  # type: ignore[assignment]
+    _LLM_VERIFIER_IMPORT_ERROR = exc
 
-# --- mojibake-tolerant tag distribution lookup (kimi-k3 over this relay) ----
-# kimi-k3's stream never materialises a '<' before the score tag: the tag
-# arrives as bare tokens 'score' '_A' '>' (evidence: _trace-dump probe
-# probe_k3_tokens.py, K3 native logprobs 20 alts/position). The library's
-# suffix matcher keys on '<score_A>' and therefore misses, silently dropping
-# to literal letter parsing (single draw, no expectation). Patch: when the
-# stock lookup misses, accept the tag's INNER name at a non-'<' boundary —
-# '<' or '/' immediately preceding means the CLOSING tag and is skipped —
-# and read the token distribution right after it. Stock library behaviour is
-# untouched whenever the '<'-formed tag is present.
-import re as _re
+    class MissingAPIKeyError(Exception):
+        pass
 
-from llm_verifier import fine_grained_reward as _fgr
+    class _UnavailableUsage:
+        @staticmethod
+        def reset() -> None:
+            return None
 
-_ORIG_FIND_TAG_LOGPROBS = _fgr._find_tag_logprobs
+        @staticmethod
+        def snapshot() -> Dict[str, int]:
+            return {"calls": 0, "input_tokens": 0,
+                    "cached_input_tokens": 0, "output_tokens": 0}
 
-
-def _find_tag_logprobs_tolerant(tokens, position_logprobs, tag):
-    found = _ORIG_FIND_TAG_LOGPROBS(tokens, position_logprobs, tag)
-    if found is not None:
-        return found
-    if not tokens or not position_logprobs:
-        return None
-    inner = tag.strip("<>").strip()  # e.g. 'score_A'
-    if not _re.match(r"^score_[A-Za-z]$", inner):
-        return None
-    name = inner
-    best = None
-    text_so_far = ""
-    for i, tok in enumerate(tokens):
-        text_so_far += tok
-        if not tok.strip():
-            continue
-        tail = text_so_far[-(len(name) + 16):]
-        if _re.search(r"(?<![</A-Za-z_])" + _re.escape(name) + r">?\s*$", tail):
-            if i + 1 < len(position_logprobs):
-                best = position_logprobs[i + 1]
-    return best
+    USAGE = _UnavailableUsage()
+    create_openai_client = None  # type: ignore[assignment]
 
 
-_fgr._find_tag_logprobs = _find_tag_logprobs_tolerant
+def _install_tolerant_tag_lookup() -> None:
+    """Patch the optional library only after it imported successfully.
+
+    kimi-k3 can emit a bare ``score_A>`` token sequence instead of a leading
+    ``<score_A>``. The stock suffix matcher misses that opening tag and falls
+    back to a literal draw; this lookup accepts the inner name at a non-closing
+    boundary while preserving stock behavior whenever the canonical tag is
+    present.
+    """
+    import re
+    from llm_verifier import fine_grained_reward as fgr
+
+    original = fgr._find_tag_logprobs
+
+    def tolerant(tokens, position_logprobs, tag):
+        found = original(tokens, position_logprobs, tag)
+        if found is not None:
+            return found
+        if not tokens or not position_logprobs:
+            return None
+        inner = tag.strip("<>").strip()
+        if not re.match(r"^score_[A-Za-z]$", inner):
+            return None
+        best = None
+        text_so_far = ""
+        for i, tok in enumerate(tokens):
+            text_so_far += tok
+            if not tok.strip():
+                continue
+            tail = text_so_far[-(len(inner) + 16):]
+            if re.search(r"(?<![</A-Za-z_])" + re.escape(inner)
+                         + r">?\s*$", tail):
+                if i + 1 < len(position_logprobs):
+                    best = position_logprobs[i + 1]
+        return best
+
+    fgr._find_tag_logprobs = tolerant
+
+
+if llm_verifier is not None:
+    _install_tolerant_tag_lookup()
 
 MAX_MSG = 500
 
@@ -190,12 +213,15 @@ def _ok(req_id: Optional[str], result: Dict[str, Any]) -> None:
 
 
 def _handle_health(req_id: Optional[str]) -> None:
+    available = llm_verifier is not None
     _ok(req_id, {
         "python": sys.version,
-        "llm_verifier_version": getattr(llm_verifier, "__version__", "unknown"),
-        "select_available": True,
-        "note": ("client must be deepseek-flagged: sampled score tags, "
-                 "no prefill support on this relay"),
+        "llm_verifier_version": (getattr(llm_verifier, "__version__", "unknown")
+                                 if available else None),
+        "select_available": available,
+        "note": (("client must be deepseek-flagged: sampled score tags, "
+                  "no prefill support on this relay") if available
+                 else "llm_verifier dependency is unavailable"),
         "deepseek_effort": os.environ.get("DEEPSEEK_EFFORT"),
     })
 
@@ -326,6 +352,25 @@ def _handle_select(req_id: Optional[str], req: Dict[str, Any]) -> None:
     except ValueError as exc:
         _error(req_id, "invalid_request", str(exc), False)
         return
+    # N=1 is a deterministic identity, not a verifier operation. Return it
+    # before credential or optional-library checks so this boundary remains
+    # testable offline and can never spend a provider call.
+    if len(v["candidates"]) == 1:
+        _ok(req_id, {
+            "index": 0,
+            "best_preview": v["candidates"][0][:200],
+            "scores": [1.0],
+            "ranking": [0],
+            "n_comparisons": 0,
+            "criteria": (list(v["criteria"].keys())
+                         if isinstance(v["criteria"], dict)
+                         else [item.get("id", str(i))
+                               if isinstance(item, dict) else str(i)
+                               for i, item in enumerate(v["criteria"])]),
+            "usage": {"calls": 0, "input_tokens": 0,
+                      "cached_input_tokens": 0, "output_tokens": 0},
+        })
+        return
     try:
         key = os.environ.get(v["api_key_env"])
         if not key:
@@ -333,6 +378,11 @@ def _handle_select(req_id: Optional[str], req: Dict[str, Any]) -> None:
                    "env var %s is not set or empty" % v["api_key_env"], False)
             return
         secret = key
+        if llm_verifier is None or create_openai_client is None:
+            _error(req_id, "bridge_unavailable",
+                   "llm_verifier import failed: %s" % _LLM_VERIFIER_IMPORT_ERROR,
+                   False)
+            return
         try:
             client = create_openai_client(base_url=v["base_url"], api_key=key)
         except Exception as exc:
@@ -425,6 +475,11 @@ def _handle_progress(req_id: Optional[str], req: Dict[str, Any]) -> None:
                    "env var %s is not set or empty" % api_key_env, False)
             return
         secret = key
+        if llm_verifier is None or create_openai_client is None:
+            _error(req_id, "bridge_unavailable",
+                   "llm_verifier import failed: %s" % _LLM_VERIFIER_IMPORT_ERROR,
+                   False)
+            return
         client = create_openai_client(base_url=base_url, api_key=key)
         client._llm_verifier_deepseek = True  # type: ignore[attr-defined]
         USAGE.reset()

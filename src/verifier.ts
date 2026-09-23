@@ -1,6 +1,9 @@
-import type { Config } from './index.js'
+import type { Config } from './config.js'
+import { normalizeBaseUrl, redactSecrets, resolveKey, type Credentials } from './util.js'
 
-type Credentials = { resolve?: (ref: string) => Promise<{ value?: string } | undefined> }
+export { normalizeBaseUrl, redactSecrets, resolveKey } from './util.js'
+export type { Credentials } from './util.js'
+
 
 export interface RouteResult {
   route: number
@@ -164,18 +167,6 @@ export function verifierEffortFields(effort: unknown): Record<string, unknown> {
   return {}
 }
 
-export async function resolveKey(credentials: Credentials | undefined, ref: string): Promise<string | undefined> {
-  if (credentials?.resolve) {
-    const resolved = await credentials.resolve(ref)
-    if (resolved?.value) return resolved.value
-  }
-  return process.env[ref] || undefined
-}
-
-export function normalizeBaseUrl(value: string): string {
-  return value.replace(/\/+$/, '')
-}
-
 export interface VerifyOptions {
   /** External abort signal (run-level fence); combined with the per-request timeout. */
   signal?: AbortSignal
@@ -222,30 +213,6 @@ function composeRequestSignal(config: Config, options?: VerifyOptions): AbortSig
   const external = options?.signal
   if (!external) return timeout
   return AbortSignal.any([timeout, external])
-}
-
-const SECRET_LITERAL_MIN_LENGTH = 8
-
-/**
- * Egress redaction policy (Phase 1): credentials must not leave the process
- * inside verifier prompts. Explicit literals (first and foremost the resolved
- * API key) are replaced before well-known token shapes are pattern-redacted.
- * Idempotent: '[REDACTED]' markers never match again.
- */
-export function redactSecrets(text: string, extraLiterals: readonly string[] = []): string {
-  let out = text
-  for (const literal of extraLiterals) {
-    if (typeof literal === 'string' && literal.length >= SECRET_LITERAL_MIN_LENGTH) {
-      out = out.split(literal).join('[REDACTED]')
-    }
-  }
-  return out
-    .replace(/eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}/g, '[REDACTED-JWT]')
-    .replace(/\bsk-[A-Za-z0-9][A-Za-z0-9-]{14,}[A-Za-z0-9]\b/g, '[REDACTED-KEY]')
-    .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, '[REDACTED-KEY]')
-    .replace(/\bxox[baprs]-[A-Za-z0-9-]{16,}\b/g, '[REDACTED-KEY]')
-    .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED-KEY]')
-    .replace(/\b(?:Bearer|token|password|passwd|secret|api[-_]?key)\s*[:=]\s*["']?([A-Za-z0-9._+/=-]{16,})["']?/gi, (match, value: string) => match.slice(0, match.length - value.length) + '[REDACTED]')
 }
 
 async function verifyRouteOnce(config: Config, credentials: Credentials | undefined, prompt: string, route: number, options?: VerifyOptions): Promise<RouteResult> {

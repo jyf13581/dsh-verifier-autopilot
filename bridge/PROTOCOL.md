@@ -155,6 +155,7 @@ The TS bridge offers `VerifierBridge.preflight()`: one tiny asymmetric pair must
 - `bad_frame`: Malformed JSON line. `retriable`: false.
 - `invalid_request`: Invalid request fields (missing, wrong type, etc.). `retriable`: false.
 - `missing_api_key`: The API key environment variable is not set or empty. `retriable`: false.
+- `bridge_unavailable`: The optional `llm_verifier` provider library could not be imported. `retriable`: false.
 - `client_init`: Failed to initialize the OpenAI client. `retriable`: false.
 - `missing_logprobs`: The model response is missing score token logprobs (expected from the verifier relay). `retriable`: false.
 - `timeout`: API request timed out. `retriable`: true.
@@ -163,6 +164,8 @@ The TS bridge offers `VerifierBridge.preflight()`: one tiny asymmetric pair must
 
 ## Notes
 
+- Health remains available without the optional provider library and reports `select_available: false`; multi-candidate `select` and `progress` then return non-retriable `bridge_unavailable`.
+- A one-candidate `select` is a deterministic identity and returns before API-key or provider-library checks.
 - The sidecar must be flagged for deepseek sampling: after creating the OpenAI client, set `client._llm_verifier_deepseek = True`.
 - The verifier relay ignores the vLLM prefill/structured_outputs trick and emits `<score_A>`/`<score_B>` tags with full token logprobs.
 - The sidecar does not print the API key or full trajectories; any trace text is truncated to 200 characters.
@@ -183,7 +186,7 @@ The TS bridge offers `VerifierBridge.preflight()`: one tiny asymmetric pair must
 ```
 {"id": "s1", "type": "select", "problem": "What is 2+2?", "candidates": ["4"], "criteria": {"accuracy": "Is the answer correct?"}, "ground_truth_note": null, "n_evaluations": 1, "pivots": 0, "seed": 0, "model": "local-model", "base_url": "http://localhost:8000/v1", "api_key_env": "DUMMY_KEY", "cache": null, "on_error": "tie", "max_workers": null, "progress": false}
 ```
-**Response (assuming API key env var DUMMY_KEY is set):**
+**Response (no API key or provider library is required for N=1):**
 ```
 {"id": "s1", "ok": true, "result": {"index": 0, "best_preview": "4", "scores": [1.0], "ranking": [0], "n_comparisons": 0, "criteria": ["accuracy"], "usage": {"calls": 0, ...}}}
 ```

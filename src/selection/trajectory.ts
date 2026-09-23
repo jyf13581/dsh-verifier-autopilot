@@ -28,6 +28,20 @@ export interface TrajectoryRender {
 const DEFAULT_CELL_CAP = 2000
 const DEFAULT_TOTAL_CAP = 24000
 
+/** Shared head/tail bounding for candidate context and handoff evidence. Keeping
+ * this with trajectory rendering prevents the candidate runner from depending
+ * back on autopilot orchestration. */
+export function boundText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  const head = Math.floor(maxChars * 0.35)
+  const tail = maxChars - head
+  return text.slice(0, head) + '\n[... bounded ...]\n' + text.slice(-tail)
+}
+
+export function boundCandidateHandoff(text: string, maxChars = 14_000): string {
+  return boundText(text.trim(), maxChars)
+}
+
 /** Meta/navigation tools that never modify the workspace or execute anything.
  *  tool_call is a dispatcher: its inner name is not visible in the event we
  *  see, so it conservatively counts as meta (never as execution evidence). */

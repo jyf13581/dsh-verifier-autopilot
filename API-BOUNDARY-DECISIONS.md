@@ -34,8 +34,10 @@ Autopilot does not call HTTP POST /select. It calls the same SelectionHost inter
 - If DSH_VA_API_TOKEN is set, provider-spending and mutating POST requests require Authorization: Bearer <token>. The token is optional in the current local deployment.
 - One selection may be active per Host. A concurrent start fails with selection-busy (429).
 - /select uses a sliding-window 12 admitted starts/hour limiter. Busy, malformed route, missing credential, and other pre-admission failures do not consume a start.
+- Manual /select rejects the internal orchestration fields trigger, policy, and taskKind (`reserved-selection-field`); callers cannot opt into autopilot sandbox or retention/relay behavior.
+- An explicit marginThreshold must be a finite JSON number in [0, 0.5]. Strings, null, non-finite values, and out-of-range values fail with `margin-threshold-invalid` rather than being coerced or clamped.
 - /eval is limited to 120/minute; /probe and /verify to 60/minute.
-- Config updates accept only the allowlisted schema in src/index.ts; timeout/model fields are range-validated before commit.
+- Config updates accept only the allowlisted schema in src/config.ts; timeout/model fields are range-validated before commit.
 
 ## Credentials and Egress
 

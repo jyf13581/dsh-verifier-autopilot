@@ -68,6 +68,12 @@ function taskPathHints(task: string): string[] {
     if (/[\\/]/.test(match[1])) hints.add(match[1].trim())
   }
   for (const match of task.matchAll(/[A-Za-z]:[\\/][^\s`"'<>|?*,，。；;()（）\[\]{}]+/g)) hints.add(match[0])
+  // POSIX absolute paths need their own boundary-aware form. Restrict this to
+  // POSIX hosts so unquoted route-like text such as /api/users is not probed
+  // as a current-drive path on Windows.
+  if (path.sep === '/') {
+    for (const match of task.matchAll(/(?:^|\s)(\/[^\s`"'<>|?*,，。；;()（）\[\]{}]+)/g)) hints.add(match[1])
+  }
   for (const match of task.matchAll(/(?:^|\s)((?:\.{1,2}[\\/])?(?:[A-Za-z0-9_.@-]+[\\/])+[A-Za-z0-9_.@-]+)/g)) hints.add(match[1])
   return [...hints].map((hint) => hint.replace(/:\d+(?::\d+)?$/, '').replace(/[.!?。！？]+$/, ''))
 }
