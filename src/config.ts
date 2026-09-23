@@ -154,7 +154,45 @@ export const SETTINGS_NAMESPACE = settingsNamespace(SETTINGS_NAMESPACE_ID)
  * immutable snapshot is derived from it for non-settings composition paths. */
 export const DEFAULT_CONFIG: Readonly<Config> = Object.freeze({ ...Config({}) } as Config)
 
-const CONFIG_KEYS = new Set<keyof Config>(Object.keys(DEFAULT_CONFIG) as Array<keyof Config>)
+/** Field shape read off the Schemastery schema. The schema is the single
+ *  authority for defaults AND for kind/bounds/choices: the API patch validator
+ *  below derives its checks from this table, so a bound changed in the schema
+ *  can never drift from the bound the API enforces. */
+interface ConfigFieldShape {
+  kind: 'boolean' | 'number' | 'string' | 'union'
+  min?: number
+  max?: number
+  /** A step declared on the schema means the field is integral. */
+  integer: boolean
+  /** Allowed values of a union field, in declaration order. */
+  choices: readonly string[]
+}
+
+function describeConfigFields(): ReadonlyMap<keyof Config, ConfigFieldShape> {
+  const shapes = new Map<keyof Config, ConfigFieldShape>()
+  for (const [key, field] of Object.entries(Config.dict ?? {})) {
+    const kind = field.type
+    if (kind !== 'boolean' && kind !== 'number' && kind !== 'string' && kind !== 'union') {
+      throw new Error('config-schema-unsupported-field:' + key + ':' + kind)
+    }
+    shapes.set(key as keyof Config, {
+      kind,
+      min: field.meta.min,
+      max: field.meta.max,
+      integer: typeof field.meta.step === 'number' && Number.isInteger(field.meta.step),
+      choices: kind === 'union' ? (field.list ?? []).map(option => String(option.value)) : [],
+    })
+  }
+  return shapes
+}
+
+const CONFIG_FIELDS = describeConfigFields()
+
+/** Error code for a rejected union value, e.g. selectionMode ->
+ *  config-selection-mode-invalid. Kept in sync with the historical codes. */
+function unionErrorCode(key: string): string {
+  return 'config-' + key.replace(/[A-Z]/g, letter => '-' + letter.toLowerCase()) + '-invalid'
+}
 
 /** Bridge the settings service's source/change callbacks to the live Host config. */
 export function createSettingsSourceHooks(host: { replaceConfig(next: Config): void }): {
@@ -177,25 +215,16 @@ export function validateConfigPatch(value: unknown): Partial<Config> {
   const input = value as Record<string, unknown>
   const output: Partial<Config> = {}
   for (const key of Object.keys(input) as Array<keyof Config>) {
-    if (!CONFIG_KEYS.has(key)) throw new Error('unknown-config-key:' + key)
+    const shape = CONFIG_FIELDS.get(key)
+    if (!shape) throw new Error('unknown-config-key:' + key)
     const item = input[key]
-    if (key === 'enabled' || key === 'autoFeedback' || key === 'allowLabelFallback' || key === 'divergenceGuard' || key === 'skipStatusContinuation' || key === 'selectionNotify' || key === 'selectionProbeEnabled') {
+    if (shape.kind === 'boolean') {
       if (typeof item !== 'boolean') throw new Error('config-boolean-required:' + key)
       output[key] = item as never
       continue
     }
-    if (key === 'selectionMode') {
-      if (item !== 'off' && item !== 'auto' && item !== 'always') throw new Error('config-selection-mode-invalid')
-      output[key] = item as never
-      continue
-    }
-    if (key === 'selectionModelStrategy') {
-      if (item !== 'quality-first' && item !== 'exploration') throw new Error('config-selection-model-strategy-invalid')
-      output[key] = item as never
-      continue
-    }
-    if (key === 'verifierEffort') {
-      if (item !== 'off' && item !== 'low' && item !== 'high' && item !== 'max') throw new Error('config-verifier-effort-invalid')
+    if (shape.kind === 'union') {
+      if (typeof item !== 'string' || !shape.choices.includes(item)) throw new Error(unionErrorCode(key))
       output[key] = item as never
       continue
     }
@@ -215,7 +244,9 @@ export function validateConfigPatch(value: unknown): Partial<Config> {
       output[key] = item as never
       continue
     }
-    if (key === 'baseURL' || key === 'model' || key === 'apiKeyEnv' || key === 'selectionProvider' || key === 'selectionModels') {
+    if (shape.kind === 'string') {
+      // Free-form identity strings (baseURL, model, apiKeyEnv, selectionProvider,
+      // selectionModels): non-empty, printable, bounded, plus per-key policy.
       if (typeof item !== 'string' || item.trim() === '') throw new Error('config-string-required:' + key)
       // Sanity bounds for free-form identity strings (Phase 2): printable,
       // bounded, and env-var names must look like environment variable names.
@@ -236,12 +267,10 @@ export function validateConfigPatch(value: unknown): Partial<Config> {
       output[key] = normalized as never
       continue
     }
+    // Numbers: kind, integrality, and bounds all come from the schema.
     if (typeof item !== 'number' || !Number.isFinite(item)) throw new Error('config-number-required:' + key)
-    const integer = key === 'routes' || key === 'maxFeedbackPerSession' || key === 'timeoutMs' || key === 'maxTokens' || key === 'selectionStandardCandidates' || key === 'selectionDeepCandidates' || key === 'selectionEvaluations' || key === 'selectionPivots' || key === 'selectionCandidateTimeoutMs' || key === 'selectionSelectTimeoutMs' || key === 'selectionVerifierWorkers' || key === 'verifierMinIntervalMs'
-    if (integer && !Number.isInteger(item)) throw new Error('config-integer-required:' + key)
-    const range: Record<string, [number, number]> = { routes: [1, 5], scoreThreshold: [0, 1], disagreementThreshold: [0, 1], maxFeedbackPerSession: [0, 3], timeoutMs: [5000, 180000], maxTokens: [256, 65536], temperature: [0, 1], divergenceGuardMedian: [0, 1], selectionStandardCandidates: [2, 5], selectionDeepCandidates: [2, 5], selectionEvaluations: [1, 8], selectionPivots: [0, 5], selectionCandidateTimeoutMs: [30000, 1800000], selectionSelectTimeoutMs: [30000, 600000], selectionMarginThreshold: [0, 0.5], selectionVerifierWorkers: [0, 16], verifierMinIntervalMs: [0, 60000] }
-    const bounds = range[key]
-    if (bounds && (item < bounds[0] || item > bounds[1])) throw new Error('config-out-of-range:' + key)
+    if (shape.integer && !Number.isInteger(item)) throw new Error('config-integer-required:' + key)
+    if ((shape.min !== undefined && item < shape.min) || (shape.max !== undefined && item > shape.max)) throw new Error('config-out-of-range:' + key)
     output[key] = item as never
   }
   return output

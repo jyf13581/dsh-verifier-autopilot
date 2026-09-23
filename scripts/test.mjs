@@ -4665,3 +4665,221 @@ test("selhost: defaultPythonPath prefers DSH_VA_PYTHON and otherwise never point
     else process.env.DSH_VA_PYTHON = saved
   }
 })
+
+// ---------- round 3: source-turn latency, transport failure channel, schema-derived config validation ----------
+
+test("model prober: concurrent probes of one model share a single in-flight request", async () => {
+  const { createModelProber } = await import("../lib/selection/probe.js")
+  const gate = deferred()
+  let fetches = 0
+  const fetchImpl = async () => { fetches += 1; await gate.promise; return { ok: true, status: 200 } }
+  const prober = createModelProber({ baseURL: "http://relay.local/v1", apiKey: "k", fetchImpl })
+  try {
+    const first = prober.probe("shared-model")
+    const second = prober.probe("shared-model")
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    assert.equal(fetches, 1, "the second caller joins the in-flight probe instead of spending a second request")
+    gate.resolve()
+    assert.deepEqual(await Promise.all([first, second]), [true, true])
+    assert.equal(await prober.probe("shared-model"), true, "settled verdicts still come from the cache")
+    assert.equal(fetches, 1)
+  } finally { gate.resolve() }
+})
+
+test("autopilot pre-step: the preferred pool is probed concurrently, so liveness costs one probe, not one per model", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-probe-par-"))
+  const origFetch = globalThis.fetch
+  try {
+    const repo = makeGitRepo(base, "source")
+    const ctx = fakeContext()
+    ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+    ctx.credentials = { resolve: async () => ({ value: "probe-test-key" }) }
+    const config = hostOverrides({ enabled: false, selectionProbeEnabled: true })
+    const pool = config.selectionModels.split(",").map((m) => m.trim()).filter(Boolean)
+    assert.ok(pool.length >= 3, "fixture: a multi-model preferred pool")
+    const host = new VerifierHost(ctx, config, {
+      selectionsTesting: { factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge: fakeBridge() },
+    })
+    const source = ctx.spawnAgent(fakeAgent("sess-par", completedTurnEvents(1)))
+    source.session.header = { cwd: repo }
+    let inFlight = 0
+    let maxInFlight = 0
+    const probed = []
+    globalThis.fetch = async (url, init) => {
+      probed.push(JSON.parse(init.body).model)
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 30))
+      inFlight -= 1
+      // Every model reports dead: the pre-step fails closed, which keeps this
+      // test free of a background tournament while still exercising the probe.
+      return { ok: false, status: 410, body: null }
+    }
+    host.start()
+    try {
+      const preStep = source.handlers.get("agent/pre-step")[0]
+      const direct = { id: "u1", role: "user", content: [{ type: "text", text: "Fix src/x.ts and run the tests" }], source: { kind: "user" } }
+      const decision = await preStep({ messages: [direct], turn: 1, step: 1, signal: new AbortController().signal }, async () => ({ kind: "enter", messages: [direct] }))
+      assert.equal(decision.kind, "enter")
+      assert.deepEqual([...probed].sort(), [...pool].sort(), "every preferred model is probed exactly once")
+      assert.equal(maxInFlight, pool.length, "probes overlap instead of queueing on the source turn (max in flight " + maxInFlight + ")")
+      assert.equal(host.selections.listSelections().length, 0, "all-dead pool still fails closed")
+    } finally {
+      await host.dispose()
+    }
+  } finally {
+    globalThis.fetch = origFetch
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test("autopilot pre-step: a source turn aborted mid-probe stops waiting for the pool", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-probe-abort-"))
+  const origFetch = globalThis.fetch
+  const gate = deferred()
+  try {
+    const repo = makeGitRepo(base, "source")
+    const ctx = fakeContext()
+    ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+    ctx.credentials = { resolve: async () => ({ value: "probe-test-key" }) }
+    const host = new VerifierHost(ctx, hostOverrides({ enabled: false, selectionProbeEnabled: true }), {
+      selectionsTesting: { factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge: fakeBridge() },
+    })
+    const source = ctx.spawnAgent(fakeAgent("sess-abort-probe", completedTurnEvents(1)))
+    source.session.header = { cwd: repo }
+    let fetches = 0
+    globalThis.fetch = async () => { fetches += 1; await gate.promise; return { ok: true, status: 200, body: null } }
+    host.start()
+    try {
+      const preStep = source.handlers.get("agent/pre-step")[0]
+      const direct = { id: "u1", role: "user", content: [{ type: "text", text: "Fix src/x.ts and run the tests" }], source: { kind: "user" } }
+      const controller = new AbortController()
+      const pending = preStep({ messages: [direct], turn: 1, step: 1, signal: controller.signal }, async () => ({ kind: "enter", messages: [direct] }))
+      await waitFor(() => fetches > 0)
+      controller.abort()
+      const outcome = await Promise.race([
+        pending.then(() => "settled", () => "settled"),
+        new Promise((resolve) => setTimeout(() => resolve("still-waiting"), 1500)),
+      ])
+      assert.equal(outcome, "settled", "the pre-step settles as soon as the turn is aborted, not when the probes finish")
+      assert.equal(host.selections.listSelections().length, 0, "no selection is admitted for an aborted turn")
+    } finally {
+      gate.resolve()
+      await host.dispose()
+    }
+  } finally {
+    gate.resolve()
+    globalThis.fetch = origFetch
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+/** Response sink whose `close` listener can be fired to simulate a client that
+ *  hung up before the handler answered. */
+function disconnectableRes() {
+  const res = fakeRes()
+  const closers = []
+  res.once = (event, listener) => { if (event === "close") closers.push(listener) }
+  res.disconnect = () => { for (const listener of closers.splice(0)) listener() }
+  return res
+}
+
+test("api: /eval stops the lane fan-out when the client disconnects", async () => {
+  const { VerifierHost, apiRoutes } = await import("../lib/index.js")
+  const server = mockLaneServer()
+  const gate = deferred()
+  try {
+    const host = new VerifierHost(fakeContext(), hostOverrides())
+    const evalRoute = apiRoutes(host).find((route) => route.path.endsWith("/eval"))
+    server.enqueue((call) => gatedLane(call, gate))
+    const res = disconnectableRes()
+    const pending = evalRoute.handler(fakeReq({ problem: "p", trace: "valid trace" }), res)
+    await waitFor(() => server.calls.length === 1)
+    assert.ok(server.calls[0].init.signal, "the lane request carries an abort signal")
+    assert.equal(server.calls[0].init.signal.aborted, false)
+    res.disconnect()
+    const outcome = await Promise.race([
+      pending.then(() => "settled"),
+      new Promise((resolve) => setTimeout(() => resolve("still-running"), 1500)),
+    ])
+    assert.equal(outcome, "settled", "the handler settles once the client is gone, without waiting for the provider")
+    assert.equal(server.calls[0].init.signal.aborted, true, "the in-flight provider request is aborted with the client")
+    assert.equal(server.calls.length, 1, "an aborted lane is not retried")
+    assert.equal(res.status, 0, "nothing is written to a connection nobody is reading")
+  } finally {
+    gate.resolve()
+    server.restore()
+  }
+})
+
+test("api: every unexpected failure leaves through one redacted, bounded 500; /config rejects bad JSON with the shared code", async () => {
+  const { host } = mkSelectionHost()
+  try {
+    const routes = apiRoutes(host)
+    const secret = "sk-abcdefghijklmnopqrstuvwxyz0123"
+    const loud = "upstream said " + secret + " " + "x".repeat(1000)
+    const expectRedacted = (res, label) => {
+      assert.equal(res.status, 500, label + " is a JSON 500")
+      const body = JSON.parse(res.bodyText)
+      assert.equal(body.ok, false)
+      assert.ok(body.error.includes("upstream said"), label + " keeps the reason")
+      assert.ok(!body.error.includes(secret), label + " never leaks a key")
+      assert.ok(body.error.length <= 240, label + " is bounded (" + body.error.length + ")")
+    }
+    host.verifySession = async () => { throw new Error(loud) }
+    const verify = fakeRes()
+    await routes.find((route) => route.path.endsWith("/verify")).handler(fakeReq({ sessionId: "sess-A" }), verify)
+    expectRedacted(verify, "/verify")
+    const originalGetConfig = host.getConfig.bind(host)
+    host.getConfig = () => { throw new Error(loud) }
+    const evalRes = fakeRes()
+    await routes.find((route) => route.path.endsWith("/eval")).handler(fakeReq({ problem: "p", trace: "valid trace" }), evalRes)
+    expectRedacted(evalRes, "/eval")
+    const probeRes = fakeRes()
+    await routes.find((route) => route.path.endsWith("/probe")).handler(fakeReq({}), probeRes)
+    expectRedacted(probeRes, "/probe")
+    host.getConfig = originalGetConfig
+    const badJson = { ...fakeReq({}), [Symbol.asyncIterator]: async function* () { yield Buffer.from("{not json") } }
+    const configRes = fakeRes()
+    await routes.find((route) => route.path.endsWith("/config")).handler(badJson, configRes)
+    assert.equal(configRes.status, 400)
+    assert.equal(JSON.parse(configRes.bodyText).error, "invalid-json-body", "/config speaks the same malformed-body code as every other route")
+  } finally { await host.selections.dispose() }
+})
+
+test("config: API patch validation is derived from the Schemastery schema, so bounds and choices cannot drift", async () => {
+  const { Config, validateConfigPatch } = await import("../lib/index.js")
+  const fields = Object.entries(Config.dict)
+  assert.ok(fields.length >= 30, "fixture: the whole schema is visible")
+  const rejects = (patch, pattern) => assert.throws(() => validateConfigPatch(patch), pattern, JSON.stringify(patch))
+  let numbers = 0
+  let unions = 0
+  let booleans = 0
+  for (const [key, field] of fields) {
+    if (field.type === "number") {
+      numbers += 1
+      const { min, max, step } = field.meta
+      assert.ok(typeof min === "number" && typeof max === "number", key + ": every numeric knob declares both bounds in the schema")
+      assert.deepEqual(validateConfigPatch({ [key]: min }), { [key]: min }, key + " accepts its schema minimum")
+      assert.deepEqual(validateConfigPatch({ [key]: max }), { [key]: max }, key + " accepts its schema maximum")
+      rejects({ [key]: min - 1 }, new RegExp("config-out-of-range:" + key))
+      rejects({ [key]: max + 1 }, new RegExp("config-out-of-range:" + key))
+      rejects({ [key]: "1" }, new RegExp("config-number-required:" + key))
+      if (typeof step === "number") rejects({ [key]: min + 0.5 }, new RegExp("config-integer-required:" + key))
+    } else if (field.type === "union") {
+      unions += 1
+      for (const option of field.list) assert.deepEqual(validateConfigPatch({ [key]: option.value }), { [key]: option.value })
+      rejects({ [key]: "__bogus__" }, /config-.*-invalid/)
+      rejects({ [key]: true }, /config-.*-invalid/)
+    } else if (field.type === "boolean") {
+      booleans += 1
+      assert.deepEqual(validateConfigPatch({ [key]: false }), { [key]: false })
+      rejects({ [key]: "true" }, new RegExp("config-boolean-required:" + key))
+    }
+  }
+  assert.ok(numbers >= 15 && unions >= 3 && booleans >= 5, "fixture: all three derived kinds were exercised (" + numbers + "/" + unions + "/" + booleans + ")")
+  rejects({ selectionMode: "sometimes" }, /^Error: config-selection-mode-invalid$/)
+  rejects({ selectionModelStrategy: "random" }, /^Error: config-selection-model-strategy-invalid$/)
+  rejects({ verifierEffort: "ultra" }, /^Error: config-verifier-effort-invalid$/)
+  rejects({ notAKnob: 1 }, /unknown-config-key:notAKnob/)
+})

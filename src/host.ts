@@ -106,6 +106,18 @@ function awaitFollowupWithFence(operation: Promise<void>, signal: AbortSignal, t
   })
 }
 
+/** Resolve with `work`, or reject as soon as `signal` aborts — whichever comes
+ *  first. The underlying work is not cancelled (it is advisory and self-bounded);
+ *  only the caller stops waiting for it. */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error('aborted'))
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason ?? new Error('aborted'))
+    signal.addEventListener('abort', onAbort, { once: true })
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+  })
+}
+
 export class VerifierHost {
   private config: Config
   private readonly agents = new Map<string, Agent>()
@@ -227,17 +239,19 @@ export class VerifierHost {
     // Liveness before planning (ruling P-C): the catalog lists models that may
     // be dead for days. Probe every configured model, including custom IDs that
     // a provider catalog does not advertise, and drop only confirmed failures.
+    // The probes run concurrently and the wait is abort-aware: this code sits
+    // on the source turn's critical path, so the pool costs one probe timeout
+    // at worst, never one per configured model, and a cancelled turn stops
+    // waiting immediately (the prober still caches the late verdicts).
     let probeEvidence: Record<string, boolean> | undefined
     if (this.config.selectionProbeEnabled) {
       try {
         const probeKey = await resolveKey(this.ctx.credentials, this.config.apiKeyEnv)
         if (probeKey) {
           const prober = this.proberFor(this.config.baseURL, probeKey)
-          const alive: string[] = []
-          const dead: string[] = []
-          for (const model of preferredModels) {
-            (await prober.probe(model) ? alive : dead).push(model)
-          }
+          const verdicts = await untilAborted(Promise.all(preferredModels.map((model) => prober.probe(model))), payload.signal)
+          const alive = preferredModels.filter((_, index) => verdicts[index])
+          const dead = preferredModels.filter((_, index) => !verdicts[index])
           if (alive.length > 0 || dead.length === 0) {
             const deadSet = new Set(dead)
             availableModels = [...alive, ...availableModels.filter((m) => !deadSet.has(m) && !alive.includes(m))]
@@ -250,6 +264,7 @@ export class VerifierHost {
         }
       } catch { /* probing is advisory only when the provider key is unavailable */ }
     }
+    payload.signal.throwIfAborted()
     const plan = planAutopilotTask(task, availableModels, policy)
     if (!plan.admitted || !plan.depth || !plan.candidateCount || !plan.nEvaluations || !plan.candidateOptions || !plan.candidateInstructions || !plan.criteria) return decision
 

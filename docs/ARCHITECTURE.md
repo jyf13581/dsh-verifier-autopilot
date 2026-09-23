@@ -114,7 +114,12 @@ Follow these rules:
 8. **Config owns config policy types and defaults.** Selection may consume
    `AutopilotMode` and `CandidateModelStrategy`; config must not import the
    selection implementation. `DEFAULT_CONFIG` is derived from the Schemastery
-   schema so defaults cannot drift between composition and settings paths.
+   schema so defaults cannot drift between composition and settings paths, and
+   `validateConfigPatch()` reads field kinds, numeric bounds, integrality, and
+   union choices from the same schema: a bound lives in exactly one place.
+   Per-key string policy (URL egress rules, env-var grammar, length caps) is
+   the only validation that stays hand-written, because it is policy, not
+   shape.
 
 A cycle is a design signal. Move a shared shape to `protocol.ts`, a generic
 boundary helper to `util.ts`, or a persistence primitive to `ledger.ts` rather
@@ -255,7 +260,16 @@ Runtime state belongs under `.data/` and is ignored. It must never be committed.
 `dispose()` is the ownership boundary that cancels in-flight work and disposes
 the selection host. A disposed Host cannot be restarted. Selection disposal
 must terminate sidecars, candidates, retained handles, and isolated workspaces. API disconnects and configured timeouts should flow
-through existing abort signals instead of creating detached promises.
+through existing abort signals instead of creating detached promises: the
+provider-spending routes (`/eval`, `/probe`) derive an abort signal from the
+response's `close` event, so a caller that hangs up stops the lane fan-out
+instead of leaving it to run to completion.
+
+The autopilot pre-step sits on the source turn's critical path. Work there is
+bounded and concurrent: the preferred pool is probed in parallel (one probe
+timeout at worst, never one per model), concurrent probes of the same model
+share one request, and the wait is abort-aware so a cancelled turn stops
+waiting immediately while late verdicts still populate the prober cache.
 
 Five concurrency and evidence invariants are pinned by regression tests and
 must survive future refactors:
@@ -296,7 +310,10 @@ values do not. Resolve them at the last responsible moment through
 `resolveKey()`. Pass normalized provider URLs through `normalizeBaseUrl()` and
 sanitize operator-visible errors with `redactSecrets()`. Logs, API errors,
 records, audit packs, tests, and fixtures must contain neither live keys nor
-internal endpoint credentials.
+internal endpoint credentials. On the transport, every unexpected failure
+leaves through one helper (`internalFailure`): a JSON 500 whose message is
+redacted and bounded. Routes answer with typed codes for expected conditions
+and never forward a raw `error.message`.
 
 The Python verifier dependency is optional. Health reporting must truthfully
 expose whether selection is available. Missing `llm_verifier` may disable
