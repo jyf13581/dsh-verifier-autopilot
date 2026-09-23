@@ -25,6 +25,69 @@ const SETTINGS_NAMESPACE = SETTINGS_NAMESPACE_ID
 const panelStyle = { padding: 12, display: 'grid', gap: 8, fontSize: 12, borderTop: '1px solid var(--border-color, #ddd)' }
 const rowStyle = { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }
 
+/** Poll cadence while the SSE stream is delivering: the stream carries every
+ *  Host change, so polling degrades to a slow reconciliation sweep. */
+const STREAMING_POLL_MS = 15000
+
+/** Live Host state for a panel: `/events` pushes a full `State` on every Host
+ *  change (selection progress, new diagnostics, config), while `poll` stays as
+ *  the initial load, the fallback when the stream is unavailable, and a slow
+ *  periodic reconciliation while it is healthy. Both callbacks are captured
+ *  at mount, matching the panels' own effect discipline. */
+function useLiveState(onState: (state: State) => void, poll: () => void, pollMs: number): void {
+  useEffect(() => {
+    let alive = true
+    let streaming = false
+    let timer = 0
+    const schedule = (): void => {
+      window.clearInterval(timer)
+      timer = window.setInterval(poll, streaming ? STREAMING_POLL_MS : pollMs)
+    }
+    poll()
+    schedule()
+    let source: EventSource | null = null
+    try {
+      source = new EventSource(API + '/events')
+      source.onmessage = (event: MessageEvent<string>) => {
+        if (!alive) return
+        let next: State
+        try { next = JSON.parse(event.data) as State } catch { return }
+        if (!next || typeof next !== 'object' || !next.config) return
+        onState(next)
+        if (!streaming) { streaming = true; schedule() }
+      }
+      // The browser reconnects on its own; until it does, poll at full speed.
+      source.onerror = () => { if (streaming) { streaming = false; schedule() } }
+    } catch { source = null }
+    return () => { alive = false; window.clearInterval(timer); source?.close() }
+  }, [])
+}
+
+function formatDiagnosticTime(at: number): string {
+  const date = new Date(at)
+  const pad = (value: number): string => (value < 10 ? '0' : '') + value
+  return pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds())
+}
+
+/** Folded degradation ledger: what the Host chose to survive instead of fail.
+ *  Empty is the healthy state and stays out of the way. */
+function DiagnosticsSection(props: { state: State | null }): any {
+  const snapshot = props.state?.diagnostics
+  if (!snapshot) return null
+  const entries = snapshot.entries.slice(0, 8)
+  const counterKeys = Object.keys(snapshot.counters)
+  const total = snapshot.entries.length + snapshot.evicted
+  const summary = '诊断 · ' + (total === 0 ? '无降级' : total + ' 条降级' + (snapshot.evicted > 0 ? '（已滚动丢弃 ' + snapshot.evicted + '）' : ''))
+    + (counterKeys.length ? ' · ' + counterKeys.length + ' 个计数器' : '')
+  const lines = entries.map((entry) => formatDiagnosticTime(entry.at) + '  ' + entry.scope + ' · ' + entry.message + (entry.count > 1 ? ' ×' + entry.count : ''))
+  const counters = counterKeys.map((key) => key + '=' + snapshot.counters[key]).join('  ')
+  return h('details', null,
+    h('summary', { style: { cursor: 'pointer', color: total > 0 ? 'var(--danger-color, #b42318)' : undefined } }, summary),
+    counters ? h('div', { style: { whiteSpace: 'pre-wrap', opacity: 0.8 } }, counters) : null,
+    h('div', { style: { whiteSpace: 'pre-wrap', maxHeight: 140, overflow: 'auto' } }, lines.length ? lines.join('\n') : '无告警'),
+  )
+}
+
 function Checkbox(props: { checked: boolean; onChange: () => void; label: string; disabled?: boolean }): any {
   return h('label', { style: { display: 'flex', alignItems: 'center', gap: 5, opacity: props.disabled ? 0.65 : 1 } }, h('input', { type: 'checkbox', checked: props.checked, disabled: props.disabled, onChange: props.onChange }), props.label)
 }
@@ -117,11 +180,11 @@ function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsSco
     }
   }
 
-  useEffect(() => {
-    void refresh()
-    const timer = window.setInterval(() => { void refresh() }, 3000)
-    return () => window.clearInterval(timer)
-  }, [])
+  useLiveState((next) => {
+    setHostState(next)
+    setData({ ok: true, active: next.selection.active, retainedWinners: next.selection.retainedWinners, selections: next.selection.selections })
+    setStatus('')
+  }, () => { void refresh() }, 3000)
 
   const post = async (path: string, body: Record<string, unknown>): Promise<boolean> => {
     const response = await fetch(API + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
@@ -265,11 +328,12 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
     }
   }
 
-  useEffect(() => {
-    void refresh()
-    const timer = window.setInterval(() => { void refresh() }, 5000)
-    return () => window.clearInterval(timer)
-  }, [])
+  useLiveState((next) => {
+    setState(next)
+    setEnabled(next.config?.enabled === true)
+    setAutoFeedback(next.config?.autoFeedback === true)
+    setStatus('')
+  }, () => { void refresh() }, 5000)
 
   const savePatch = async (patch: Record<string, unknown>): Promise<void> => {
     setSaving(true)
@@ -408,6 +472,7 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
       h('span', null, props.sessionId ? '当前会话已选' : '无当前会话'),
     ),
     h('div', { style: { whiteSpace: 'pre-wrap', maxHeight: 180, overflow: 'auto' } }, lines.length ? lines.join('\n') : (status || '尚无验证记录')),
+    h(DiagnosticsSection, { state }),
   )
 }
 

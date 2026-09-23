@@ -36,6 +36,7 @@ implementation code.
 | `src/protocol.ts` | Canonical Host/client wire types, structural web transport types, API prefix, and model catalog. |
 | `src/util.ts` | Dependency-light boundary helpers: credentials, API-key resolution, base-URL normalization, and secret redaction. |
 | `src/ledger.ts` | Shared versioned JSONL reading/appending/compaction and same-directory atomic replacement. |
+| `src/diagnostics.ts` | Bounded, redacted degradation ledger (warnings ring + counters). Every layer reports its best-effort failures here; the snapshot rides in `/state`. Leaf: imports only `util`. |
 
 ### Legacy verifier path
 
@@ -83,10 +84,11 @@ index
        ├─ evidence      ├─> protocol (types/constants only)
        ├─ verifier      ├─> util
        ├─ ledger        │
+       ├─ diagnostics ──┤ (protocol imports its snapshot type only)
        └─ selection/host
             ├─ candidates / autopilot / live / checks / trajectory
             ├─ bridge / retry / probe
-            └─ ledger
+            └─ ledger / diagnostics
 
 client ─────────────────────> protocol
 ```
@@ -120,6 +122,21 @@ Follow these rules:
    Per-key string policy (URL egress rules, env-var grammar, length caps) is
    the only validation that stays hand-written, because it is policy, not
    shape.
+9. **`diagnostics.ts` is a leaf, and "best-effort" means "reported", not
+   "silent".** Every layer (Host, selection, sidecar bridge) writes into the
+   same bounded `Diagnostics` sink, so the sink may import only `util.ts` /
+   `constants.ts` — an import in the other direction would make the failure
+   reporter depend on the code that fails. A `catch` that swallows an error on
+   a path the operator cannot otherwise observe (ledger append, artifact
+   write, loser cleanup, progress sample, notice/relay delivery, sidecar
+   exit, verifier retry) must call `diagnostics.warn(scope, error, detail)`.
+   Two exceptions are deliberate: subscriber-loop catches inside `emit()` only
+   `count()`, because a warning notifies subscribers and would re-enter the
+   loop; and shutdown-path catches (`dispose()`) stay quiet, because the
+   snapshot can no longer be read. Messages are redacted and length-bounded
+   before they are stored, consecutive identical entries coalesce into a
+   count, and the ring evicts oldest-first, so the sink can never grow without
+   bound or leak a credential into `/state`.
 
 A cycle is a design signal. Move a shared shape to `protocol.ts`, a generic
 boundary helper to `util.ts`, or a persistence primitive to `ledger.ts` rather
@@ -319,6 +336,19 @@ The Python verifier dependency is optional. Health reporting must truthfully
 expose whether selection is available. Missing `llm_verifier` may disable
 provider-backed comparison, but it must not make offline Host startup or the
 sidecar's deterministic protocol gates dishonest.
+
+Degradation is observable. Best-effort paths keep their contract (a failed
+ledger append, a stuck loser worktree, a dead sidecar, an undeliverable relay
+never fail the operation that owns them) but they report into the shared
+`Diagnostics` sink: a ring of the last 200 warnings (consecutive repeats
+coalesced, one scope capped at a fifth of the ring, redacted and bounded text)
+plus monotonic counters. `VerifierHost.snapshot()` carries the snapshot, so
+`/state` and the `/events` stream expose it, and the panel shows it in a
+folded "诊断" section. The Host subscribes to the sink: every new warning
+pushes a state frame to connected panels, while counters stay silent so they
+are safe to bump from inside `emit()` and snapshot paths. The browser panels
+consume `/events` as their primary feed and keep polling only as the initial
+load, the no-stream fallback, and a slow (15 s) reconciliation sweep.
 
 ## 8. Build and test topology
 

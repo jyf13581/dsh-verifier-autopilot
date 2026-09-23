@@ -22,6 +22,7 @@ import {
 import { appendJsonlLedger, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from './ledger.js'
 import type { StateResponse, VerificationRecord, WebRoute } from './protocol.js'
 import { resolveKey, type Credentials } from './util.js'
+import { diagnostics as defaultDiagnostics, type Diagnostics } from './diagnostics.js'
 import { SelectionHost } from './selection/host.js'
 import { runChecks } from './selection/checks.js'
 import { evaluateDelivery } from './selection/candidates.js'
@@ -57,14 +58,18 @@ function isRecordState(value: unknown): value is RecordState {
     && typeof (value as Partial<RecordState>).status === 'string')
 }
 
-function loadPersistedRecords(file: string): RecordState[] {
+function loadPersistedRecords(file: string, diagnostics: Diagnostics): RecordState[] {
+  let skippedRows = 0
   const loaded = readJsonlLedger(file, {
     limit: VERIFICATION_HISTORY_LIMIT,
     validate: isRecordState,
     normalize: normalizeLoadedRecord,
+    onSkippedRow: () => { skippedRows += 1 },
   })
+  if (skippedRows > 0) diagnostics.warn('records.corrupt_rows', skippedRows + ' unreadable row(s) skipped while loading the verification ledger', { file, rows: skippedRows })
   if (ledgerExceeds(file, RECORDS_FILE_MAX_BYTES)) {
-    try { compactJsonlLedger(file, loaded) } catch { /* best-effort compaction */ }
+    diagnostics.count('records.compact')
+    try { compactJsonlLedger(file, loaded) } catch (error) { diagnostics.warn('records.compact', error, { file }) }
   }
   return loaded
 }
@@ -132,6 +137,11 @@ export class VerifierHost {
   /** null disables persistence (tests/embedded use); the injected Host enables it */
   private readonly recordsFile: string | null
   private readonly feedbackTimeoutMs: number
+  /** Degradation sink shared with the selection host, runner, and sidecar
+   *  bridge. Every "best-effort" branch reports here instead of vanishing;
+   *  the snapshot rides along in `/state` and the SSE stream. */
+  private readonly diagnostics: Diagnostics
+  private readonly unsubscribeDiagnostics: () => void
   /** Best-of-N selection host (manual trigger plus first-step autopilot). */
   readonly selections: SelectionHost
   /** Autopilot winners live only until the source turn reaches idle. */
@@ -155,10 +165,14 @@ export class VerifierHost {
     return this.proberState.instance
   }
 
-  constructor(private readonly ctx: HostContext, config: Config, options: { recordsFile?: string | null; feedbackTimeoutMs?: number; selectionsFile?: string | null; selectionsTesting?: ConstructorParameters<typeof SelectionHost>[0]['testing'] } = {}) {
+  constructor(private readonly ctx: HostContext, config: Config, options: { recordsFile?: string | null; feedbackTimeoutMs?: number; selectionsFile?: string | null; selectionsTesting?: ConstructorParameters<typeof SelectionHost>[0]['testing']; diagnostics?: Diagnostics } = {}) {
     // Own the mutable reference: settings callers and embedded consumers must
     // not be able to alter live behavior by retaining the constructor object.
     this.config = { ...config }
+    this.diagnostics = options.diagnostics ?? defaultDiagnostics
+    // A new warning is a state change the panel should see without waiting
+    // for its next poll. Counters do not notify: they are cheap and frequent.
+    this.unsubscribeDiagnostics = this.diagnostics.subscribe(() => { if (!this.disposed) this.emit() })
     this.recordsFile = options.recordsFile === undefined ? null : options.recordsFile
     this.feedbackTimeoutMs = Number.isFinite(options.feedbackTimeoutMs)
       ? Math.max(1, Math.floor(options.feedbackTimeoutMs as number))
@@ -186,6 +200,7 @@ export class VerifierHost {
       selectionsFile: options.selectionsFile === undefined ? null : options.selectionsFile,
       testing: options.selectionsTesting,
       notify: (record) => this.notifySelectionSettlement(record),
+      diagnostics: this.diagnostics,
     })
   }
 
@@ -230,10 +245,11 @@ export class VerifierHost {
     try {
       const catalogModels = await this.ctx.llm?.listModels(this.config.selectionProvider)
       if (catalogModels) availableModels = [...new Set([...preferredModels, ...catalogModels.map((model) => model.id)])]
-    } catch {
+    } catch (error) {
       // A provider catalog is discovery metadata, not an allowlist. Keep the
       // operator-supplied model IDs and let the real probe decide liveness.
       catalogAvailable = false
+      this.diagnostics.warn('autopilot.catalog', error, { provider: this.config.selectionProvider })
     }
     payload.signal.throwIfAborted()
     // Liveness before planning (ruling P-C): the catalog lists models that may
@@ -252,17 +268,24 @@ export class VerifierHost {
           const verdicts = await untilAborted(Promise.all(preferredModels.map((model) => prober.probe(model))), payload.signal)
           const alive = preferredModels.filter((_, index) => verdicts[index])
           const dead = preferredModels.filter((_, index) => !verdicts[index])
+          if (dead.length > 0) this.diagnostics.count('probe.dead', dead.length)
           if (alive.length > 0 || dead.length === 0) {
             const deadSet = new Set(dead)
             availableModels = [...alive, ...availableModels.filter((m) => !deadSet.has(m) && !alive.includes(m))]
             if (dead.length > 0 || !catalogAvailable) probeEvidence = Object.fromEntries(dead.map((m) => [m, false]).concat(alive.map((m) => [m, true])))
           } else if (dead.length > 0) {
             // All configured models are dead: never roll the whole pool onto a
-            // corpse or silently weaken the selection gates.
+            // corpse or silently weaken the selection gates. Skipping autopilot
+            // is the correct decision, and it must be a visible one.
+            this.diagnostics.warn('autopilot.pool_dead', 'every preferred candidate model failed the liveness probe; autopilot skipped this turn', { models: preferredModels.join(',') })
             return decision
           }
-        }
-      } catch { /* probing is advisory only when the provider key is unavailable */ }
+        } else this.diagnostics.count('probe.skipped_no_key')
+      } catch (error) {
+        // Probing is advisory: a missing key or a failing prober degrades to
+        // "unprobed", never to a blocked turn. A cancelled turn is not a fault.
+        if (!payload.signal.aborted) this.diagnostics.warn('autopilot.probe', error)
+      }
     }
     payload.signal.throwIfAborted()
     const plan = planAutopilotTask(task, availableModels, policy)
@@ -338,19 +361,21 @@ export class VerifierHost {
         void Promise.resolve(agent.followup(createUserMessage({
           source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
           content: [{ type: 'text', text: buildAutopilotRelay(record) }],
-        }))).catch(() => undefined)
-      }).catch(() => {
+        }))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId }))
+      }).catch((error: unknown) => {
         const current = this.autopilotActive.get(sourceId)
         current?.delete(selectionId as string)
         if (current && current.size === 0) this.autopilotActive.delete(sourceId)
         payload.signal.removeEventListener('abort', cancel)
+        this.diagnostics.warn('autopilot.wait', error, { selectionId })
       })
       return decision
-    } catch {
+    } catch (error) {
       // The selection admission itself is the only synchronous failure point.
       // Once admitted, its terminal outcome is handled by the background waiter.
       payload.signal.removeEventListener('abort', cancel)
       payload.signal.throwIfAborted()
+      this.diagnostics.warn('autopilot.admission', error, { sourceSessionId: String(agent.id) })
       return decision
     }
   }
@@ -436,8 +461,9 @@ export class VerifierHost {
                   note: verdict.note + (postAuditError ? ' [test runner error: ' + postAuditError + ']' : ''),
                 }
               }
-            } catch {
+            } catch (error) {
               rec.delivery = { audited: false, delivered: 'unknown', note: 'audit raised' }
+              this.diagnostics.warn('autopilot.audit', error, { selectionId })
             }
           }
           rec.timing = { ...(rec.timing ?? {}), auditedAt: Date.now() }
@@ -446,7 +472,10 @@ export class VerifierHost {
         const after = this.selections.getSelection(selectionId)
         const slotAfter = after ? (after.winner ?? after.fallback) : undefined
         if (removed || !slotAfter || slotAfter.discardedAt !== undefined) pending.delete(selectionId)
-      } catch { /* keep it queued for the next idle/dispose retry */ }
+      } catch (error) {
+        // Keep it queued for the next idle/dispose retry — visibly.
+        this.diagnostics.warn('autopilot.cleanup', error, { selectionId })
+      }
     }
     if (pending.size === 0) this.autopilotCleanup.delete(sourceSessionId)
   }
@@ -470,12 +499,13 @@ export class VerifierHost {
         + (record.margin !== undefined ? '（margin ' + record.margin.toFixed(4) + ' / 阈值 ' + (record.marginThreshold ?? 'n/a') + (record.marginProvisional ? '，临时' : '') + '）' : '')
         + '。loser/淘汰候选已回收（会话与工作区均已删除）。保留对象的工作区位于 ' + slot.workspace + '，面板里可"丢弃 winner"彻底清理。此消息为结算通知，无需回复。'
       : '[Selection 结算] ' + record.selectionId + ' 结束：status=' + record.status + (record.outcome ? '，outcome=' + record.outcome : '') + (record.error ? '（' + record.error + '）' : '') + '，候选已全部回收。此消息为结算通知，无需回复。'
+    const failed = (error: unknown): void => this.diagnostics.warn('selection.notice', error, { selectionId: record.selectionId })
     try {
       void Promise.resolve(agent.followup(createUserMessage({
         source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/selection', form: 'notice', summary: boundContextSummary('选择结算：' + record.selectionId) },
         content: [{ type: 'text', text }],
-      }))).catch(() => undefined)
-    } catch { /* notice failures are silent by design */ }
+      }))).catch(failed)
+    } catch (error) { failed(error) /* a notice never disturbs accounting; it is still reported */ }
   }
 
   start(): void {
@@ -513,16 +543,18 @@ export class VerifierHost {
       this.autopilotCleanup.set(sourceId, pending)
       record.timing = { ...(record.timing ?? {}), relayedAt: Date.now() }
       this.selections.pubRecord(record)
+      this.diagnostics.count('autopilot.relay_recovered')
       void Promise.resolve(agent.followup(createUserMessage({
         source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
         content: [{ type: 'text', text: buildAutopilotRelay(record) }],
-      }))).catch(() => undefined)
+      }))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId: record.selectionId, recovered: true }))
     }
   }
 
   async dispose(): Promise<void> {
     if (this.disposed) return
     this.disposed = true
+    this.unsubscribeDiagnostics()
     this.coordinator.dispose()
     for (const dispose of this.disposers.splice(0)) { try { dispose() } catch { /* isolated */ } }
     for (const unsubscribe of this.agentListeners.values()) { try { unsubscribe() } catch { /* isolated */ } }
@@ -561,7 +593,9 @@ export class VerifierHost {
    *  operations: listener exceptions are contained here. */
   private emit(): void {
     for (const listener of [...this.listeners]) {
-      try { listener() } catch { /* subscriber exceptions are isolated */ }
+      // Counted, never warned: a warning re-enters emit() through the
+      // diagnostics subscription, so a throwing listener would loop forever.
+      try { listener() } catch { this.diagnostics.count('host.subscriber_error') }
     }
   }
 
@@ -699,6 +733,7 @@ export class VerifierHost {
               else record.feedbackSent = true
             } catch (error) {
               record.feedbackError = error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240)
+              this.diagnostics.count('verifier.feedback_failed')
             }
           }
         }
@@ -730,12 +765,15 @@ export class VerifierHost {
   }
 
   snapshot(): StateResponse {
-    return { config: cleanConfig(this.config), agents: this.agents.size, records: this.records.slice(0, 20), selection: this.selections.snapshot() }
+    return { config: cleanConfig(this.config), agents: this.agents.size, records: this.records.slice(0, 20), selection: this.selections.snapshot(), diagnostics: this.diagnostics.snapshot() }
   }
+
+  /** The degradation ledger behind `/state`, for tests and embedded hosts. */
+  getDiagnostics(): Diagnostics { return this.diagnostics }
 
   private loadHistory(): void {
     if (!this.recordsFile) return
-    const loaded = loadPersistedRecords(this.recordsFile)
+    const loaded = loadPersistedRecords(this.recordsFile, this.diagnostics)
     if (loaded.length > 0) this.records.unshift(...loaded)
     this.records.splice(VERIFICATION_HISTORY_LIMIT)
   }
@@ -743,7 +781,7 @@ export class VerifierHost {
   private persist(record: RecordState): void {
     if (!this.recordsFile) return
     try { appendJsonlLedger(this.recordsFile, record) }
-    catch { /* observability must never break verification */ }
+    catch (error) { this.diagnostics.warn('records.append', error, { file: this.recordsFile, recordId: record.id }) }
   }
 
   /** Newest-first history view with optional filters for the /records endpoint. */

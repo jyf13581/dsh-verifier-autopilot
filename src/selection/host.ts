@@ -33,6 +33,7 @@ import { IsolatedWorkspaceManager, gitDiffStat, gitDiffFull, gitRepoState, makeL
 import type { TrajectoryEvent } from './trajectory.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
 import { appendJsonlLedger, atomicWriteFile, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from '../ledger.js'
+import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 import type { SelectionSnapshot, SelectionStartRequest } from '../protocol.js'
 
 export interface SelectionsAgentProvider {
@@ -89,6 +90,9 @@ export interface SelectionHostDeps {
    *  session (the operator keeps chatting there; without this the result is
    *  invisible outside the GUI panel). Best-effort; exceptions are contained. */
   notify?: (record: SelectionRecord) => void
+  /** Degradation sink shared with the runner and the sidecar bridge; the
+   *  process default when omitted. */
+  diagnostics?: Diagnostics
   /** Deterministic overrides for tests: bypass live factory/workspace/bridge. */
   testing?: {
     factory?: CandidateFactory
@@ -385,6 +389,7 @@ function safeCriteria(input: unknown): BridgeSelectRequest['criteria'] {
 
 export class SelectionHost {
   private readonly deps: SelectionHostDeps
+  private readonly diagnostics: Diagnostics
   private readonly now: () => number
   private readonly selections: SelectionRecord[] = []
   private active: { selectionId: string; controller: AbortController; run: Promise<void> | null } | null = null
@@ -403,6 +408,7 @@ export class SelectionHost {
   constructor(deps: SelectionHostDeps) {
     this.deps = deps
     this.now = deps.now ?? Date.now
+    this.diagnostics = deps.diagnostics ?? defaultDiagnostics
     this.selectionsFile = deps.selectionsFile === undefined ? null : deps.selectionsFile
     if (this.selectionsFile) this.loadSelections(this.selectionsFile)
   }
@@ -414,7 +420,10 @@ export class SelectionHost {
 
   private emit(): void {
     for (const listener of [...this.listeners]) {
-      try { listener() } catch { /* subscriber exceptions are isolated */ }
+      // Counted, not warned: a warning would notify the diagnostics
+      // subscribers, which re-enter emit() — a throwing listener must not
+      // become an infinite loop.
+      try { listener() } catch { this.diagnostics.count('selections.subscriber_error') }
     }
   }
 
@@ -435,6 +444,7 @@ export class SelectionHost {
       this.bridgeSingleton = new VerifierBridge({
         pythonPath: this.deps.pythonPath ?? defaultPythonPath(),
         scriptPath: this.deps.sidecarPath ?? defaultSidecarPath(),
+        diagnostics: this.diagnostics,
       })
     }
     return this.bridgeSingleton
@@ -468,6 +478,7 @@ export class SelectionHost {
       // but valid relay must not be rejected by a separate hard-coded deadline.
       maxAttempts: 2,
       now: this.now,
+      onRetry: (error, attempt) => this.diagnostics.warn('verifier.preflight_retry', error, { attempt, model: v.model }),
     })
     this.preflightOk.add(tuple)
   }
@@ -570,6 +581,7 @@ export class SelectionHost {
       diffFull: this.deps.testing?.diffFull ?? gitDiffFull,
       sleep: testing.retrySleep,
       now: this.now,
+      diagnostics: this.diagnostics,
     })
     // F5/I.5 — capture the EFFECTIVE configuration at start: later
     // build/reload/POST /config drift must never rewrite what actually ran.
@@ -598,7 +610,7 @@ export class SelectionHost {
     let sourceHeadAtStart: string | null = null
     let sourceModel: string | null = null
     if (sourceCwd && body.trigger === 'autopilot') {
-      try { sourceHeadAtStart = (await gitRepoState(sourceCwd))?.head ?? null } catch { sourceHeadAtStart = null }
+      try { sourceHeadAtStart = (await gitRepoState(sourceCwd))?.head ?? null } catch (error) { sourceHeadAtStart = null; this.diagnostics.warn('source.head', error, { sourceCwd }) }
     }
     try {
       const header = parent?.session.header as { model?: string } | undefined
@@ -701,7 +713,10 @@ export class SelectionHost {
     if (retained) {
       if (record.trigger === 'autopilot') this.winners.set(record.selectionId, retained.handle)
       else {
-        try { await retained.handle.dispose() } catch { this.winners.set(record.selectionId, retained.handle) }
+        try { await retained.handle.dispose() } catch (error) {
+          this.winners.set(record.selectionId, retained.handle)
+          this.diagnostics.warn('winner.dispose', error, { selectionId: record.selectionId })
+        }
       }
     }
     if (this.active?.selectionId === record.selectionId) this.active = null
@@ -709,7 +724,7 @@ export class SelectionHost {
     this.writeArtifact(record, artifacts)
     this.emit()
     if (record.trigger !== 'autopilot' && this.deps.notify) {
-      try { this.deps.notify(record) } catch { /* notices must never disturb accounting */ }
+      try { this.deps.notify(record) } catch (error) { this.diagnostics.warn('selection.notify', error, { selectionId: record.selectionId }) }
     }
   }
 
@@ -817,15 +832,23 @@ export class SelectionHost {
 
   private loadSelections(file: string): void {
     try {
+      let skippedRows = 0
       const loaded = readJsonlLedger(file, {
         limit: SELECTIONS_HISTORY_LIMIT,
         validate: isSelectionRecord,
         idOf: record => record.selectionId,
         normalize: normalizeLoadedSelection,
+        onSkippedRow: () => { skippedRows += 1 },
       })
-      if (ledgerExceeds(file, SELECTIONS_FILE_MAX_BYTES)) compactJsonlLedger(file, loaded)
+      // One entry per load, not one per row: a large torn ledger must not
+      // flush the whole diagnostics window with its own corruption.
+      if (skippedRows > 0) this.diagnostics.warn('selections.corrupt_rows', skippedRows + ' unreadable row(s) skipped while loading the selection ledger', { file, rows: skippedRows })
+      if (ledgerExceeds(file, SELECTIONS_FILE_MAX_BYTES)) {
+        this.diagnostics.count('selections.compact')
+        compactJsonlLedger(file, loaded)
+      }
       this.selections.push(...loaded)
-    } catch { /* observability must never break selection */ }
+    } catch (error) { this.diagnostics.warn('selections.load', error, { file }) }
   }
 
   /** Persist a settled record again after an out-of-band mutation (relay
@@ -843,11 +866,12 @@ export class SelectionHost {
     if (!file) return
     try {
       if (ledgerExceeds(file, SELECTIONS_FILE_MAX_BYTES)) {
+        this.diagnostics.count('selections.compact')
         compactJsonlLedger(file, this.selections.slice(0, SELECTIONS_HISTORY_LIMIT))
         return
       }
       appendJsonlLedger(file, record)
-    } catch { /* observability must never break selection */ }
+    } catch (error) { this.diagnostics.warn('selections.append', error, { file, selectionId: record.selectionId }) }
   }
 
   /** Audit pack (ruling I.5/G, F6): one directory per selection, written at
@@ -883,7 +907,7 @@ export class SelectionHost {
           }
         }
       }
-    } catch { /* audit persistence is observability, never fatal */ }
+    } catch (error) { this.diagnostics.warn('artifact.write', error, { selectionId: record.selectionId }) }
   }
 
   async dispose(): Promise<void> {
@@ -898,10 +922,10 @@ export class SelectionHost {
     // so a discard that is mid-flight when the host goes down cannot dispose
     // the same handle twice or observe a half-removed worktree.
     await Promise.all([...this.winners.keys()].map(async (id) => {
-      try { await this.serializeWinnerOp(id, () => this.releaseWinnerNow(id)) } catch { /* isolated for shutdown */ }
+      try { await this.serializeWinnerOp(id, () => this.releaseWinnerNow(id)) } catch (error) { this.diagnostics.warn('winner.release', error, { selectionId: id, phase: 'dispose' }) }
     }))
     if (this.bridgeSingleton) {
-      try { await this.bridgeSingleton.dispose() } catch { /* isolated */ }
+      try { await this.bridgeSingleton.dispose() } catch (error) { this.diagnostics.warn('sidecar.dispose', error) }
       this.bridgeSingleton = null
     }
     this.listeners.clear()

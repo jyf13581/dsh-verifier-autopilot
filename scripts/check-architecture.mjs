@@ -91,6 +91,9 @@ for (const edge of edges.values()) {
   if (from === 'src/protocol.ts' && edge.runtime && to !== 'src/constants.ts') {
     reject('the browser-safe protocol may only import the dependency-free constants module at runtime')
   }
+  if (from === 'src/diagnostics.ts' && !['src/util.ts', 'src/constants.ts'].includes(to)) {
+    reject('the diagnostics sink is a leaf: every layer reports into it, so it may import only util/constants')
+  }
   if (from === 'src/config.ts' && isSelection(edge.to)) {
     reject('configuration owns policy types and may not depend on selection implementation')
   }

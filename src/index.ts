@@ -22,6 +22,8 @@ export {
 } from './evidence.js'
 export type { EvidenceKind, EventRecord, FindingCitationAudit, TurnClassification, TurnKind, TurnShape } from './evidence.js'
 export { LEDGER_VERSION, atomicWriteFile, appendJsonlLedger, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from './ledger.js'
+export { DIAGNOSTICS_LIMIT, DIAGNOSTICS_SCOPE_SHARE, Diagnostics, describeCause, diagnostics } from './diagnostics.js'
+export type { DiagnosticDetail, DiagnosticEntry, DiagnosticsSnapshot } from './diagnostics.js'
 export { API_RATE_LIMITS, apiRoutes, createRateLimiter, json, readJson } from './api.js'
 export { API_PREFIX, MODEL_OPTIONS, SETTINGS_NAMESPACE_ID } from './protocol.js'
 export type { ApiErrorResponse, ConfigRequest, ConfigResponse, ModelOption, SelectionActionResponse, SelectionIdRequest, SelectionItemResponse, SelectionReleaseResponse, SelectionSnapshot, SelectionStartRequest, SelectionStartResponse, SelectionView, SelectionsListResponse, State, StateResponse, VerificationRecord, VerifyRequest, VerifyResponse, WebRequest, WebResponse } from './protocol.js'

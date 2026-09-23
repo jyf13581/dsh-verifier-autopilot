@@ -9,6 +9,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 
 export type BridgeErrorCode =
   | 'bad_frame' | 'invalid_request' | 'missing_api_key' | 'client_init'
@@ -95,6 +96,8 @@ export interface VerifierBridgeOptions {
   shutdownGraceMs?: number
   /** Cap on retained stderr diagnostics (chars). */
   stderrBufferChars?: number
+  /** Degradation sink (sidecar exits, timeouts, protocol faults). */
+  diagnostics?: Diagnostics
 }
 
 interface Pending {
@@ -147,6 +150,8 @@ export class VerifierBridge {
   private pending = new Map<string, Pending>()
   private disposed = false
   private spawnKey: { name: string; value: string } | null = null
+  private spawnedOnce = false
+  private readonly diagnostics: Diagnostics
 
   constructor(options: VerifierBridgeOptions) {
     this.pythonPath = options.pythonPath
@@ -155,6 +160,7 @@ export class VerifierBridge {
     this.defaultTimeoutMs = options.defaultTimeoutMs ?? 120000
     this.shutdownGraceMs = options.shutdownGraceMs ?? 5000
     this.stderrCap = options.stderrBufferChars ?? 2048
+    this.diagnostics = options.diagnostics ?? defaultDiagnostics
   }
 
   get alive(): boolean { return this.child !== null && !this.child.killed }
@@ -174,6 +180,10 @@ export class VerifierBridge {
     if (needRespawn) this.teardownChild(new BridgeError('bridge_down', 'api key changed: respawning sidecar', true))
     const env: NodeJS.ProcessEnv = { ...process.env, ...this.extraEnv }
     if (envKey) env[envKey.name] = envKey.value
+    // First spawn vs. every later one (crash, timeout kill, key change): a
+    // climbing respawn counter is the cheapest "the sidecar keeps dying" signal.
+    this.diagnostics.count(this.spawnedOnce ? 'sidecar.respawn' : 'sidecar.spawn')
+    this.spawnedOnce = true
     const child = spawn(this.pythonPath, [this.scriptPath], { env, windowsHide: true })
     this.spawnKey = envKey ?? null
     this.child = child
@@ -185,12 +195,18 @@ export class VerifierBridge {
     // pending queue of its already-respawned successor.
     child.on('error', (err) => {
       if (this.child !== child) return
-      this.onChildGone(new BridgeError('bridge_down', 'spawn failed: ' + err.message, true))
+      const failure = new BridgeError('bridge_down', 'spawn failed: ' + err.message, true)
+      this.diagnostics.warn('sidecar.spawn', failure, { python: this.pythonPath })
+      this.onChildGone(failure)
     })
     child.on('exit', (code, signal) => {
       if (this.child !== child) return
+      // Only an exit the bridge did not ask for is a degradation: dispose()
+      // and teardownChild() detach the child before it goes away.
       const why = 'sidecar exited code=' + String(code) + ' signal=' + String(signal)
-      this.onChildGone(new BridgeError('bridge_down', why + this.stderrSuffix(), false))
+      const failure = new BridgeError('bridge_down', why + this.stderrSuffix(), false)
+      if (!this.disposed) this.diagnostics.warn('sidecar.exit', failure, { pending: this.pending.size })
+      this.onChildGone(failure)
     })
     return Promise.resolve()
   }
@@ -213,14 +229,18 @@ export class VerifierBridge {
       try {
         frame = JSON.parse(line) as Record<string, unknown>
       } catch {
-        this.teardownChild(new BridgeError('bridge_protocol', 'sidecar emitted non-JSON line' + this.stderrSuffix(), false))
+        const failure = new BridgeError('bridge_protocol', 'sidecar emitted non-JSON line' + this.stderrSuffix(), false)
+        this.diagnostics.warn('sidecar.protocol', failure)
+        this.teardownChild(failure)
         return
       }
       const id = typeof frame.id === 'string' ? frame.id : null
       if (id === null) {
         // bad_frame from the sidecar means OUR last frame was malformed;
         // the serial pipe cannot identify which request failed.
-        this.teardownChild(new BridgeError('bridge_protocol', 'sidecar reported bad_frame' + this.stderrSuffix(), false))
+        const failure = new BridgeError('bridge_protocol', 'sidecar reported bad_frame' + this.stderrSuffix(), false)
+        this.diagnostics.warn('sidecar.protocol', failure)
+        this.teardownChild(failure)
         return
       }
       const entry = this.pending.get(id)
@@ -259,11 +279,15 @@ export class VerifierBridge {
       const timer = setTimeout(() => {
         const err = new BridgeError('bridge_timeout', 'sidecar request ' + id + ' exceeded ' + options.timeoutMs + 'ms' + this.stderrSuffix(), true)
         this.pending.delete(id)
+        // The request id is deliberately left out of the diagnostic message so
+        // repeated timeouts coalesce into one counted entry.
+        this.diagnostics.warn('sidecar.timeout', 'sidecar ' + String(frame.type) + ' request exceeded ' + options.timeoutMs + 'ms' + this.stderrSuffix(), { type: String(frame.type) })
         this.teardownChild(err)
         settle(err)
       }, options.timeoutMs)
       const onAbort = () => {
         const err = new BridgeError('bridge_aborted', 'sidecar request ' + id + ' aborted by caller', false)
+        this.diagnostics.count('sidecar.abort')
         this.pending.delete(id)
         // The sidecar is serial: an aborted in-flight request would still
         // produce a response. Kill the child to keep id routing sound.

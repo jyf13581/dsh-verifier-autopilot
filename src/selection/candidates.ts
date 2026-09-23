@@ -15,6 +15,7 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 import { rmdir } from 'node:fs/promises'
 import path from 'node:path'
 import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
@@ -236,6 +237,9 @@ export interface SelectionRunnerDeps {
   /** Test seam for bounded verifier backoff; production uses abort-aware timers. */
   sleep?: RetrySleep
   now?: () => number
+  /** Degradation sink for best-effort paths (loser cleanup, evidence
+   *  capture, progress sampling, ranking retries). Process default if omitted. */
+  diagnostics?: Diagnostics
 }
 
 export interface SelectionRunInput {
@@ -441,7 +445,8 @@ export class SelectionRunner {
       candidates: [],
       verifierModel: input.verifier.model,
     }
-    const publish = () => { try { input.onUpdate?.(record) } catch { /* observers never own the run */ } }
+    const diag = this.deps.diagnostics ?? defaultDiagnostics
+    const publish = () => { try { input.onUpdate?.(record) } catch { diag.count('selection.observer_error') } }
     publish()
     const handles: Array<SelectionAgentHandle | null> = new Array(n).fill(null)
     const trajectories: Array<string | null> = new Array(n).fill(null)
@@ -473,16 +478,19 @@ export class SelectionRunner {
       progressChain = progressChain.then(run, run)
     }
 
+    // Loser cleanup is best-effort by contract (a leaked worktree must never
+    // fail a settled selection) but not silent: every leaked resource is a
+    // diagnostic the operator can act on.
     const disposeLoser = async (i: number) => {
       const h = handles[i]
-      if (h) { try { await h.dispose() } catch { /* loser cleanup best-effort */ } }
+      if (h) { try { await h.dispose() } catch (error) { diag.warn('loser.dispose', error, { selectionId: record.selectionId, candidate: i }) } }
       const ws = record.candidates[i]?.workspace
       if (ws) {
-        try { await this.deps.workspaces.remove(ws) } catch { /* best-effort */ }
+        try { await this.deps.workspaces.remove(ws) } catch (error) { diag.warn('loser.workspace', error, { selectionId: record.selectionId, candidate: i, workspace: ws }) }
         // Dispose BEFORE purge: the agent may still flush its journal at
         // disposal time; purging first would race a late write into re-creating
         // the directory.
-        try { await this.deps.workspaces.purgeSessionRecord?.(ws) } catch { /* best-effort */ }
+        try { await this.deps.workspaces.purgeSessionRecord?.(ws) } catch (error) { diag.warn('loser.session', error, { selectionId: record.selectionId, candidate: i }) }
       }
     }
 
@@ -606,7 +614,15 @@ export class SelectionRunner {
                   })
                   score = r.score
                 }
-              } catch { score = null }
+              } catch (error) {
+                score = null
+                diag.count('progress.sample_failed')
+                // A run abort is the caller's decision, not a degradation. The
+                // bridge already recorded the per-request detail (timeout text,
+                // stderr tail); here the stable code keeps one entry per outage
+                // instead of one per tick.
+                if (!input.signal?.aborted) diag.warn('progress.sample', error instanceof BridgeError ? 'sidecar ' + error.code : error, { selectionId: record.selectionId })
+              }
               if (score !== null) {
                 pgLastScore = score
                 ;(cand.progress ??= []).push({ at: this.now(), score })
@@ -699,17 +715,17 @@ export class SelectionRunner {
           cand.execToolCalls = r.execToolCalls
           cand.trajectoryChars = r.totalChars
           trajectories[cand.index] = r.text
-        } catch { /* render is observability, never fatal */ }
+        } catch (error) { diag.warn('evidence.render', error, { selectionId: record.selectionId, candidate: cand.index }) }
         // Objective diff evidence (ruling I.5): the workspace's git surface is
         // the has-work gate's primary trust anchor. Best-effort; a non-git
         // workspace yields null and the gate falls back to tool calls.
         if (this.deps.diffStat) {
-          try { cand.diffStat = await this.deps.diffStat(cand.workspace) } catch { cand.diffStat = null }
+          try { cand.diffStat = await this.deps.diffStat(cand.workspace) } catch (error) { cand.diffStat = null; diag.warn('evidence.diffstat', error, { selectionId: record.selectionId, candidate: cand.index }) }
         }
         // Full patch capture for the artifact pack — BEFORE any cleanup could
         // delete the worktree (loser disposal runs later).
         if (this.deps.diffFull) {
-          try { diffPatches[cand.index] = await this.deps.diffFull(cand.workspace) } catch { diffPatches[cand.index] = null }
+          try { diffPatches[cand.index] = await this.deps.diffFull(cand.workspace) } catch (error) { diffPatches[cand.index] = null; diag.warn('evidence.diff', error, { selectionId: record.selectionId, candidate: cand.index }) }
         }
         publish()
       }))
@@ -841,9 +857,10 @@ export class SelectionRunner {
                 maxAttempts: 2,
                 now,
                 onAttempt: (attempt) => { record.rankingAttempts = attempt; publish() },
-                onRetry: (error) => {
+                onRetry: (error, attempt) => {
                   const errors = record.rankingRetryErrors ?? (record.rankingRetryErrors = [])
                   errors.push(error.message.slice(0, 300))
+                  diag.warn('verifier.ranking_retry', error, { selectionId: record.selectionId, attempt })
                   publish()
                 },
               })
@@ -853,6 +870,7 @@ export class SelectionRunner {
               // their eligibility honestly instead of dropping to failed.
               if (!survivors.every((c) => c.objectiveEvidence === 'pass')) throw bridgeFailure
               record.outcome = 'verifier_unavailable'
+              diag.warn('verifier.unavailable', bridgeFailure, { selectionId: record.selectionId })
               record.note = 'ranking failed after retries: ' + errText(bridgeFailure)
               const passCounts = survivors.map((c) => (c.checks ?? []).filter((x) => x.ok).length)
               if (new Set(passCounts).size === passCounts.length) {
