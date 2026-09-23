@@ -257,8 +257,8 @@ the selection host. A disposed Host cannot be restarted. Selection disposal
 must terminate sidecars, candidates, retained handles, and isolated workspaces. API disconnects and configured timeouts should flow
 through existing abort signals instead of creating detached promises.
 
-Three concurrency invariants are pinned by regression tests and must survive
-future refactors:
+Five concurrency and evidence invariants are pinned by regression tests and
+must survive future refactors:
 
 1. **Admission claims are atomic.** In `SelectionHost.start()` everything that
    can throw or await (validation, credential resolution, factory/runner
@@ -276,6 +276,16 @@ future refactors:
    arrive mid-pass request exactly one follow-up pass instead of a concurrent
    one, so the post-audit (including the configured test command in the user's
    repository) never executes twice for the same retained slot.
+4. **Progress samples are serialized per run.** The sidecar is one serial
+   pipe, so `SelectionRunner` feeds progressGuard samples through a run-scoped
+   FIFO with at most one pending sample per candidate: never more than one
+   `progress` frame is in flight, a slow verifier cannot push the tail frame
+   past the bridge timeout (which would tear the sidecar down for everyone),
+   and every live candidate is still sampled in turn.
+5. **Evidence capture never mutates the evidence.** `gitDiffFull` records its
+   intent-to-add entries in a scratch `GIT_INDEX_FILE` copy; the candidate's
+   real index, `git status`, and the retained winner's worktree stay exactly as
+   the candidate left them.
 
 A runner must also treat an already-aborted signal as an abort *before* it
 provisions anything: `abort` events do not replay, and a selection started

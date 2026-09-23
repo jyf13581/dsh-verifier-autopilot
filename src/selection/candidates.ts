@@ -455,6 +455,24 @@ export class SelectionRunner {
     const onAbort = () => { aborted = true }
     input.signal?.addEventListener('abort', onAbort, { once: true })
 
+    // Run-scoped serial progress sampler. The sidecar is one serial pipe: N
+    // candidates ticking together used to push N progress frames into it at
+    // once, so with a slow verifier the tail frame could outlive the bridge
+    // timeout and tear the whole sidecar down. Samples now run one at a time
+    // in FIFO order with at most one queued sample per candidate; a tick that
+    // finds its own sample still pending is skipped (a sample is a best-effort
+    // observation, not a scheduled obligation).
+    let progressChain: Promise<void> = Promise.resolve()
+    const progressPending = new Set<number>()
+    const enqueueProgressSample = (index: number, sample: () => Promise<void>): void => {
+      if (progressPending.has(index)) return
+      progressPending.add(index)
+      const run = async () => {
+        try { await sample() } catch { /* sampling never owns the run */ } finally { progressPending.delete(index) }
+      }
+      progressChain = progressChain.then(run, run)
+    }
+
     const disposeLoser = async (i: number) => {
       const h = handles[i]
       if (h) { try { await h.dispose() } catch { /* loser cleanup best-effort */ } }
@@ -563,7 +581,10 @@ export class SelectionRunner {
           let lastEvidence = -1
           const evidenceCount = () => agent.session.events.filter((ev) => ev.type === 'tool/result').length
           monitor = setInterval(() => {
-            void (async () => {
+            if (pgCancelled || cand.status !== 'running') return
+            enqueueProgressSample(cand.index, async () => {
+              // Re-check after the queue wait: the candidate may have settled
+              // (or the run aborted) while another candidate's sample ran.
               if (pgCancelled || cand.status !== 'running') return
               samples += 1
               const evidence = evidenceCount()
@@ -580,6 +601,8 @@ export class SelectionRunner {
                     apiKeyEnv: input.verifier.apiKeyEnv,
                     effort: input.verifier.effort,
                     nEvaluations: 1,
+                    // A run abort must not leave a sample occupying the pipe.
+                    signal: input.signal,
                   })
                   score = r.score
                 }
@@ -602,7 +625,7 @@ export class SelectionRunner {
                 clearInterval(monitor)
                 monitor = null
               }
-            })()
+            })
           }, interval)
         }
         try {

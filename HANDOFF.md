@@ -220,7 +220,7 @@
 - **2026-09-05 修复**：候选工作区若位于"宿主外壳 git 仓库"内部（本插件托管 `D:/tools/dsh-plugins/dsh-verifier-autopilot` 自带 .git），`git rev-parse --show-toplevel` 会把普通候选目录冒名成外层仓库 worktree，discoverLease 以 workspace-path-outside-managed-root 炸开整个 remove()/discard 路径。现为：toplevel 落在管理根之外即认定"非 worktree"，按普通目录 rm；回归测试为 `workspace manager: a foreign git repo above the managed root must not hijack lease discovery`。
 - **2026-09-08 起 relay 按 outcome 区分文案**：ranked_winner 才带原 finalizer 契约；single_candidate_fallback 明示「未经候选间比较」；objective_only_result 明示「仅客观检查排序」；abstain/insufficient_evidence/verifier_unavailable 不附 finalizer 契约、double-finalist 等同权证据或明确叫停。想冒充选优的措辞不存在了。
 - **审计包**：`finishRun` 与 `discardWinner` 都在清理工作区**之前**把 `.data/selection-artifacts/{selectionId}.json` 落盘（race：先写盘后回收）。内含起跑有效配置快照（含 candidateOptions 实际值、verifier/model/effort/baseURL host、taskKind、checks 名）、sourceModel、sourceHeadAtStart、margin/threshold/condition、outcome/winnerBasis、noSearchSpace/llmOnly/checksUnreliable 标志、finalists 摘录；discard 时重写以追加 discardedAt 与 delivery。manual 与历史 record 无此包，但保留历史文件字段兼容。
-- **审计包 v2（2026-09-10，G/F6 补齐）**：一个 `SelectionRunResult.artifacts` 在 runner 内部于 loser dispose **之前**捕获；落为目录 `.data/selection-artifacts/{id}/`：`record.json` + `traces/c{i}.txt`（候选渲染轨迹全文）+ `diffs/c{i}.patch`（`git add -N . && git diff HEAD` 的全量 patch、含 untracked 清单、256KB 截断标记）。同一条写旧的 `{id}.json` 平面文件已废弃；`writeArtifact` 的 settle-vs-discard 两阶段不变。
+- **审计包 v2（2026-09-10，G/F6 补齐）**：一个 `SelectionRunResult.artifacts` 在 runner 内部于 loser dispose **之前**捕获；落为目录 `.data/selection-artifacts/{id}/`：`record.json` + `traces/c{i}.txt`（候选渲染轨迹全文）+ `diffs/c{i}.patch`（`git add -N . && git diff HEAD` 的全量 patch、含 untracked 清单、256KB 截断标记；intent-to-add 写在临时 `GIT_INDEX_FILE` 副本里，候选真实 index 不被改动）。同一条写旧的 `{id}.json` 平面文件已废弃；`writeArtifact` 的 settle-vs-discard 两阶段不变。
 - **source 后置审计（G-4）**：autopilot winner/fallback 在 source idle/detach/dispose 前的 cleanupAutopilotWinners 里做 HEAD-before/after + 工作区脏读数，写入 `delivery`，`delivered` 三值：观察到集成证据但测试未运行 → `unknown`；审计执行且无变化 → `no`；未执行 → `unknown`。插件不擅自跑用户的测试。
 - manual 历史工件没有自动 artifact GC；autopilot 当前路径有 source-idle cleanup。不要把两者写成统一生命周期。
 
@@ -272,7 +272,7 @@ API prefix：/@dsh-external/dsh-verifier-autopilot/api
 | selection workspace | .data/selection-workspaces |
 | selection ledger | .data/selections.jsonl |
 | legacy ledger | .data/records.jsonl |
-| Python | D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe |
+| Python | `DSH_VA_PYTHON` 优先；未设置时若 D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe 存在则用它，否则回退 PATH 上的 `python`（win32）/`python3` |
 
 provider 注意事项：candidateOptions 必须能补成完整 provider+model；半路由或未知模型 fail-fast（catalog 不再是 allowlist——2026-09-13/16 改造后 `availableModels = preferred ∪ catalog`，不在 `/models` 里的 operator 自定义 ID 也会被直接探活，由探活决定去留）。selectionModels 是按质量排序的优先列表。quality-first 会把全部 N 个候选压到探活后的第一名可用模型；exploration 才会轮换已有模型。因此 standard N=2 出现两个同模型候选是默认行为，不是记录错误。
 

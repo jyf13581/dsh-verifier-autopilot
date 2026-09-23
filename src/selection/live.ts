@@ -9,7 +9,7 @@
 
 import { cp, lstat, mkdir, readlink, rm, rmdir } from 'node:fs/promises'
 import { statSync } from 'node:fs'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
@@ -497,10 +497,10 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
 
 /** Larger-output variant of exec() for evidence collection (numstat / status
  *  listings legitimately exceed the 2000-char diagnostic tail). */
-function execWide(cmd: string, args: string[], cwd?: string, timeoutMs = 30000, cap = 262144): Promise<{ code: number; out: string }> {
+function execWide(cmd: string, args: string[], cwd?: string, timeoutMs = 30000, cap = 262144, env?: NodeJS.ProcessEnv): Promise<{ code: number; out: string }> {
   return new Promise((resolve) => {
     let out = ''
-    const child = spawn(cmd, args, { cwd, windowsHide: true })
+    const child = spawn(cmd, args, { cwd, windowsHide: true, ...(env ? { env } : {}) })
     const take = (b: Buffer | string) => { out = (out + String(b)).slice(0, cap) }
     child.stdout?.on('data', take)
     child.stderr?.on('data', take)
@@ -563,7 +563,9 @@ export async function gitDiffStat(cwd: string): Promise<DiffStatLite | null> {
 
 export interface DiffFull {
   /** git diff HEAD patch text, capped; untracked new files are included via
-   *  `git add -N` intent-to-add (safe: runs in a disposable worktree). */
+   *  `git add -N` intent-to-add recorded in a THROWAWAY copy of the index, so
+   *  the candidate's real index is never touched (the retained winner's
+   *  worktree is handed to the finalizer exactly as the candidate left it). */
   patch: string
   truncated: boolean
   /** Untracked (non-ignored) file names — the typical brand-new deliverable. */
@@ -573,17 +575,29 @@ export interface DiffFull {
 /** Full diff evidence for the audit pack (ruling I.5): what the candidate
  *  actually changed, captured BEFORE the workspace can be reclaimed. */
 export async function gitDiffFull(cwd: string, patchCap = 262144): Promise<DiffFull | null> {
+  let scratchIndex: string | undefined
   try {
     const head = await execWide('git', ['-C', cwd, 'rev-parse', '--verify', 'HEAD'], cwd)
     if (head.code !== 0) return null
-    await execWide('git', ['-C', cwd, 'add', '-N', '.'], cwd)
-    const diff = await execWide('git', ['-C', cwd, 'diff', 'HEAD', '--', '.'], cwd, 30000, patchCap)
+    // Evidence collection must not mutate the evidence: stage intent-to-add
+    // entries into a private copy of the index (GIT_INDEX_FILE) so untracked
+    // files show up in the patch while `git status`/`git diff --cached` in the
+    // candidate worktree stay exactly as the candidate left them.
+    const indexPath = await execWide('git', ['-C', cwd, 'rev-parse', '--git-path', 'index'], cwd)
+    if (indexPath.code !== 0 || !indexPath.out.trim()) return null
+    scratchIndex = path.join(os.tmpdir(), 'dsh-va-index-' + randomUUID())
+    try { await cp(path.resolve(cwd, indexPath.out.trim()), scratchIndex) } catch { /* no index yet: git starts from an empty one */ }
+    const scratchEnv = { ...process.env, GIT_INDEX_FILE: scratchIndex }
+    await execWide('git', ['-C', cwd, 'add', '-N', '.'], cwd, 30000, 262144, scratchEnv)
+    const diff = await execWide('git', ['-C', cwd, 'diff', 'HEAD', '--', '.'], cwd, 30000, patchCap, scratchEnv)
     if (diff.code !== 0) return null
     const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard'], cwd)
     const untrackedFiles = others.code === 0 ? others.out.split(/\r?\n/).filter(Boolean) : []
     return { patch: diff.out, truncated: diff.out.length >= patchCap, untrackedFiles }
   } catch {
     return null
+  } finally {
+    if (scratchIndex) await rm(scratchIndex, { force: true }).catch(() => undefined)
   }
 }
 

@@ -14,7 +14,7 @@
  */
 
 import path from 'node:path'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { VerifierBridge, type BridgeSelectRequest, type BridgeSelectResult } from './bridge.js'
@@ -189,8 +189,18 @@ export function defaultSidecarPath(): string {
   return path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'bridge', 'llm_verifier_sidecar.py')
 }
 
+/** Operator venv documented in HANDOFF §4 (bridge dependencies live there on
+ *  the production Windows host). It is only used when it actually exists. */
+const OPERATOR_BRIDGE_VENV_PYTHON = 'D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe'
+
+/** Sidecar interpreter resolution: explicit `DSH_VA_PYTHON` wins; otherwise the
+ *  documented operator venv when present; otherwise the PATH interpreter, so a
+ *  fresh checkout (CI, another machine) gets a truthful `bridge_unavailable`
+ *  health verdict instead of ENOENT on a drive letter that does not exist. */
 export function defaultPythonPath(): string {
-  return process.env.DSH_VA_PYTHON || 'D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe'
+  if (process.env.DSH_VA_PYTHON) return process.env.DSH_VA_PYTHON
+  if (existsSync(OPERATOR_BRIDGE_VENV_PYTHON)) return OPERATOR_BRIDGE_VENV_PYTHON
+  return process.platform === 'win32' ? 'python' : 'python3'
 }
 
 export function defaultWorkspaceRoot(): string {

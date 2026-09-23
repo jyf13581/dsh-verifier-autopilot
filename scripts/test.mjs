@@ -4584,3 +4584,84 @@ test("api: selection lifecycle routes answer 400 for non-object bodies and a red
     assert.ok(!body.error.includes("sk-abcdefghijklmnopqrstuvwxyz0123"), "secrets never leave through the error channel")
   } finally { await host.selections.dispose() }
 })
+
+// ---------- evidence + sidecar hygiene: serialized progress samples, non-mutating diff capture, portable interpreter ----------
+
+test("selrunner: progress samples are serialized per run (one frame in the pipe at a time, every candidate still sampled)", async () => {
+  const factory = makeFakeFactory({ scripts: { 0: { hang: true, partial: true }, 1: { hang: true, partial: true }, 2: { hang: true, partial: true } } })
+  const bridge = fakeBridge()
+  bridge.progressCalls = []
+  let inFlight = 0
+  let maxInFlight = 0
+  bridge.progress = async (req) => {
+    bridge.progressCalls.push(req)
+    inFlight += 1
+    maxInFlight = Math.max(maxInFlight, inFlight)
+    await new Promise((r) => setTimeout(r, 40))
+    inFlight -= 1
+    return { score: 0.95, usage: { calls: 1, input_tokens: 1, cached_input_tokens: 0, uncached_input_tokens: 1, output_tokens: 1, reasoning_tokens: 0, cache_hit_rate: 0 } }
+  }
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  const controller = new AbortController()
+  const running = runner.run(selInput({ signal: controller.signal, progressGuard: { intervalMs: 10, minScore: 0.5, graceChecks: 2, maxChecks: 50 } }))
+  await waitFor(() => bridge.progressCalls.length >= 3)
+  controller.abort()
+  const { record } = await running
+  assert.equal(record.status, "aborted")
+  assert.equal(maxInFlight, 1, "the sidecar is a serial pipe: never more than one progress frame in flight (saw " + maxInFlight + ")")
+  const sampled = new Set(bridge.progressCalls.map((req) => (/candidate (\d+)/.exec(req.steps.join(" ")) ?? [])[1]))
+  assert.deepEqual([...sampled].sort(), ["0", "1", "2"], "serialization never starves a candidate")
+})
+
+test("live: gitDiffFull captures untracked files without touching the candidate's index", async () => {
+  const { gitDiffFull, gitDiffStat } = await import("../lib/selection/live.js")
+  const base = mkdtempSync(path.join(tmpdir(), "dsh-va-difffull-"))
+  try {
+    const repo = makeGitRepo(base, "repo")
+    writeFileSync(path.join(repo, "tracked.txt"), "tracked-changed\n")
+    writeFileSync(path.join(repo, "brand-new.txt"), "hello from an untracked file\n")
+    const before = runGit(repo, "status", "--porcelain")
+    assert.ok(before.includes("?? brand-new.txt"), "fixture: the new file starts untracked")
+    const full = await gitDiffFull(repo)
+    assert.ok(full, "diff capture succeeds in a plain repo")
+    assert.ok(full.patch.includes("+hello from an untracked file"), "untracked file content is part of the evidence")
+    assert.ok(full.patch.includes("+tracked-changed"), "tracked modification is part of the evidence")
+    assert.deepEqual(full.untrackedFiles, ["brand-new.txt"])
+    assert.equal(full.truncated, false)
+    assert.equal(runGit(repo, "status", "--porcelain"), before, "evidence capture leaves the worktree status exactly as the candidate left it")
+    assert.equal(runGit(repo, "diff", "--cached", "--name-only"), "", "no intent-to-add entry leaks into the real index")
+    const stat = await gitDiffStat(repo)
+    assert.ok(stat, "diff stat succeeds")
+    assert.equal(stat.files, 1, "stat counts tracked modifications")
+    assert.equal(stat.untracked, 1, "stat counts the untracked file")
+    assert.equal(runGit(repo, "diff", "--cached", "--name-only"), "", "stat capture does not stage either")
+    const wt = path.join(base, "wt", "c0")
+    runGit(repo, "worktree", "add", "--detach", wt, "HEAD")
+    writeFileSync(path.join(wt, "new-in-worktree.txt"), "worktree-born\n")
+    const wtFull = await gitDiffFull(wt)
+    assert.ok(wtFull && wtFull.patch.includes("+worktree-born"), "linked worktrees (the real candidate layout) are captured too")
+    assert.equal(runGit(wt, "status", "--porcelain"), "?? new-in-worktree.txt", "the linked worktree's own index is untouched")
+    assert.equal(runGit(repo, "status", "--porcelain"), before, "the primary worktree is untouched by a linked-worktree capture")
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test("selhost: defaultPythonPath prefers DSH_VA_PYTHON and otherwise never points at a missing interpreter", async () => {
+  const { defaultPythonPath } = await import("../lib/selection/host.js")
+  const saved = process.env.DSH_VA_PYTHON
+  try {
+    process.env.DSH_VA_PYTHON = "/opt/custom/bin/python-x"
+    assert.equal(defaultPythonPath(), "/opt/custom/bin/python-x", "explicit operator choice wins")
+    delete process.env.DSH_VA_PYTHON
+    const fallback = defaultPythonPath()
+    if (existsSync("D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe")) {
+      assert.equal(fallback, "D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe", "the documented operator venv is used when present")
+    } else {
+      assert.equal(fallback, process.platform === "win32" ? "python" : "python3", "a PATH interpreter, never a hardcoded path that does not exist here")
+    }
+  } finally {
+    if (saved === undefined) delete process.env.DSH_VA_PYTHON
+    else process.env.DSH_VA_PYTHON = saved
+  }
+})
