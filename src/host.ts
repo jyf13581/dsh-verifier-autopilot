@@ -519,6 +519,10 @@ export class VerifierHost {
     const disposed = events.on('agent/disposed', payload => this.detach(payload?.agent))
     if (typeof disposed === 'function') this.disposers.push(disposed)
     this.recoverAutopilotRelays()
+    // Storage hygiene runs off the critical path: candidate directories a
+    // previous process left behind are reclaimed (or reported) in the
+    // background; the result lands in diagnostics, never in start().
+    void this.selections.reclaimOrphanWorkspaces()
   }
 
   /** Reload recovery (live incident sel-ac04cfd7, 2026-09-09): a plugin hot

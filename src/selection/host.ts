@@ -14,7 +14,8 @@
  */
 
 import path from 'node:path'
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { VerifierBridge, type BridgeSelectRequest, type BridgeSelectResult } from './bridge.js'
@@ -260,6 +261,15 @@ function normalizeLoadedSelection(record: SelectionRecord): SelectionRecord {
 
 const SAFE_SELECTION_ID = /^sel-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 
+export interface OrphanReclaim {
+  /** Candidate directories removed (known settled selection, not retained). */
+  reclaimed: number
+  /** Selection ids on disk with no record in the window (reported only). */
+  unknown: number
+  /** Removals that raised; each is a `workspaces.reclaim` diagnostic. */
+  failed: number
+}
+
 function isSelectionRecord(value: unknown): value is SelectionRecord {
   if (!value || typeof value !== 'object') return false
   const record = value as Partial<SelectionRecord>
@@ -404,13 +414,30 @@ export class SelectionHost {
   private disposed = false
   private readonly listeners = new Set<() => void>()
   private readonly selectionsFile: string | null
+  /** Audit-pack collection is serialized: two passes must never race the same
+   *  directory removal, and a pass must never overlap a write for an id it
+   *  could not have observed. */
+  private artifactGc: Promise<number> = Promise.resolve(0)
+  private reclaiming: Promise<OrphanReclaim> | null = null
+  /** True once the in-memory history is known to reflect the ledger: at
+   *  least one record loaded from it, or one written to it by this process.
+   *  Until then the window proves nothing about which packs are stale. */
+  private ledgerKnown = false
 
   constructor(deps: SelectionHostDeps) {
     this.deps = deps
     this.now = deps.now ?? Date.now
     this.diagnostics = deps.diagnostics ?? defaultDiagnostics
     this.selectionsFile = deps.selectionsFile === undefined ? null : deps.selectionsFile
-    if (this.selectionsFile) this.loadSelections(this.selectionsFile)
+    if (this.selectionsFile) {
+      // Audit packs live exactly as long as their record is in the history
+      // window; a ledger that could not be read (or is empty) proves nothing
+      // about what is stale, so collection waits for a successful load.
+      if (this.loadSelections(this.selectionsFile) > 0) {
+        this.ledgerKnown = true
+        void this.collectArtifacts()
+      }
+    }
   }
 
   subscribe(listener: () => void): () => void {
@@ -643,7 +670,14 @@ export class SelectionHost {
     }
     this.active = { selectionId, controller, run: null }
     this.selections.unshift(placeholder)
-    this.selections.splice(SELECTIONS_HISTORY_LIMIT)
+    const evicted = this.selections.splice(SELECTIONS_HISTORY_LIMIT)
+    // The running row is persisted now, not only at settlement: a process that
+    // dies mid-run leaves an `interrupted-by-reload` record on the next load
+    // instead of an unexplained gap, and its candidate directories become
+    // attributable (and reclaimable) orphans instead of anonymous ones.
+    // persist() never throws, so the admission claim stays atomic.
+    if (this.selectionsFile) this.persist(placeholder)
+    if (evicted.length > 0) void this.collectArtifacts()
     this.emit()
 
     const runInput: SelectionRunInput = {
@@ -830,7 +864,9 @@ export class SelectionHost {
     }
   }
 
-  private loadSelections(file: string): void {
+  /** Returns how many records were loaded; 0 also when the ledger is absent
+   *  or unreadable. */
+  private loadSelections(file: string): number {
     try {
       let skippedRows = 0
       const loaded = readJsonlLedger(file, {
@@ -848,7 +884,11 @@ export class SelectionHost {
         compactJsonlLedger(file, loaded)
       }
       this.selections.push(...loaded)
-    } catch (error) { this.diagnostics.warn('selections.load', error, { file }) }
+      return loaded.length
+    } catch (error) {
+      this.diagnostics.warn('selections.load', error, { file })
+      return 0
+    }
   }
 
   /** Persist a settled record again after an out-of-band mutation (relay
@@ -864,6 +904,7 @@ export class SelectionHost {
   private persist(record: SelectionRecord): void {
     const file = this.selectionsFile
     if (!file) return
+    this.ledgerKnown = true
     try {
       if (ledgerExceeds(file, SELECTIONS_FILE_MAX_BYTES)) {
         this.diagnostics.count('selections.compact')
@@ -908,6 +949,93 @@ export class SelectionHost {
         }
       }
     } catch (error) { this.diagnostics.warn('artifact.write', error, { selectionId: record.selectionId }) }
+  }
+
+  /** Remove every audit pack whose selection is no longer in the history
+   *  window. The window (SELECTIONS_HISTORY_LIMIT newest records) is the only
+   *  retention policy this host has: a record outside it can no longer be
+   *  listed, discarded, or relayed, so its pack is unreachable evidence and
+   *  the directory would otherwise grow without bound. Only entries shaped
+   *  like a selection id are considered — dirs `sel-…` and the legacy flat
+   *  `sel-….json` — so nothing else in the directory is touched. Resolves to
+   *  the number of packs removed; never rejects. */
+  collectArtifacts(): Promise<number> {
+    const dir = this.artifactDir()
+    if (!dir || !this.ledgerKnown) return Promise.resolve(0)
+    const pass = async (): Promise<number> => {
+      let entries: string[]
+      try { entries = readdirSync(dir) } catch { return 0 }
+      const live = new Set(this.selections.map((record) => record.selectionId))
+      let removed = 0
+      for (const entry of entries) {
+        const selectionId = entry.endsWith('.json') ? entry.slice(0, -'.json'.length) : entry
+        if (!SAFE_SELECTION_ID.test(selectionId) || live.has(selectionId) || this.active?.selectionId === selectionId) continue
+        try {
+          await rm(path.join(dir, entry), { recursive: true, force: true })
+          removed += 1
+        } catch (error) { this.diagnostics.warn('artifacts.gc', error, { selectionId }) }
+      }
+      if (removed > 0) this.diagnostics.count('artifacts.gc_removed', removed)
+      return removed
+    }
+    this.artifactGc = this.artifactGc.then(pass, pass)
+    return this.artifactGc
+  }
+
+  /** Reclaim candidate directories left behind by a process that died
+   *  mid-selection, or by a loser cleanup that failed. Two rules keep this
+   *  safe for the operator:
+   *   - a directory whose selection is known (in the history window) is
+   *     reclaimed unless it is that record's retained winner/fallback slot
+   *     (`discardedAt` unset) or the selection is running right now;
+   *   - a directory with no record at all is reported, never removed: it may
+   *     be a retained manual winner whose record aged out of the window, and
+   *     deleting an operator's live worktree is the one failure worse than a
+   *     leak. Manual and autopilot winners keep their own lifecycles.
+   *  Concurrent calls share one pass. Never rejects. */
+  reclaimOrphanWorkspaces(): Promise<OrphanReclaim> {
+    if (this.reclaiming) return this.reclaiming
+    const run = async (): Promise<OrphanReclaim> => {
+      const summary: OrphanReclaim = { reclaimed: 0, unknown: 0, failed: 0 }
+      const manager = this.deps.testing?.workspaces
+        ?? (this.workspaceManager ??= new IsolatedWorkspaceManager(this.deps.workspaceRoot ?? defaultWorkspaceRoot()))
+      if (!manager.listManaged) return summary
+      let dirs: Array<{ selectionId: string; index: number; dir: string }>
+      try { dirs = await manager.listManaged() } catch (error) { this.diagnostics.warn('workspaces.list', error); return summary }
+      const unknownIds = new Set<string>()
+      for (const entry of dirs) {
+        if (this.disposed) break
+        if (this.active?.selectionId === entry.selectionId) continue
+        const record = this.selections.find((s) => s.selectionId === entry.selectionId)
+        if (!record) { unknownIds.add(entry.selectionId); continue }
+        if (record.status === 'running') continue
+        const slot = record.winner ?? record.fallback
+        if (slot && slot.index === entry.index && slot.discardedAt === undefined) continue
+        // Prefer the workspace path the record knows (the candidate cwd may be
+        // a sub-directory of the worktree root, and the session-store key was
+        // derived from it); fall back to the directory itself when the record
+        // points elsewhere (ledger copied from another machine).
+        const known = (record.candidates ?? []).find((candidate) => candidate.index === entry.index)?.workspace
+        const inside = known ? path.relative(entry.dir, known) : '..'
+        const target = known && inside !== '' && !inside.startsWith('..') && !path.isAbsolute(inside) ? known : entry.dir
+        try {
+          await manager.remove(target)
+          await manager.purgeSessionRecord?.(target)
+          summary.reclaimed += 1
+        } catch (error) {
+          summary.failed += 1
+          this.diagnostics.warn('workspaces.reclaim', error, { selectionId: entry.selectionId, candidate: entry.index })
+        }
+      }
+      summary.unknown = unknownIds.size
+      if (summary.reclaimed > 0) this.diagnostics.count('workspaces.reclaimed', summary.reclaimed)
+      if (summary.unknown > 0) {
+        this.diagnostics.warn('workspaces.unknown', summary.unknown + ' candidate workspace director' + (summary.unknown === 1 ? 'y has' : 'ies have') + ' no record in the history window; left in place for the operator', { selectionIds: [...unknownIds].slice(0, 5).join(',') })
+      }
+      return summary
+    }
+    this.reclaiming = run().finally(() => { this.reclaiming = null })
+    return this.reclaiming
   }
 
   async dispose(): Promise<void> {

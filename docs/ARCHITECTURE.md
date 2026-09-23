@@ -55,9 +55,10 @@ implementation code.
 | `src/selection/host.ts` | Selection lifecycle, single-run admission, history, audit artifacts, sidecar ownership, winner retention, and source-session settlement. |
 | `src/selection/autopilot.ts` | Admission policy and bounded task/context planning for automatic selection. |
 | `src/selection/candidates.ts` | Candidate runner and selection state machine. |
-| `src/selection/live.ts` | Live DSH candidate adapters and isolated Git-worktree management. |
+| `src/selection/live.ts` | Live DSH candidate adapters and isolated Git-worktree management (prepare, remove, enumerate). |
+| `src/selection/proc.ts` | Bounded child-process runner shared by the Git helpers and the check harness: capped output (head or tail), timeout/abort with kill escalation, flush-bounded completion, spawn failure distinct from exit. Leaf: imports Node only. |
 | `src/selection/trajectory.ts` | Candidate trajectory rendering plus shared context/handoff bounding. The candidate runner depends here rather than back on autopilot orchestration. |
-| `src/selection/checks.ts` | Objective repository/check execution and normalization. |
+| `src/selection/checks.ts` | Objective check execution and normalization. Resolves one shell per process from a platform chain (`pwsh`, then Windows PowerShell or `/bin/sh`); a shell that cannot start is a harness error, never evidence against a candidate. |
 | `src/selection/bridge.ts` | Framed subprocess client for the Python verifier sidecar. |
 | `src/selection/retry.ts` | Bounded retry policy for transient bridge failures. |
 | `src/selection/probe.ts` | Availability/capability probing. |
@@ -137,6 +138,13 @@ Follow these rules:
    before they are stored, consecutive identical entries coalesce into a
    count, and the ring evicts oldest-first, so the sink can never grow without
    bound or leak a credential into `/state`.
+10. **`selection/proc.ts` is a leaf.** `live.ts` (worktrees, diffs) and
+    `checks.ts` (objective checks) both spawn processes and must not depend on
+    each other, so the one bounded runner they share may import Node only.
+    Anything that needs a child process with a timeout, an output cap, or a
+    spawn-failure distinction uses `runProcess()`; the `execCapture` streaming
+    helper in `live.ts` is the single deliberate exception (it streams a
+    tracked file list from stdin and returns raw bytes for shell-free diffs).
 
 A cycle is a design signal. Move a shared shape to `protocol.ts`, a generic
 boundary helper to `util.ts`, or a persistence primitive to `ledger.ts` rather
@@ -271,6 +279,36 @@ append operation per encoded row; startup still tolerates a torn final row.
 
 Runtime state belongs under `.data/` and is ignored. It must never be committed.
 
+### Storage lifecycle
+
+Nothing under `.data/` is append-only forever; every artifact is bound to a
+record that can still reach it.
+
+- **Selection audit packs** (`selection-artifacts/<selectionId>/`) live exactly
+  as long as their record is in the history window (the newest
+  `SELECTIONS_HISTORY_LIMIT` records). A record outside the window can no
+  longer be listed, discarded, or relayed, so its pack is unreachable evidence.
+  `SelectionHost.collectArtifacts()` removes packs — directories and the legacy
+  flat `<id>.json` — whose id is not in the window; it runs after a successful
+  ledger load and whenever a new run evicts a record. A ledger that could not
+  be read proves nothing about what is stale, so a failed or empty load never
+  collects. Only entries shaped like a selection id are considered; anything
+  else in the directory is not the host's to touch.
+- **Candidate directories** (`selection-workspaces/<selectionId>/c<i>`) are
+  removed when a loser is disposed or a winner is discarded. Directories a dead
+  process left behind are handled by `reclaimOrphanWorkspaces()` at Host start,
+  under two rules: a directory whose record is in the window is reclaimed
+  unless it is that record's retained (`discardedAt` unset) winner/fallback
+  slot or the selection is running; a directory with **no** record is reported
+  (`workspaces.unknown`) and never deleted, because it may be a retained manual
+  winner whose record aged out, and deleting an operator's live worktree is the
+  one outcome worse than a leak. The manager only ever enumerates the
+  `sel-*/c<i>` shape it creates, so enumeration can never widen removal.
+- **The running row is persisted at admission**, not only at settlement. A
+  process that dies mid-run leaves an `interrupted-by-reload` record on the
+  next load, so the gap is explained and the orphaned directories are
+  attributable to a known selection.
+
 ## 7. Lifecycle, cancellation, and secrets
 
 `VerifierHost.start()` idempotently establishes subscriptions and scheduling;
@@ -335,7 +373,22 @@ and never forward a raw `error.message`.
 The Python verifier dependency is optional. Health reporting must truthfully
 expose whether selection is available. Missing `llm_verifier` may disable
 provider-backed comparison, but it must not make offline Host startup or the
-sidecar's deterministic protocol gates dishonest.
+sidecar's deterministic protocol gates dishonest. The bridge measures each
+spawn's warm-up (spawn to first answered frame, via a bridge-internal health
+probe that is never counted as a caller's request) into the
+`sidecar.warmups` / `sidecar.warmup_ms` counters and warns once per slow spawn
+(`sidecar.warmup`, above 10 s) or when the sidecar reports
+`select_available=false` (`sidecar.select_unavailable`).
+
+Portability is a boundary, not an afterthought. The objective-check harness
+names no shell at its call sites: `checks.ts` resolves the first startable
+shell from `defaultCheckShells(platform)` (`pwsh` everywhere it exists, then
+Windows PowerShell on win32 or `/bin/sh` elsewhere), records which shell ran
+on every result, and treats "no shell could start" as a harness error for
+every check — the candidate is kept with `checksInvalid`, exactly like a
+command the shell could not parse. Tests write their check fixtures in the
+dialect of whichever shell won, so the same suite runs on a pwsh-less runner
+and a Windows workstation.
 
 Degradation is observable. Best-effort paths keep their contract (a failed
 ledger append, a stuck loser worktree, a dead sidecar, an undeliverable relay

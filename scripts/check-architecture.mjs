@@ -94,6 +94,9 @@ for (const edge of edges.values()) {
   if (from === 'src/diagnostics.ts' && !['src/util.ts', 'src/constants.ts'].includes(to)) {
     reject('the diagnostics sink is a leaf: every layer reports into it, so it may import only util/constants')
   }
+  if (from === 'src/selection/proc.ts' && to.startsWith('src/')) {
+    reject('the bounded process runner is a leaf: live.ts and checks.ts both build on it, so it may import Node only')
+  }
   if (from === 'src/config.ts' && isSelection(edge.to)) {
     reject('configuration owns policy types and may not depend on selection implementation')
   }

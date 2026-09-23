@@ -103,7 +103,14 @@ export interface VerifierBridgeOptions {
 interface Pending {
   id: string
   settle: (err: BridgeError | null, frame?: Record<string, unknown>) => void
+  /** Bridge-internal frame (warm-up probe): never a caller's request, so it
+   *  is excluded from "pending requests lost" accounting. */
+  internal?: boolean
 }
+
+/** A cold sidecar that needs longer than this to answer its first frame is
+ *  worth an operator's attention (interpreter + llm_verifier import). */
+export const SIDECAR_SLOW_WARMUP_MS = 10_000
 
 const PREFLIGHT_PROBLEM = 'Reply with exactly one word: ready'
 const PREFLIGHT_GOOD = '[E01] USER: Reply with exactly one word: ready'
@@ -152,6 +159,8 @@ export class VerifierBridge {
   private spawnKey: { name: string; value: string } | null = null
   private spawnedOnce = false
   private readonly diagnostics: Diagnostics
+  /** Spawn-to-first-answer latency of the most recent child, once measured. */
+  private warmupMs: number | null = null
 
   constructor(options: VerifierBridgeOptions) {
     this.pythonPath = options.pythonPath
@@ -164,6 +173,10 @@ export class VerifierBridge {
   }
 
   get alive(): boolean { return this.child !== null && !this.child.killed }
+
+  /** How long the current child took from spawn to its first answered frame;
+   *  null until the warm-up probe has been answered. */
+  get lastWarmupMs(): number | null { return this.warmupMs }
 
   private noteStderr(chunk: string): void {
     this.stderrTail = (this.stderrTail + chunk).slice(-this.stderrCap)
@@ -191,6 +204,13 @@ export class VerifierBridge {
     child.stdout.on('data', (chunk: string) => this.onStdout(chunk))
     child.stderr.setEncoding('utf8')
     child.stderr.on('data', (chunk: string) => this.noteStderr(chunk))
+    // A frame written in the instant between the sidecar dying and its exit
+    // event would otherwise surface as an unhandled 'error' on the stdin pipe
+    // (EPIPE) and take the whole host process down with it.
+    child.stdin.on('error', (err: Error) => {
+      if (this.child !== child) return
+      this.teardownChild(new BridgeError('bridge_down', 'sidecar stdin error: ' + err.message, true))
+    })
     // Identity guard: a killed child's late exit/error must not clear the
     // pending queue of its already-respawned successor.
     child.on('error', (err) => {
@@ -205,10 +225,39 @@ export class VerifierBridge {
       // and teardownChild() detach the child before it goes away.
       const why = 'sidecar exited code=' + String(code) + ' signal=' + String(signal)
       const failure = new BridgeError('bridge_down', why + this.stderrSuffix(), false)
-      if (!this.disposed) this.diagnostics.warn('sidecar.exit', failure, { pending: this.pending.size })
+      if (!this.disposed) this.diagnostics.warn('sidecar.exit', failure, { pending: [...this.pending.values()].filter((p) => !p.internal).length })
       this.onChildGone(failure)
     })
+    this.probeWarmup(child)
     return Promise.resolve()
+  }
+
+  /** Measure the cold start. The sidecar imports llm_verifier before it reads
+   *  its first line, so the round trip of a health frame written right after
+   *  spawn is interpreter + import time; the caller's real request queues
+   *  behind it on the same serial pipe and pays nothing extra. The probe has
+   *  no timer of its own: it must never tear a child down or hold a request
+   *  hostage, and a child that dies simply settles it with an error we ignore.
+   *  Health also tells us immediately whether selection can work at all. */
+  private probeWarmup(child: ChildProcessWithoutNullStreams): void {
+    const spawnedAt = Date.now()
+    const id = 'warmup-' + crypto.randomUUID()
+    this.warmupMs = null
+    this.pending.set(id, {
+      id,
+      internal: true,
+      settle: (err, frame) => {
+        if (err || !frame || this.child !== child) return
+        const elapsed = Date.now() - spawnedAt
+        this.warmupMs = elapsed
+        this.diagnostics.count('sidecar.warmups')
+        this.diagnostics.count('sidecar.warmup_ms', elapsed)
+        if (elapsed > SIDECAR_SLOW_WARMUP_MS) this.diagnostics.warn('sidecar.warmup', 'sidecar took ' + elapsed + 'ms from spawn to its first answer', { python: this.pythonPath })
+        const result = (frame.ok === true ? frame.result : null) as Partial<BridgeHealth> | null
+        if (result && result.select_available === false) this.diagnostics.warn('sidecar.select_unavailable', String(result.note ?? 'llm_verifier dependency is unavailable'), { python: this.pythonPath })
+      },
+    })
+    child.stdin.write(JSON.stringify({ id, type: 'health' }) + String.fromCharCode(10), () => { /* a broken pipe surfaces through exit/error */ })
   }
 
   private stderrSuffix(): string {

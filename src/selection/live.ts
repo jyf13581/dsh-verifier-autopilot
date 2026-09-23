@@ -7,7 +7,7 @@
  * and this file is typechecked + smoke-tested against the live host.
  */
 
-import { cp, lstat, mkdir, readlink, rm, rmdir } from 'node:fs/promises'
+import { cp, lstat, mkdir, readdir, readlink, rm, rmdir } from 'node:fs/promises'
 import { statSync } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
@@ -15,6 +15,7 @@ import os from 'node:os'
 import path from 'node:path'
 import type { CandidateFactory, CandidateSpec, DiffStatLite, SelectionAgentHandle, WorkspaceManager } from './candidates.js'
 import type { TrajectoryEvent } from './trajectory.js'
+import { runProcess } from './proc.js'
 
 interface LiveAgentLike {
   id: string
@@ -28,17 +29,29 @@ interface LiveContext {
   }
 }
 
-function exec(cmd: string, args: string[], cwd?: string, timeoutMs = 30000): Promise<{ code: number; out: string }> {
-  return new Promise((resolve) => {
-    let out = ''
-    const child = spawn(cmd, args, { cwd, windowsHide: true })
-    const take = (b: Buffer | string) => { out = (out + String(b)).slice(-2000) }
-    child.stdout?.on('data', take)
-    child.stderr?.on('data', take)
-    const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } }, timeoutMs)
-    child.on('error', () => { clearTimeout(timer); resolve({ code: -1, out }) })
-    child.on('exit', (code) => { clearTimeout(timer); resolve({ code: code ?? -1, out }) })
-  })
+/** Evidence listings (numstat, status, patches) legitimately exceed the
+ *  2000-char diagnostic tail; they keep the head so truncation cuts the end. */
+const EVIDENCE_CAP = 262144
+
+interface ExecOptions {
+  cwd?: string
+  timeoutMs?: number
+  cap?: number
+  keep?: 'head' | 'tail'
+  env?: NodeJS.ProcessEnv
+}
+
+/** Bounded process call. The default shape (2000-char tail) is the
+ *  diagnostic one: when git fails, the reason is at the end. `code` is -1 for
+ *  anything that did not produce an honest exit code (spawn failure, timeout). */
+async function exec(cmd: string, args: string[], options: ExecOptions = {}): Promise<{ code: number; out: string }> {
+  const result = await runProcess(cmd, args, options)
+  return { code: result.code ?? -1, out: result.out }
+}
+
+/** Evidence-shaped call: large head-kept output. */
+function execWide(cmd: string, args: string[], cwd?: string, env?: NodeJS.ProcessEnv): Promise<{ code: number; out: string }> {
+  return exec(cmd, args, { cwd, cap: EVIDENCE_CAP, keep: 'head', env })
 }
 
 async function existingAncestor(input: string): Promise<string | undefined> {
@@ -393,6 +406,12 @@ export class WorkspacePrepareError extends Error {
   }
 }
 
+/** The only directory shapes the manager will ever create or remove:
+ *  `<root>/sel-<id>/c<index>`. Both ends of the lifecycle (prepare/remove and
+ *  listManaged) share these so enumeration can never widen removal. */
+const MANAGED_SELECTION_DIR = /^sel-[A-Za-z0-9][A-Za-z0-9-]{0,100}$/
+const MANAGED_CANDIDATE_DIR = /^c(\d+)$/
+
 export class IsolatedWorkspaceManager implements WorkspaceManager {
   private readonly root: string
   private readonly storeRoot: string
@@ -407,7 +426,7 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
     const relative = path.relative(this.root, absolute)
     const parts = relative.split(/[\\/]/).filter(Boolean)
     if (!relative || path.isAbsolute(relative) || parts.includes('..') || parts.length < 2
-      || !/^sel-[A-Za-z0-9][A-Za-z0-9-]{0,100}$/.test(parts[0]) || !/^c\d+$/.test(parts[1])) {
+      || !MANAGED_SELECTION_DIR.test(parts[0]) || !MANAGED_CANDIDATE_DIR.test(parts[1])) {
       throw new Error('workspace-path-outside-managed-root')
     }
     return absolute
@@ -437,10 +456,10 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
   }
 
   private async removeLease(lease: WorktreeLease): Promise<void> {
-    const gone = await exec('git', ['-C', lease.sourceRoot, 'worktree', 'remove', '--force', lease.worktreeRoot], undefined, 60000)
+    const gone = await exec('git', ['-C', lease.sourceRoot, 'worktree', 'remove', '--force', lease.worktreeRoot], { timeoutMs: 60000 })
     if (gone.code !== 0) {
       await rm(lease.worktreeRoot, { recursive: true, force: true })
-      const pruned = await exec('git', ['-C', lease.sourceRoot, 'worktree', 'prune', '--expire', 'now'], undefined, 60000)
+      const pruned = await exec('git', ['-C', lease.sourceRoot, 'worktree', 'prune', '--expire', 'now'], { timeoutMs: 60000 })
       if (pruned.code !== 0) throw new Error('workspace-worktree-prune-failed: ' + pruned.out)
     }
     this.worktrees.delete(lease.candidateCwd)
@@ -462,7 +481,7 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
         const sourceCwd = path.resolve(sel.sourceCwd)
         const relativeCwd = path.relative(sourceRoot, sourceCwd)
         if (path.isAbsolute(relativeCwd) || relativeCwd.split(/[\\/]/).includes('..')) throw new Error('source-cwd-outside-git-root')
-        const add = await exec('git', ['-C', sourceRoot, 'worktree', 'add', '--detach', worktreeRoot, 'HEAD'], undefined, 60000)
+        const add = await exec('git', ['-C', sourceRoot, 'worktree', 'add', '--detach', worktreeRoot, 'HEAD'], { timeoutMs: 60000 })
         if (add.code !== 0) throw new Error('workspace-worktree-add-failed: ' + add.out)
         const candidateCwd = path.join(worktreeRoot, relativeCwd)
         const lease = { candidateCwd, worktreeRoot, sourceRoot }
@@ -493,21 +512,26 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
       try { await rmdir(path.dirname(managed)) } catch { /* selection root not empty */ }
     }
   }
-}
 
-/** Larger-output variant of exec() for evidence collection (numstat / status
- *  listings legitimately exceed the 2000-char diagnostic tail). */
-function execWide(cmd: string, args: string[], cwd?: string, timeoutMs = 30000, cap = 262144, env?: NodeJS.ProcessEnv): Promise<{ code: number; out: string }> {
-  return new Promise((resolve) => {
-    let out = ''
-    const child = spawn(cmd, args, { cwd, windowsHide: true, ...(env ? { env } : {}) })
-    const take = (b: Buffer | string) => { out = (out + String(b)).slice(0, cap) }
-    child.stdout?.on('data', take)
-    child.stderr?.on('data', take)
-    const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } }, timeoutMs)
-    child.on('error', () => { clearTimeout(timer); resolve({ code: -1, out }) })
-    child.on('exit', (code) => { clearTimeout(timer); resolve({ code: code ?? -1, out }) })
-  })
+  /** Enumerate the `<root>/<selectionId>/c<i>` directories on disk. Only names
+   *  that `managedPath` would accept are reported, so nothing an operator
+   *  dropped into the root by hand can ever be handed to remove(). */
+  async listManaged(): Promise<Array<{ selectionId: string; index: number; dir: string }>> {
+    const found: Array<{ selectionId: string; index: number; dir: string }> = []
+    let selections: string[]
+    try { selections = await readdir(this.root) } catch { return found }
+    for (const selectionId of selections) {
+      if (!MANAGED_SELECTION_DIR.test(selectionId)) continue
+      let candidates: string[]
+      try { candidates = await readdir(path.join(this.root, selectionId)) } catch { continue }
+      for (const name of candidates) {
+        const match = MANAGED_CANDIDATE_DIR.exec(name)
+        if (!match) continue
+        found.push({ selectionId, index: Number(match[1]), dir: path.join(this.root, selectionId, name) })
+      }
+    }
+    return found
+  }
 }
 
 /** The evidence shape is owned by the runner contract (candidates.ts); this
@@ -588,8 +612,8 @@ export async function gitDiffFull(cwd: string, patchCap = 262144): Promise<DiffF
     scratchIndex = path.join(os.tmpdir(), 'dsh-va-index-' + randomUUID())
     try { await cp(path.resolve(cwd, indexPath.out.trim()), scratchIndex) } catch { /* no index yet: git starts from an empty one */ }
     const scratchEnv = { ...process.env, GIT_INDEX_FILE: scratchIndex }
-    await execWide('git', ['-C', cwd, 'add', '-N', '.'], cwd, 30000, 262144, scratchEnv)
-    const diff = await execWide('git', ['-C', cwd, 'diff', 'HEAD', '--', '.'], cwd, 30000, patchCap, scratchEnv)
+    await execWide('git', ['-C', cwd, 'add', '-N', '.'], cwd, scratchEnv)
+    const diff = await exec('git', ['-C', cwd, 'diff', 'HEAD', '--', '.'], { cwd, cap: patchCap, keep: 'head', env: scratchEnv })
     if (diff.code !== 0) return null
     const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard'], cwd)
     const untrackedFiles = others.code === 0 ? others.out.split(/\r?\n/).filter(Boolean) : []

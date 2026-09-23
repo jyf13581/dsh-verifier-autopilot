@@ -212,6 +212,10 @@ export interface CandidateFactory {
 export interface WorkspaceManager {
   prepare(sel: { selectionId: string; index: number; sourceCwd?: string; strictSnapshot?: boolean }): Promise<string>
   remove(path: string): Promise<void>
+  /** Every candidate directory currently under the managed root, whether or
+   *  not this process created it. Absent = the manager cannot enumerate
+   *  (test fakes), and orphan reclamation is skipped. */
+  listManaged?(): Promise<Array<{ selectionId: string; index: number; dir: string }>>
   /** Best-effort purge of the candidate's DSH session-store record (the
    *  persisted journal under the session root). Without this the GUI forever
    *  lists disposed losers as dead sessions pointing at deleted workspaces

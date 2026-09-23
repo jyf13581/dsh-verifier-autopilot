@@ -15,7 +15,8 @@ import { VerifierBridge, BridgeError } from "../lib/selection/bridge.js"
 import { SelectionRunner } from "../lib/selection/candidates.js"
 import { retryTransientBridge } from "../lib/selection/retry.js"
 import { buildAutopilotRelay, planAutopilotTask } from "../lib/selection/autopilot.js"
-import { runChecks } from "../lib/selection/checks.js"
+import { runChecks, resolveCheckShell, defaultCheckShells } from "../lib/selection/checks.js"
+import { runProcess } from "../lib/selection/proc.js"
 import { renderTrajectory } from "../lib/selection/trajectory.js"
 import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync } from "node:fs"
 import { execFileSync } from "node:child_process"
@@ -2512,7 +2513,7 @@ test("retry: external abort during backoff settles as bridge_aborted", async () 
 // ---------- best-of-N candidate batch orchestrator (Phase 2) ----------
 //
 // SelectionRunner with scripted fakes: no live DSH runtime, no provider, and
-// (apart from the pwsh check runner) no external processes.
+// (apart from the check-shell runner) no external processes.
 
 const SEL_TMP = mkdtempSync(path.join(tmpdir(), "va-sel-"))
 
@@ -2608,7 +2609,18 @@ const selInput = (over = {}) => ({
   ...over,
 })
 
-const PASS_CHECK = [{ name: "marker", command: "if (Test-Path ./pass.txt) { exit 0 } else { exit 3 }", timeoutMs: 20000 }]
+// The check harness resolves one shell per process (pwsh wherever it is
+// installed, otherwise the platform shell). Check fixtures are written in
+// whichever dialect won, so this suite runs the same on a pwsh-less Linux
+// runner and a Windows dev box.
+const CHECK_SHELL = (await resolveCheckShell()).shell
+const CHECK_DIALECT = CHECK_SHELL?.name === "sh" ? "sh" : "pwsh"
+const PASS_CHECK = [{
+  name: "marker",
+  command: CHECK_DIALECT === "sh" ? "test -f ./pass.txt || exit 3" : "if (Test-Path ./pass.txt) { exit 0 } else { exit 3 }",
+  timeoutMs: 20000,
+}]
+const SLOW_CHECK_COMMAND = CHECK_DIALECT === "sh" ? "sleep 30" : "Start-Sleep -Seconds 30"
 
 // ---------- selection host + routes (Phase 3) ----------
 
@@ -3409,13 +3421,15 @@ test("checks: pass/fail/timeout surface as structured results", async () => {
   const results = await runChecks(dir, [
     { name: "ok", command: "exit 0" },
     { name: "fail", command: "exit 3" },
-    { name: "slow", command: "Start-Sleep -Seconds 30", timeoutMs: 800 },
+    { name: "slow", command: SLOW_CHECK_COMMAND, timeoutMs: 800 },
   ])
   assert.deepEqual(results.map((r) => [r.name, r.ok, r.exitCode]), [
     ["ok", true, 0],
     ["fail", false, 3],
     ["slow", false, null],
   ])
+  assert.ok(results.every((r) => r.shell === CHECK_SHELL.name), "every result records the shell that ran it")
+  assert.equal(results[1].harnessError, undefined, "a plain non-zero exit is the candidate's failure, not the harness's")
 })
 
 test("trajectory: renders evidence lines with stable ids and skips runtime noise", () => {
@@ -5119,4 +5133,332 @@ test("diagnostics: the sink is a leaf module and the architecture gate says so",
   const client = readFileSync(fileURLToPath(new URL("../src/client/index.ts", import.meta.url)), "utf8")
   assert.ok(client.includes("new EventSource(API + '/events')"), "the panel consumes the SSE route instead of leaving it dead")
   assert.ok(!/window\.setInterval\(\(\) => \{ void refresh\(\) \}, [35]000\)/.test(client), "the fixed 3s/5s polling loops are gone")
+})
+
+// ---------- round 5: storage lifecycle and platform portability ----------
+//
+// One bounded process runner under both the git helpers and the check
+// harness; a check shell resolved from a platform chain instead of a
+// hard-coded pwsh; audit packs and candidate directories that live exactly as
+// long as the records that can still reach them; sidecar warm-up measured.
+
+test("proc: exit, spawn failure, timeout and abort are four distinct ends, and output is bounded from the chosen side", async () => {
+  const node = process.execPath
+  const tail = await runProcess(node, ["-e", "process.stdout.write('a'.repeat(3000)); process.stderr.write('Z'); process.exit(4)"], { cap: 100, keep: "tail" })
+  assert.equal(tail.end, "exit")
+  assert.equal(tail.code, 4)
+  assert.equal(tail.out.length, 100)
+  assert.ok(tail.out.endsWith("Z"), "tail mode keeps the end of the stream, where the failure is")
+  const head = await runProcess(node, ["-e", "process.stdout.write('H' + 'b'.repeat(3000))"], { cap: 100, keep: "head" })
+  assert.equal(head.code, 0)
+  assert.equal(head.out.length, 100)
+  assert.ok(head.out.startsWith("H"), "head mode keeps the start of the stream (listings truncate at the end)")
+  const missing = await runProcess(path.join(tmpdir(), "va-no-such-shell-" + process.pid), ["-c", "exit 0"])
+  assert.equal(missing.end, "spawn-failed")
+  assert.equal(missing.code, null)
+  assert.match(missing.error, /ENOENT/, "a shell that does not exist is reported as such, not as a non-zero exit")
+  const slow = await runProcess(node, ["-e", "setTimeout(() => {}, 30000)"], { timeoutMs: 300 })
+  assert.equal(slow.end, "timeout")
+  assert.equal(slow.code, null)
+  assert.ok(slow.durationMs < 5000, "the kill grace bounds a timeout, the child's own lifetime does not")
+  const controller = new AbortController()
+  const pending = runProcess(node, ["-e", "setTimeout(() => {}, 30000)"], { signal: controller.signal, timeoutMs: 30000 })
+  setTimeout(() => controller.abort(), 50)
+  const aborted = await pending
+  assert.equal(aborted.end, "aborted")
+  assert.equal(aborted.code, null)
+  const preAborted = await runProcess(node, ["-e", "setTimeout(() => {}, 30000)"], { signal: AbortSignal.abort(), timeoutMs: 30000 })
+  assert.equal(preAborted.end, "aborted", "an already-aborted signal settles immediately")
+}, { timeout: 20000 })
+
+test("proc: completion waits for stdio to flush, but a grandchild that inherited the pipes cannot pin the caller", async () => {
+  const node = process.execPath
+  const flushed = await runProcess(node, ["-e", "process.stdout.write('tail-of-output'); process.exit(0)"], { cap: 100 })
+  assert.equal(flushed.out, "tail-of-output", "output written right before exit is in the result (close, not exit, completes the run)")
+  // The child hands its stdout to a detached grandchild and exits. 'close'
+  // cannot fire until the grandchild lets go (8 s here, forever for a
+  // background server); the flush grace settles the caller with the child's
+  // honest exit code long before that.
+  const script = "const { spawn } = require('node:child_process');"
+    + " spawn(process.execPath, ['-e', 'setTimeout(() => {}, 8000)'], { stdio: ['ignore', 'inherit', 'ignore'], detached: true, windowsHide: true }).unref();"
+    + " process.stdout.write('parent-done');"
+  const started = Date.now()
+  const result = await runProcess(node, ["-e", script], { cap: 100 })
+  assert.equal(result.end, "exit")
+  assert.equal(result.code, 0)
+  assert.ok(result.out.includes("parent-done"))
+  assert.ok(Date.now() - started < 6000, "settled by the flush grace, not by the grandchild's lifetime")
+}, { timeout: 20000 })
+
+test("checks: the shell chain falls back past a shell that cannot start, records which shell ran, and probes once per chain", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "va-shell-"))
+  try {
+    const ghost = { name: "ghost", file: path.join(dir, "no-such-shell"), args: ["-c"] }
+    const nodeShell = { name: "node", file: process.execPath, args: ["-e"] }
+    const resolved = await resolveCheckShell([ghost, nodeShell])
+    assert.equal(resolved.shell, nodeShell, "the first startable shell in the chain wins")
+    assert.equal(resolved.failures.length, 1)
+    assert.match(resolved.failures[0], /^ghost: /)
+    const results = await runChecks(dir, [
+      { name: "ok", command: "process.exit(0)" },
+      { name: "fail", command: "console.error('boom'); process.exit(2)" },
+    ], { shells: [ghost, nodeShell] })
+    assert.deepEqual(results.map((r) => [r.name, r.ok, r.exitCode, r.shell]), [["ok", true, 0, "node"], ["fail", false, 2, "node"]])
+    assert.ok(results[1].outputTail.includes("boom"))
+    assert.equal(results[1].harnessError, undefined, "a real non-zero exit through a fallback shell is still the candidate's failure")
+    assert.equal(await resolveCheckShell([ghost, nodeShell]), resolved, "the probe is memoized per chain")
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test("checks: a chain with no startable shell yields a harness error for every check, never an elimination", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "va-noshell-"))
+  try {
+    const ghost = { name: "ghost", file: path.join(dir, "no-such-shell"), args: ["-c"] }
+    const ghost2 = { name: "ghost2", file: path.join(dir, "also-missing"), args: [] }
+    const results = await runChecks(dir, [{ name: "a", command: "exit 0" }, { name: "b", command: "exit 1" }], { shells: [ghost, ghost2] })
+    assert.equal(results.length, 2, "every check is reported, none silently dropped")
+    for (const r of results) {
+      assert.equal(r.ok, false)
+      assert.equal(r.exitCode, null)
+      assert.equal(r.harnessError, true, "the harness's failure is flagged so the gate keeps the candidate (B-10)")
+      assert.match(r.outputTail, /^harness: no usable shell \(ghost: .*; ghost2: .*\)$/)
+    }
+    assert.deepEqual(await runChecks(dir, [], { shells: [ghost] }), [], "no checks means no shell is even resolved")
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test("checks: the default chain prefers pwsh and falls back to the platform shell this host actually has", async () => {
+  assert.deepEqual(defaultCheckShells("win32").map((s) => s.name), ["pwsh", "powershell"])
+  assert.deepEqual(defaultCheckShells("linux").map((s) => s.name), ["pwsh", "sh"])
+  assert.deepEqual(defaultCheckShells("darwin").map((s) => s.name), ["pwsh", "sh"])
+  assert.ok(CHECK_SHELL, "this host has at least one usable check shell")
+  const dir = mkdtempSync(path.join(tmpdir(), "va-defshell-"))
+  try {
+    const results = await runChecks(dir, [{ name: "plain", command: "exit 0" }, { name: "broken", command: "= -eq 3" }])
+    assert.equal(results[0].ok, true)
+    assert.equal(results[0].shell, CHECK_SHELL.name)
+    assert.equal(results[1].ok, false)
+    assert.equal(results[1].harnessError, true, "interpreter noise is recognized in the " + CHECK_SHELL.name + " dialect too")
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+const settledRecord = (selectionId, startedAt, extra = {}) => ({
+  selectionId, sourceSessionId: null, startedAt, finishedAt: startedAt + 1, status: "completed", candidates: [], ...extra,
+})
+
+test("artifacts: audit packs outside the history window are collected on load and on eviction; everything else in the directory is left alone", async () => {
+  const { SelectionHost, SELECTIONS_HISTORY_LIMIT } = await import("../lib/selection/host.js")
+  const { Diagnostics } = await import("../lib/index.js")
+  const base = mkdtempSync(path.join(tmpdir(), "va-gc-"))
+  try {
+    const ledger = path.join(base, "selections.jsonl")
+    const artifacts = path.join(base, "selection-artifacts")
+    const lines = []
+    for (let i = 0; i <= SELECTIONS_HISTORY_LIMIT; i += 1) lines.push(JSON.stringify(settledRecord("sel-" + i, i)))
+    writeFileSync(ledger, lines.join("\n") + "\n")
+    const pack = (name) => { mkdirSync(path.join(artifacts, name), { recursive: true }); writeFileSync(path.join(artifacts, name, "record.json"), "{}") }
+    pack("sel-0"); pack("sel-1"); pack("sel-" + SELECTIONS_HISTORY_LIMIT); pack("sel-gone")
+    writeFileSync(path.join(artifacts, "sel-legacy.json"), "{}")
+    writeFileSync(path.join(artifacts, "notes.txt"), "operator notes")
+    mkdirSync(path.join(artifacts, "unrelated-dir"))
+    const diag = new Diagnostics()
+    const factory = makeFakeFactory({})
+    const host = new SelectionHost({
+      verifier: () => ({ model: "m", baseURL: "u", apiKeyEnv: "k" }),
+      resolveKey: async () => "dummy",
+      selectionsFile: ledger, artifactsDir: artifacts, diagnostics: diag,
+      testing: { factory, workspaces: realWorkspaces, bridge: fakeBridge() },
+    })
+    try {
+    assert.equal(host.listSelections().length, SELECTIONS_HISTORY_LIMIT, "fixture: the window is full")
+    assert.equal(host.getSelection("sel-0"), undefined, "fixture: the oldest record fell out of the window at load")
+    assert.equal(await host.collectArtifacts(), 0, "the pass started by the constructor already ran; a second pass finds nothing")
+    assert.equal(diag.snapshot().counters["artifacts.gc_removed"], 3)
+    for (const gone of ["sel-0", "sel-gone", "sel-legacy.json"]) assert.ok(!existsSync(path.join(artifacts, gone)), gone + " is outside the window and was removed")
+    for (const kept of ["sel-1", "sel-" + SELECTIONS_HISTORY_LIMIT, "notes.txt", "unrelated-dir"]) assert.ok(existsSync(path.join(artifacts, kept)), kept + " is kept")
+
+    // A new selection evicts the oldest retained record; its pack goes with it.
+    const started = await host.start({ problem: "task", candidateCount: 1 })
+    assert.equal(host.getSelection("sel-1"), undefined, "fixture: sel-1 was evicted by the new run")
+    await host.collectArtifacts()
+    assert.ok(!existsSync(path.join(artifacts, "sel-1")), "the evicted record's pack is collected")
+    await waitFor(() => { const s = host.getSelection(started.selectionId); return s && s.status !== "running" ? s : null })
+    assert.ok(existsSync(path.join(artifacts, started.selectionId, "record.json")), "the new selection's own pack is written and kept")
+    } finally { await host.dispose() }
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+test("artifacts: a ledger that could not be read, or is empty, proves nothing — no pack is collected", async () => {
+  const { SelectionHost } = await import("../lib/selection/host.js")
+  const base = mkdtempSync(path.join(tmpdir(), "va-gc-empty-"))
+  try {
+    const artifacts = path.join(base, "selection-artifacts")
+    mkdirSync(path.join(artifacts, "sel-precious"), { recursive: true })
+    const verifier = () => ({ model: "m", baseURL: "u", apiKeyEnv: "k" })
+    const absent = new SelectionHost({ verifier, selectionsFile: path.join(base, "missing.jsonl"), artifactsDir: artifacts })
+    assert.equal(await absent.collectArtifacts(), 0, "no ledger yet: an explicit pass is a no-op too")
+    assert.ok(existsSync(path.join(artifacts, "sel-precious")), "no ledger yet: nothing is collected")
+    await absent.dispose()
+    writeFileSync(path.join(base, "empty.jsonl"), "")
+    const empty = new SelectionHost({ verifier, selectionsFile: path.join(base, "empty.jsonl"), artifactsDir: artifacts })
+    assert.equal(await empty.collectArtifacts(), 0, "an empty ledger proves nothing about what is stale")
+    await empty.dispose()
+    const unreadable = path.join(base, "dir-as-ledger.jsonl")
+    mkdirSync(unreadable)
+    const failed = new SelectionHost({ verifier, selectionsFile: unreadable, artifactsDir: artifacts })
+    await failed.collectArtifacts()
+    assert.ok(existsSync(path.join(artifacts, "sel-precious")), "a failed load never turns into a purge")
+    await failed.dispose()
+    const off = new SelectionHost({ verifier, selectionsFile: null, artifactsDir: null })
+    assert.equal(await off.collectArtifacts(), 0, "no artifact directory: a no-op")
+    await off.dispose()
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+test("selhost: the running row is persisted at start, so a crash mid-run leaves an attributable interrupted record", async () => {
+  const { SelectionHost } = await import("../lib/selection/host.js")
+  const base = mkdtempSync(path.join(tmpdir(), "va-placeholder-"))
+  try {
+    const ledger = path.join(base, "selections.jsonl")
+    const factory = makeFakeFactory({ scripts: { 0: { hang: true } } })
+    const host = new SelectionHost({
+      verifier: () => ({ model: "m", baseURL: "u", apiKeyEnv: "k" }),
+      resolveKey: async () => "dummy",
+      selectionsFile: ledger,
+      testing: { factory, workspaces: realWorkspaces, bridge: fakeBridge() },
+    })
+    try {
+      const started = await host.start({ problem: "task", candidateCount: 1 })
+      const rows = readFileSync(ledger, "utf8").trim().split("\n").map((line) => JSON.parse(line))
+      assert.equal(rows.length, 1)
+      assert.equal(rows[0].selectionId, started.selectionId)
+      assert.equal(rows[0].status, "running", "the admission claim is on disk before any candidate runs")
+      // A reader that loads the ledger now (a replacement process) sees an
+      // explained failure, not a gap.
+      const reader = new SelectionHost({ verifier: () => ({ model: "m", baseURL: "u", apiKeyEnv: "k" }), selectionsFile: ledger })
+      assert.equal(reader.getSelection(started.selectionId).status, "failed")
+      assert.equal(reader.getSelection(started.selectionId).error, "interrupted-by-reload")
+      await reader.dispose()
+      const release = await waitFor(() => factory.handles[0]?.agent._release)
+      release()
+      const settled = await waitFor(() => { const s = host.getSelection(started.selectionId); return s && s.status !== "running" ? s : null })
+      assert.equal(settled.status, "completed")
+      const after = readFileSync(ledger, "utf8").trim().split("\n").map((line) => JSON.parse(line))
+      assert.equal(after.length, 2, "the settled row is appended, not rewritten in place")
+      assert.equal(after[1].status, "completed")
+      const reloaded = new SelectionHost({ verifier: () => ({ model: "m", baseURL: "u", apiKeyEnv: "k" }), selectionsFile: ledger })
+      assert.equal(reloaded.getSelection(started.selectionId).status, "completed", "the later settled row wins on reload")
+      assert.equal(reloaded.listSelections().length, 1)
+      await reloaded.dispose()
+    } finally {
+      await host.dispose()
+      rmSync(base, { recursive: true, force: true })
+    }
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+test("workspaces: orphan candidate directories are reclaimed by the record rules — retained winners and unknown ids are never deleted", async () => {
+  const { SelectionHost } = await import("../lib/selection/host.js")
+  const { Diagnostics } = await import("../lib/index.js")
+  const base = mkdtempSync(path.join(tmpdir(), "va-orphans-"))
+  try {
+    const root = path.join(base, "managed")
+    const ws = (sel, i) => path.join(root, sel, "c" + i)
+    for (const dir of [ws("sel-known", 0), ws("sel-known", 1), ws("sel-old", 0), ws("sel-unknown", 0), path.join(root, "stray-dir", "c0")]) mkdirSync(dir, { recursive: true })
+    writeFileSync(path.join(root, "sel-known", "notes.txt"), "not a candidate directory")
+    const ledger = path.join(base, "selections.jsonl")
+    writeFileSync(ledger, [
+      JSON.stringify(settledRecord("sel-known", 1, {
+        candidates: [{ index: 0, sessionId: "c0", workspace: ws("sel-known", 0) }, { index: 1, sessionId: "c1", workspace: ws("sel-known", 1) }],
+        winner: { index: 1, sessionId: "c1", workspace: ws("sel-known", 1) },
+      })),
+      JSON.stringify(settledRecord("sel-old", 2, {
+        candidates: [{ index: 0, sessionId: "o0", workspace: ws("sel-old", 0) }],
+        fallback: { index: 0, sessionId: "o0", workspace: ws("sel-old", 0), discardedAt: 5 },
+      })),
+    ].join("\n") + "\n")
+    const diag = new Diagnostics()
+    const host = new SelectionHost({ verifier: () => ({ model: "m", baseURL: "u", apiKeyEnv: "k" }), workspaceRoot: root, selectionsFile: ledger, diagnostics: diag })
+    const first = host.reclaimOrphanWorkspaces()
+    assert.equal(host.reclaimOrphanWorkspaces(), first, "concurrent callers share one pass")
+    assert.deepEqual(await first, { reclaimed: 2, unknown: 1, failed: 0 })
+    assert.ok(!existsSync(ws("sel-known", 0)), "a settled loser directory is reclaimed")
+    assert.ok(existsSync(ws("sel-known", 1)), "the retained winner is protected")
+    assert.ok(existsSync(path.join(root, "sel-known", "notes.txt")), "non-candidate entries are not the manager's to touch")
+    assert.ok(!existsSync(path.join(root, "sel-old")), "a discarded slot's directory is reclaimed and its empty selection root removed")
+    assert.ok(existsSync(ws("sel-unknown", 0)), "a directory with no record is reported, never deleted")
+    assert.ok(existsSync(path.join(root, "stray-dir", "c0")), "names outside the managed shape are invisible to reclamation")
+    assert.equal(diag.snapshot().counters["workspaces.reclaimed"], 2)
+    const unknown = diag.snapshot().entries.find((entry) => entry.scope === "workspaces.unknown")
+    assert.ok(unknown, "unknown directories are a diagnostic for the operator")
+    assert.equal(unknown.detail.selectionIds, "sel-unknown")
+    assert.deepEqual(await host.reclaimOrphanWorkspaces(), { reclaimed: 0, unknown: 1, failed: 0 }, "a second pass is idempotent")
+    await host.dispose()
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+test("workspaces: VerifierHost.start() runs orphan reclamation in the background from the ledger it loaded", async () => {
+  const { Diagnostics } = await import("../lib/index.js")
+  const base = mkdtempSync(path.join(tmpdir(), "va-orphans-host-"))
+  try {
+    const ledger = path.join(base, "selections.jsonl")
+    writeFileSync(ledger, JSON.stringify(settledRecord("sel-done", 1, {
+      candidates: [{ index: 0, sessionId: "d0", workspace: "/managed/sel-done/c0" }],
+      fallback: { index: 0, sessionId: "d0", workspace: "/managed/sel-done/c0", discardedAt: 2 },
+    })) + "\n")
+    const removed = []
+    const purged = []
+    const listed = [
+      { selectionId: "sel-done", index: 0, dir: "/managed/sel-done/c0" },
+      { selectionId: "sel-mystery", index: 0, dir: "/managed/sel-mystery/c0" },
+    ]
+    const workspaces = {
+      ...realWorkspaces,
+      async remove(dir) { removed.push(dir) },
+      async purgeSessionRecord(dir) { purged.push(dir) },
+      async listManaged() { return listed },
+    }
+    const diag = new Diagnostics()
+    const ctx = fakeContext()
+    const host = new VerifierHost(ctx, hostOverrides({ enabled: false }), {
+      selectionsFile: ledger, diagnostics: diag,
+      selectionsTesting: { factory: makeFakeFactory({}), workspaces, bridge: fakeBridge() },
+    })
+    host.start()
+    await waitFor(() => removed.length === 1)
+    assert.deepEqual(removed, ["/managed/sel-done/c0"])
+    assert.deepEqual(purged, ["/managed/sel-done/c0"], "the session-store record goes with the directory")
+    assert.equal(diag.snapshot().counters["workspaces.reclaimed"], 1)
+    assert.ok(diag.snapshot().entries.some((entry) => entry.scope === "workspaces.unknown" && entry.detail.selectionIds === "sel-mystery"))
+    await host.dispose()
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+test("bridge: sidecar warm-up is measured from spawn to first answer, and the internal probe is never a lost caller request", async () => {
+  const { Diagnostics } = await import("../lib/index.js")
+  const diag = new Diagnostics()
+  const bridge = mkBridge(STUB_SIDECAR, { diagnostics: diag })
+  try {
+    assert.equal(bridge.lastWarmupMs, null, "nothing measured before the first spawn")
+    await bridge.health({ timeoutMs: 15000 })
+    await waitFor(() => diag.snapshot().counters["sidecar.warmups"] === 1, 5000)
+    const snapshot = diag.snapshot()
+    assert.equal(typeof bridge.lastWarmupMs, "number")
+    assert.ok(bridge.lastWarmupMs >= 0 && bridge.lastWarmupMs < 15000)
+    assert.equal(snapshot.counters["sidecar.warmup_ms"], bridge.lastWarmupMs, "the counter accumulates the same milliseconds the getter reports")
+    assert.ok(!snapshot.entries.some((entry) => entry.scope === "sidecar.warmup"), "a fast warm-up is a counter, not a warning")
+    assert.ok(!snapshot.entries.some((entry) => entry.scope === "sidecar.select_unavailable"), "the stub reports select_available=true")
+  } finally { await bridge.dispose() }
+})
+
+test("portability: the process runner is a leaf and the check harness is the only place a shell is named", () => {
+  const proc = readFileSync(fileURLToPath(new URL("../src/selection/proc.ts", import.meta.url)), "utf8")
+  const procImports = [...proc.matchAll(/^import\s[^'"]*['"]([^'"]+)['"]/gm)].map((match) => match[1])
+  assert.deepEqual(procImports, ["node:child_process"], "proc.ts depends on Node only, so live.ts and checks.ts share it without a cycle")
+  const gate = readFileSync(fileURLToPath(new URL("./check-architecture.mjs", import.meta.url)), "utf8")
+  assert.ok(gate.includes("from === 'src/selection/proc.ts'"), "the architecture gate enforces the leaf rule in CI")
+  const live = readFileSync(fileURLToPath(new URL("../src/selection/live.ts", import.meta.url)), "utf8")
+  assert.ok(!/\bspawn\(\s*cmd\b/.test(live.replace(/execCapture[\s\S]*?\n}\n/, "")), "live.ts no longer hand-rolls its own bounded runner")
+  const candidates = readFileSync(fileURLToPath(new URL("../src/selection/candidates.ts", import.meta.url)), "utf8")
+  assert.ok(!/pwsh/.test(candidates), "the runner does not know which shell runs a check")
 })
