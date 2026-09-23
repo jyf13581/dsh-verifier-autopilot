@@ -35,26 +35,24 @@ import type { TrajectoryEvent } from './trajectory.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
 import { appendJsonlLedger, atomicWriteFile, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from '../ledger.js'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
+import type { AgentCreate } from '../dsh-context.js'
 import type { SelectionSnapshot, SelectionStartRequest } from '../protocol.js'
 
+/** Source-session lookup for manual runs: the seed cut, the problem text, and
+ *  the candidate's parent identity all come from here. Settlement notices go
+ *  back through `SelectionHostDeps.notify`, never through this provider, so
+ *  the shape asks for nothing more than the Host's own `Agent` offers. */
 export interface SelectionsAgentProvider {
   list(): Array<{ id: string }>
   get(id: string): {
     id: string
     ctx: unknown
     session: { events: readonly TrajectoryEvent[]; header?: { cwd?: string; delegationDepth?: number } }
-    /** Post a message into the source session (selection settlement notice). */
-    followup?: (message: {
-      id: string
-      role: 'user'
-      content: Array<{ type: 'text'; text: string }>
-      source: { kind: 'plugin'; plugin: string; form: string; summary?: string }
-    }) => void | Promise<void>
   } | undefined
 }
 
 interface LiveAgentsWiring {
-  create(options: Record<string, unknown>): Promise<{ agent: unknown; dispose(): Promise<void> }>
+  create: AgentCreate
 }
 
 export interface SelectionHostDeps {
@@ -584,7 +582,7 @@ export class SelectionHost {
       if (!this.deps.liveAgents) throw new SelectionApiError(503, 'live-agents-unavailable', 'live agent factory not wired')
       return makeLiveCandidateFactory({
         ctx: { agents: this.deps.liveAgents },
-        parent: parent as never,
+        parent,
         agentOptions: sharedRoute ?? {},
         agentPreset: body.agentPreset,
         // Autopilot candidates need to run real verification commands (e.g.

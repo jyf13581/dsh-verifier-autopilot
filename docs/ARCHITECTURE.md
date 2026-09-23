@@ -37,6 +37,7 @@ implementation code.
 | `src/util.ts` | Dependency-light boundary helpers: credentials, API-key resolution, base-URL normalization, and secret redaction. |
 | `src/ledger.ts` | Shared versioned JSONL reading/appending/compaction and same-directory atomic replacement. |
 | `src/diagnostics.ts` | Bounded, redacted degradation ledger (warnings ring + counters). Every layer reports its best-effort failures here; the snapshot rides in `/state`. Leaf: imports only `util`. |
+| `src/dsh-context.ts` | Runtime-checked views of the DSH/cordis contexts the plugin is handed: the hook surface (`on`), an agent's scoped context (`get`, session append), and the one `create` call into the agent registry. Type predicates, no casts. Leaf: imports nothing. |
 
 ### Legacy verifier path
 
@@ -59,7 +60,7 @@ implementation code.
 | `src/selection/proc.ts` | Bounded child-process runner shared by the Git helpers and the check harness: capped output (head or tail), timeout/abort with kill escalation, flush-bounded completion, spawn failure distinct from exit. Leaf: imports Node only. |
 | `src/selection/trajectory.ts` | Candidate trajectory rendering plus shared context/handoff bounding. The candidate runner depends here rather than back on autopilot orchestration. |
 | `src/selection/checks.ts` | Objective check execution and normalization. Resolves one shell per process from a platform chain (`pwsh`, then Windows PowerShell or `/bin/sh`); a shell that cannot start is a harness error, never evidence against a candidate. |
-| `src/selection/bridge.ts` | Framed subprocess client for the Python verifier sidecar. |
+| `src/selection/bridge.ts` | Framed subprocess client for the Python verifier sidecar, and the only place a sidecar frame becomes a typed value: `parseHealthResult` / `parseSelectResult` / `parseProgressResult` / `parseErrorFrame` (malformed shape → `bridge_protocol`). |
 | `src/selection/retry.ts` | Bounded retry policy for transient bridge failures. |
 | `src/selection/probe.ts` | Availability/capability probing. |
 | `bridge/llm_verifier_sidecar.py` | JSON-lines process boundary around the optional Python `llm_verifier` library. |
@@ -146,11 +147,30 @@ Follow these rules:
     helper in `live.ts` is the single deliberate exception (it streams a
     tracked file list from stdin and returns raw bytes for shell-free diffs).
 
+11. **Type seams are declared once and checked at runtime, never cast.**
+    Three kinds of value enter the plugin without a compile-time type: DSH
+    contexts and agents (DSH augments the cordis event map and brands its
+    identifiers at link time, which this build does not see), sidecar frames
+    (JSON Lines from a Python process), and provider bodies (`fetch().json()`).
+    Each has exactly one narrowing point: `dsh-context.ts` type predicates
+    (`isHookSource`, `isAgentScope`, `requireHookSource`) for contexts,
+    `bridge.ts` frame parsers (`parseHealthResult`, `parseSelectResult`,
+    `parseProgressResult`, `parseErrorFrame`) for the sidecar — a shape the
+    protocol does not allow is a `bridge_protocol` error, never a `TypeError`
+    inside a mapping — and `validateConfigPatch()` for configuration, which
+    builds an untyped record against the schema-derived field table and takes
+    the `Config` type in one documented place. A cast through `never`, `any`,
+    or `unknown` (`x as never`, `x as any`, `x as unknown as T`) re-opens a
+    seam at an arbitrary call site with no check behind it; the architecture
+    gate rejects every occurrence in `src/`. Narrow with a predicate or a
+    parser, or widen the declared interface (as `HostContext.agents.create`
+    and `SelectionsAgentProvider` were) so the structural types actually meet.
+
 A cycle is a design signal. Move a shared shape to `protocol.ts`, a generic
 boundary helper to `util.ts`, or a persistence primitive to `ledger.ts` rather
 than introducing a reciprocal import. `npm run check:architecture` parses the
-TypeScript module graph, rejects runtime **and type-only** cycles, and enforces
-these layer restrictions in CI.
+TypeScript module graph, rejects runtime **and type-only** cycles, enforces
+these layer restrictions, and rejects blind casts (rule 11) in CI.
 
 ## 4. Evidence boundary: verification is not selection
 
@@ -423,20 +443,69 @@ git diff --check "$(git merge-base origin/main HEAD)" HEAD
 What each gate covers:
 
 - `check:architecture`: parses project imports, enforces allowed layer
-  directions, and rejects runtime or type-only module cycles.
+  directions, rejects runtime or type-only module cycles, and rejects blind
+  casts (`as never`, `as any`, `as unknown as`) anywhere in `src/`.
 - `typecheck`: strict Host and client TypeScript checking without emit.
 - `build:host`: emits Node modules, source maps, and declarations to `lib/`.
 - `build:client`: bundles `src/client/index.ts` as the DSH browser module in
   `lib/client.js`; it deliberately does not clean Host output.
-- `npm test`: deterministic Node regression suite over emitted modules,
-  including evidence, verifier, API, Host, ledger, and selection behavior.
+- `npm test`: deterministic Node regression suite over emitted modules, one
+  file per domain under `scripts/tests/` (layout below). `node --test` runs
+  every file in its own process, so a leaked timer, handle, or rejection is
+  attributable to one domain, and a single file runs alone with
+  `node --test scripts/tests/<domain>.test.mjs`.
 - `bridge/self_test.py`: offline framing, validation, shutdown, retry, and
-  optional-provider gates for the Python boundary. Set
+  optional-provider gates for the Python boundary. The frame-level gates are
+  the `conformance` cases of `bridge/protocol-fixtures.json`. Set
   `DSH_VA_REQUIRE_LLM_VERIFIER=1` in the real bridge venv to require provider
   availability and the provider-specific mojibake gate.
 - `git diff --check "$(git merge-base origin/main HEAD)" HEAD`: whitespace/EOL
   guard over the committed change range. A bare `git diff --check` in a clean
   checkout checks nothing.
+
+### Test layout
+
+```text
+scripts/tests/
+  evidence.test.mjs          trace rendering, evidence ids, citation audit, turn gating
+  verifier-scoring.test.mjs  prompt protocol, score-tag parsing, effort, feedback math
+  verifier-lanes.test.mjs    lane retry taxonomy, redaction on egress, workers, smoothing
+  host.test.mjs              VerifierHost lifecycle, coordinator seam, record persistence
+  api.test.mjs               route validation, rate-limit buckets, probe, disconnects, 500s
+  config.test.mjs            settings-source sync, schema-derived patch validation
+  repair-v2.test.mjs         preregistered eval tooling (eval/repair-v2.mjs)
+  bridge.test.mjs            sidecar framing (stub + real, offline), parsers, retry, preflight
+  selection-runner.test.mjs  candidate batch: checks gate, winner gate, progress guard, cleanup
+  selection-host.test.mjs    /select admission, options, snapshots, discard, audit packs
+  autopilot.test.mjs         admission policy, route planning, prober, pre-step lifecycle
+  workspaces.test.mjs        isolated Git workspaces, snapshots, orphan reclamation
+  storage.test.mjs           settlement ledger, running rows, artifact GC
+  process-checks.test.mjs    bounded process runner, check shell chain, portability
+  diagnostics.test.mjs       degradation sink, redaction, /events, leaf boundary
+  helpers/                   harness (timing, rejection collector), provider (mocked
+                             verifier), host (fake DSH context), selection (fake
+                             factories/bridges, real workspaces), sidecar, git
+  fixtures/stub_sidecar.py   protocol-conformant stub sidecar (answers from the fixtures)
+```
+
+Helpers are plain functions with no registration side effects, with two
+documented exceptions: `helpers/harness.mjs` installs an unhandled-rejection
+collector that records the reason **and** fails the file, and
+`helpers/selection.mjs` creates one temp workspace root per process and
+removes it at exit.
+
+### Sidecar protocol fixtures
+
+`bridge/protocol-fixtures.json` is the single source for the wire protocol's
+canonical frames. Three consumers read it: `bridge/self_test.py` drives its
+`conformance` cases through the real sidecar; `scripts/tests/fixtures/stub_sidecar.py`
+answers with its `responses`/`errors` frames; and `scripts/tests/bridge.test.mjs`
+asserts that the TypeScript bridge emits exactly the `requests` frames (via the
+stub's echo file), parses every canonical response, rejects every
+`malformed_results` entry as `bridge_protocol`, and that `PROTOCOL.md`'s error
+codes and request/result keys match the fixtures and `SIDECAR_ERROR_CODES`.
+A protocol change is therefore made in the fixture and the document first, and
+each side of the pipe fails until it follows.
 
 Some regression fixtures invoke PowerShell and require `pwsh`. Run the complete
 suite on the Ubuntu CI image when a local environment lacks it. The historical
@@ -462,7 +531,8 @@ must remain untracked.
 | Candidate execution/state transition | `src/selection/candidates.ts` | Live adapters and selection tests |
 | Git workspace or live agent behavior | `src/selection/live.ts` | Cleanup/cancellation tests |
 | Objective check | `src/selection/checks.ts` | Request validation and audit output |
-| Sidecar protocol | `src/selection/bridge.ts` + `bridge/llm_verifier_sidecar.py` | `bridge/self_test.py`, retry tests |
+| Sidecar protocol | `bridge/protocol-fixtures.json` + `bridge/PROTOCOL.md` first, then `src/selection/bridge.ts` + `bridge/llm_verifier_sidecar.py` | `bridge/self_test.py`, `scripts/tests/bridge.test.mjs`, the stub sidecar |
+| DSH context shape (hooks, agent registry, scoped services) | `src/dsh-context.ts` | `HostContext` in `host.ts`, live adapter in `selection/live.ts` |
 | History format/compaction | `src/ledger.ts` | Both Hosts, migration/reload tests |
 | Credential/URL/redaction behavior | `src/util.ts` | Compatibility export and boundary tests |
 | Browser presentation only | `src/client/index.ts` | Client build; no server-domain import |

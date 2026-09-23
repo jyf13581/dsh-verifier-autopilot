@@ -133,6 +133,25 @@ function clientAbortSignal(res: WebResponse): AbortSignal {
 }
 
 /** Exported for regression tests: builds the Host API routes for this host. */
+/** Model ids from an OpenAI-style `/models` listing body of unknown shape:
+ *  `{ data: [{ id }] }`, or bare strings, capped at 50; anything else is an
+ *  empty list, never a throw. */
+/** `error.message` from an OpenAI-style error body, when it has one. */
+function upstreamErrorMessage(body: unknown): string | undefined {
+  if (typeof body !== 'object' || body === null || !('error' in body)) return undefined
+  const error = body.error
+  if (typeof error !== 'object' || error === null || !('message' in error)) return undefined
+  return typeof error.message === 'string' ? error.message : undefined
+}
+
+function modelIdsOf(body: unknown): string[] {
+  if (typeof body !== 'object' || body === null || !('data' in body) || !Array.isArray(body.data)) return []
+  return body.data.slice(0, 50).map((entry: unknown) => {
+    if (typeof entry === 'object' && entry !== null && 'id' in entry) return String(entry.id)
+    return String(entry)
+  })
+}
+
 export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   const evalLimiter = createRateLimiter(API_RATE_LIMITS.evalPerMinute, 60_000)
   const probeLimiter = createRateLimiter(API_RATE_LIMITS.probePerMinute, 60_000)
@@ -251,15 +270,15 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
           headers: { authorization: 'Bearer ' + key },
           signal: AbortSignal.any([AbortSignal.timeout(30000), signal]),
         })
-        const listBody = await listResponse.json().catch(() => ({}) as any)
-        const ids = Array.isArray(listBody?.data) ? listBody.data.map((m: any) => String(m?.id ?? m)).slice(0, 50) : []
+        const listBody: unknown = await listResponse.json().catch(() => ({}))
+        const ids = modelIdsOf(listBody)
         // Upstream health maps straight into ok: a non-2xx listing is NOT a ready provider.
         return json(res, 200, {
           ok: listResponse.ok,
           transportOk: listResponse.ok,
           status: listResponse.status,
           models: ids,
-          apiError: listResponse.ok ? undefined : String(listBody?.error?.message ?? 'HTTP ' + listResponse.status).slice(0, 240),
+          apiError: listResponse.ok ? undefined : (upstreamErrorMessage(listBody) ?? 'HTTP ' + listResponse.status).slice(0, 240),
         })
       }
       // Ride the production lane path end-to-end: same prompt shape, parser,

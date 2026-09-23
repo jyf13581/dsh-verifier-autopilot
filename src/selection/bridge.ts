@@ -11,12 +11,25 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 
+/** Error codes the sidecar may put in a failure frame (bridge/PROTOCOL.md
+ *  "Error Codes"). The protocol fixtures test keeps this list and the
+ *  document in agreement. */
+export const SIDECAR_ERROR_CODES = [
+  'bad_frame', 'invalid_request', 'missing_api_key', 'bridge_unavailable', 'client_init',
+  'missing_logprobs', 'timeout', 'provider_error', 'selection_failed',
+] as const
+export type SidecarErrorCode = typeof SIDECAR_ERROR_CODES[number]
+
+/** Sidecar codes plus the ones this side of the pipe raises itself. */
 export type BridgeErrorCode =
-  | 'bad_frame' | 'invalid_request' | 'missing_api_key' | 'client_init'
-  | 'missing_logprobs' | 'timeout' | 'provider_error' | 'selection_failed'
+  | SidecarErrorCode
   | 'preflight_failed' | 'selection_timeout'
   | 'bridge_timeout' | 'bridge_down' | 'bridge_disposed' | 'bridge_aborted'
   | 'bridge_protocol'
+
+function isSidecarErrorCode(value: unknown): value is SidecarErrorCode {
+  return typeof value === 'string' && (SIDECAR_ERROR_CODES as readonly string[]).includes(value)
+}
 
 export class BridgeError extends Error {
   readonly code: BridgeErrorCode
@@ -144,6 +157,98 @@ export interface BridgeProgressResult {
   usage: BridgeUsage
 }
 
+// ---- Frame parsing: the only place sidecar output becomes a typed value ----
+//
+// Everything the sidecar answers is untrusted until it is parsed. A shape the
+// protocol does not allow is a `bridge_protocol` error: never a TypeError from
+// inside a mapping, never a half-typed object handed to the runner. Verdict-
+// bearing fields (index, scores, ranking, comparisons, criteria) are strict;
+// usage is telemetry and degrades to zeros rather than failing a verdict.
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function protocolError(what: string): BridgeError {
+  return new BridgeError('bridge_protocol', 'sidecar result malformed: ' + what, false)
+}
+
+function finiteNumber(record: Record<string, unknown>, key: string): number {
+  const value = record[key]
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw protocolError(key + ' must be a finite number')
+  return value
+}
+
+function numberArray(record: Record<string, unknown>, key: string, integers: boolean): number[] {
+  const value = record[key]
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'number' && (integers ? Number.isInteger(item) : Number.isFinite(item)))) {
+    throw protocolError(key + ' must be an array of ' + (integers ? 'integers' : 'finite numbers'))
+  }
+  return value.map(Number)
+}
+
+function stringArray(record: Record<string, unknown>, key: string): string[] {
+  const value = record[key]
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) throw protocolError(key + ' must be an array of strings')
+  return value.map(String)
+}
+
+const USAGE_FIELDS: ReadonlyArray<keyof BridgeUsage> = ['calls', 'input_tokens', 'cached_input_tokens', 'uncached_input_tokens', 'output_tokens', 'reasoning_tokens', 'cache_hit_rate']
+
+function parseUsage(value: unknown): BridgeUsage {
+  const source = isRecord(value) ? value : {}
+  const usage = { calls: 0, input_tokens: 0, cached_input_tokens: 0, uncached_input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cache_hit_rate: 0 }
+  for (const field of USAGE_FIELDS) {
+    const raw = source[field]
+    if (typeof raw === 'number' && Number.isFinite(raw)) usage[field] = raw
+  }
+  return usage
+}
+
+export function parseHealthResult(value: unknown): BridgeHealth {
+  if (!isRecord(value)) throw protocolError('health result must be an object')
+  if (typeof value.select_available !== 'boolean') throw protocolError('select_available must be a boolean')
+  return {
+    python: String(value.python ?? ''),
+    llm_verifier_version: String(value.llm_verifier_version ?? ''),
+    select_available: value.select_available,
+    note: String(value.note ?? ''),
+    deepseek_effort: typeof value.deepseek_effort === 'string' ? value.deepseek_effort : null,
+  }
+}
+
+export function parseSelectResult(value: unknown): BridgeSelectResult {
+  if (!isRecord(value)) throw protocolError('select result must be an object')
+  const index = finiteNumber(value, 'index')
+  if (!Number.isInteger(index)) throw protocolError('index must be an integer')
+  return {
+    index,
+    bestPreview: typeof value.best_preview === 'string' ? value.best_preview : '',
+    scores: numberArray(value, 'scores', false),
+    ranking: numberArray(value, 'ranking', true),
+    nComparisons: finiteNumber(value, 'n_comparisons'),
+    criteria: stringArray(value, 'criteria'),
+    usage: parseUsage(value.usage),
+  }
+}
+
+export function parseProgressResult(value: unknown): BridgeProgressResult {
+  if (!isRecord(value)) throw protocolError('progress result must be an object')
+  return { score: finiteNumber(value, 'score'), usage: parseUsage(value.usage) }
+}
+
+/** A failure frame's error object as a typed BridgeError. Codes outside the
+ *  documented set are not invented into the union: they become
+ *  `selection_failed` with the original code kept in the message. */
+export function parseErrorFrame(frame: Record<string, unknown>): BridgeError {
+  const err = isRecord(frame.error) ? frame.error : {}
+  const message = typeof err.message === 'string' ? err.message : 'sidecar selection failed'
+  const retriable = err.retriable === true
+  if (isSidecarErrorCode(err.code)) return new BridgeError(err.code, message, retriable)
+  const label = typeof err.code === 'string' && err.code ? err.code : 'missing'
+  return new BridgeError('selection_failed', 'sidecar error code ' + label + ': ' + message, retriable)
+}
+
 export class VerifierBridge {
   private readonly pythonPath: string
   private readonly scriptPath: string
@@ -253,7 +358,7 @@ export class VerifierBridge {
         this.diagnostics.count('sidecar.warmups')
         this.diagnostics.count('sidecar.warmup_ms', elapsed)
         if (elapsed > SIDECAR_SLOW_WARMUP_MS) this.diagnostics.warn('sidecar.warmup', 'sidecar took ' + elapsed + 'ms from spawn to its first answer', { python: this.pythonPath })
-        const result = (frame.ok === true ? frame.result : null) as Partial<BridgeHealth> | null
+        const result = frame.ok === true && isRecord(frame.result) ? frame.result : null
         if (result && result.select_available === false) this.diagnostics.warn('sidecar.select_unavailable', String(result.note ?? 'llm_verifier dependency is unavailable'), { python: this.pythonPath })
       },
     })
@@ -371,8 +476,8 @@ export class VerifierBridge {
     const frame = await this.request(
       { id: crypto.randomUUID(), type: 'health' },
       { timeoutMs: options?.timeoutMs ?? this.defaultTimeoutMs })
-    if (frame.ok !== true) throw this.frameError(frame)
-    return frame.result as unknown as BridgeHealth
+    if (frame.ok !== true) throw parseErrorFrame(frame)
+    return parseHealthResult(frame.result)
   }
 
   async select(req: BridgeSelectRequest): Promise<BridgeSelectResult> {
@@ -400,17 +505,8 @@ export class VerifierBridge {
       call_retries: Math.max(0, Math.min(5, Math.floor(req.callRetries ?? 2))),
       progress: false,
     }, { timeoutMs: req.timeoutMs ?? this.defaultTimeoutMs, signal: req.signal })
-    if (frame.ok !== true) throw this.frameError(frame)
-    const result = frame.result as Record<string, unknown>
-    return {
-      index: Number(result.index),
-      bestPreview: String(result.best_preview ?? ''),
-      scores: (result.scores as number[]).map(Number),
-      ranking: (result.ranking as number[]).map(Number),
-      nComparisons: Number(result.n_comparisons),
-      criteria: (result.criteria as string[]).map(String),
-      usage: result.usage as BridgeUsage,
-    }
+    if (frame.ok !== true) throw parseErrorFrame(frame)
+    return parseSelectResult(frame.result)
   }
 
 
@@ -432,9 +528,8 @@ export class VerifierBridge {
       n_evaluations: req.nEvaluations ?? 1,
       effort: req.effort ?? null,
     }, { timeoutMs: req.timeoutMs ?? this.defaultTimeoutMs, signal: req.signal })
-    if (frame.ok !== true) throw this.frameError(frame)
-    const result = frame.result as Record<string, unknown>
-    return { score: Number(result.score), usage: result.usage as BridgeUsage }
+    if (frame.ok !== true) throw parseErrorFrame(frame)
+    return parseProgressResult(frame.result)
   }
 
   /**
@@ -478,13 +573,6 @@ export class VerifierBridge {
           + ' over ' + result.nComparisons + ' comparisons — expected the present-output trajectory to win strictly',
         false)
     }
-  }
-
-  private frameError(frame: Record<string, unknown>): BridgeError {
-    const err = (frame.error ?? {}) as Record<string, unknown>
-    const code = (typeof err.code === 'string' ? err.code : 'selection_failed') as BridgeErrorCode
-    const message = typeof err.message === 'string' ? err.message : 'sidecar selection failed'
-    return new BridgeError(code, message, err.retriable === true)
   }
 
   async dispose(): Promise<void> {

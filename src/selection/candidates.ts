@@ -386,8 +386,10 @@ function deterministicPreface(cand: CandidateRecord, taskKind: string | undefine
 /** Validate the untrusted sidecar payload before any index is mapped back to
  * an agent. A malformed result must fail transparently; it must never crown a
  * candidate by accident or turn a partial ranking into a winner. */
-function validateSelectionResult(outcome: BridgeSelectResult, candidateCount: number): void {
-  const value = outcome as unknown as Record<string, unknown>
+function validateSelectionResult(value: { [K in keyof BridgeSelectResult]?: unknown }, candidateCount: number): void {
+  // Typed as "these fields, contents unknown": the bridge parsed the wire
+  // shape, but an injected bridge (tests, embedded hosts) has not, and the
+  // candidate-count invariants below belong to the runner either way.
   const index = value.index
   const scores = value.scores
   const ranking = value.ranking

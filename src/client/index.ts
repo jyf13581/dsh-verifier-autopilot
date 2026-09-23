@@ -4,17 +4,25 @@ import {
   type SelectionsListResponse, type State, type VerifyResponse,
 } from '../protocol.js'
 
-declare const require: (name: string) => any
+declare const require: (name: string) => unknown
 
-type SlotsService = { inject(name: string, callback: () => void | (() => void)): void; register(options: any, component: any): () => void }
+/** The panel renders through the host application's React, reached via the
+ *  client runtime's `require`. The plugin build links no React typings, so
+ *  the slice it uses is declared here: elements are opaque, components take
+ *  their own props, DOM events expose only what the handlers read. */
+type VNode = unknown
+type Component = (props: never) => VNode
+type FieldEvent = { target: { value?: string; blur(): void }; currentTarget: { blur(): void }; key?: string }
+
+type SlotsService = { inject(name: string, callback: () => void | (() => void)): void; register(options: Record<string, unknown>, component: Component): () => void }
 type SettingsValue = Partial<Pick<State['config'], 'enabled' | 'autoFeedback' | 'model' | 'selectionMode' | 'selectionModelStrategy'>>
 type SettingsScope = { getSnapshot(): { value?: SettingsValue; status?: string }; subscribe(listener: () => void): () => void; set(field: string, value: unknown): Promise<void> }
 type SettingsBinder = { bind(spec: { namespace: string }): SettingsScope }
 type ClientContext = { slots: SlotsService; get(name: string): unknown; settingsScope?: SettingsBinder }
 
 type ReactApi = {
-  createElement: (type: any, props?: Record<string, any> | null, ...children: any[]) => any
-  useEffect: (effect: () => void | (() => void), deps?: any[]) => void
+  createElement: (type: string | Component, props?: Record<string, unknown> | null, ...children: VNode[]) => VNode
+  useEffect: (effect: () => void | (() => void), deps?: readonly unknown[]) => void
   useState: <T>(initial: T) => [T, (next: T | ((previous: T) => T)) => void]
 }
 const { createElement: h, useEffect, useState } = require('react') as ReactApi
@@ -71,7 +79,7 @@ function formatDiagnosticTime(at: number): string {
 
 /** Folded degradation ledger: what the Host chose to survive instead of fail.
  *  Empty is the healthy state and stays out of the way. */
-function DiagnosticsSection(props: { state: State | null }): any {
+function DiagnosticsSection(props: { state: State | null }): VNode {
   const snapshot = props.state?.diagnostics
   if (!snapshot) return null
   const entries = snapshot.entries.slice(0, 8)
@@ -88,7 +96,7 @@ function DiagnosticsSection(props: { state: State | null }): any {
   )
 }
 
-function Checkbox(props: { checked: boolean; onChange: () => void; label: string; disabled?: boolean }): any {
+function Checkbox(props: { checked: boolean; onChange: () => void; label: string; disabled?: boolean }): VNode {
   return h('label', { style: { display: 'flex', alignItems: 'center', gap: 5, opacity: props.disabled ? 0.65 : 1 } }, h('input', { type: 'checkbox', checked: props.checked, disabled: props.disabled, onChange: props.onChange }), props.label)
 }
 
@@ -98,7 +106,7 @@ const wideInputStyle = { fontSize: 12, flex: 1, minWidth: 120, padding: '2px 4px
 
 /** Enforced-integer config input: invalid or out-of-range entries are ignored,
  *  extremes are clamped before committing. */
-function NumberField(props: { value: number; min: number; max: number; disabled?: boolean; title?: string; onCommit: (next: number) => void }): any {
+function NumberField(props: { value: number; min: number; max: number; disabled?: boolean; title?: string; onCommit: (next: number) => void }): VNode {
   const commit = (raw: string): void => {
     const parsed = Number(raw)
     if (!Number.isFinite(parsed)) return
@@ -108,19 +116,19 @@ function NumberField(props: { value: number; min: number; max: number; disabled?
   return h('input', {
     type: 'number', min: props.min, max: props.max, step: 1, value: props.value, disabled: props.disabled, title: props.title,
     style: tinyInputStyle,
-    onChange: (ev: any) => commit(String(ev.target?.value ?? '')),
+    onChange: (ev: FieldEvent) => commit(String(ev.target?.value ?? '')),
   })
 }
 
-function EffortSelect(props: { value: string; disabled?: boolean; onCommit: (next: 'off' | 'low' | 'high' | 'max') => void }): any {
+function EffortSelect(props: { value: string; disabled?: boolean; onCommit: (next: 'off' | 'low' | 'high' | 'max') => void }): VNode {
   return h('select', {
     value: props.value, disabled: props.disabled, title: '验证器思考强度（verifier thinking effort）',
-    onChange: (ev: any) => { const next = String(ev.target.value ?? '') as 'off' | 'low' | 'high' | 'max'; if (EFFORT_OPTIONS.includes(next)) props.onCommit(next) },
+    onChange: (ev: FieldEvent) => { const next = String(ev.target.value ?? '') as 'off' | 'low' | 'high' | 'max'; if (EFFORT_OPTIONS.includes(next)) props.onCommit(next) },
     style: { fontSize: 12 },
   }, ...EFFORT_OPTIONS.map(option => h('option', { key: option, value: option }, option)))
 }
 
-function DurableSettingsPanel(props: { scope: SettingsScope }): any {
+function DurableSettingsPanel(props: { scope: SettingsScope }): VNode {
   const [snapshot, setSnapshot] = useState(props.scope.getSnapshot())
   const [error, setError] = useState('')
   // Phase 2 fallback: when the durable settings service is unavailable the
@@ -162,7 +170,7 @@ const STAGE_LABELS: Record<string, string> = {
   workspace: '工作区快照', preflight: '验证器预检', rollout: '候选执行', checks: '客观检查', ranking: '比较排序', settled: '结算',
 }
 
-function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsScope }): any {
+function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsScope }): VNode {
   const [data, setData] = useState<SelectionsListResponse | null>(null)
   const [hostState, setHostState] = useState<State | null>(null)
   const [status, setStatus] = useState('')
@@ -284,19 +292,19 @@ function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsSco
       h('input', {
         type: 'number', min: 0, max: 0.5, step: 0.005, value: config?.selectionMarginThreshold ?? 0.03, disabled: saving, style: tinyInputStyle,
         title: 'top-2 margin 噪声门限：低于它一律 abstain（0.03 = 校准首轮 C0 噪声上限的 2.2 倍，暂标 temporary）',
-        onChange: (ev: any) => { const v = Number(String(ev.target?.value ?? '')); if (Number.isFinite(v)) void saveConfig('selectionMarginThreshold', Math.max(0, Math.min(0.5, v))) },
+        onChange: (ev: FieldEvent) => { const v = Number(String(ev.target?.value ?? '')); if (Number.isFinite(v)) void saveConfig('selectionMarginThreshold', Math.max(0, Math.min(0.5, v))) },
       }),
       h('span', null, 'provider'),
       h('input', {
         value: config?.selectionProvider ?? 'kimi', disabled: saving, style: tinyInputStyle, title: '候选 provider 名',
-        onChange: (ev: any) => { const v = String(ev.target.value ?? '').trim(); if (v && v !== (config?.selectionProvider ?? 'kimi')) void saveConfig('selectionProvider', v) },
+        onChange: (ev: FieldEvent) => { const v = String(ev.target.value ?? '').trim(); if (v && v !== (config?.selectionProvider ?? 'kimi')) void saveConfig('selectionProvider', v) },
       })),
     h('div', { style: rowStyle },
       h('span', null, '候选模型池'),
       h('input', {
         key: 'models-' + (config?.selectionModels ?? ''), defaultValue: config?.selectionModels ?? '', disabled: saving, style: wideInputStyle, title: '逗号分隔，按质量从高到低（quality-first 时全部候选用第一名）',
-        onBlur: (ev: any) => { const v = String(ev.target.value ?? '').trim(); if (v && v !== config?.selectionModels) void saveConfig('selectionModels', v) },
-        onKeyDown: (ev: any) => { if (ev.key === 'Enter') ev.target.blur() },
+        onBlur: (ev: FieldEvent) => { const v = String(ev.target.value ?? '').trim(); if (v && v !== config?.selectionModels) void saveConfig('selectionModels', v) },
+        onKeyDown: (ev: FieldEvent) => { if (ev.key === 'Enter') ev.target.blur() },
       })),
     config?.selectionModels ? h('div', { style: { color: 'var(--muted-color, #666)', overflowWrap: 'anywhere' } }, '质量顺序 · ' + config.selectionModels.split(',').map((m: string) => m.trim()).filter(Boolean).join(' · ')) : null,
     selectionRows.length ? selectionRows : h('div', null, '尚无候选运行记录'),
@@ -304,7 +312,7 @@ function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsSco
   )
 }
 
-function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScope }): any {
+function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScope }): VNode {
   const [state, setState] = useState<State | null>(null)
   const [enabled, setEnabled] = useState(true)
   const [autoFeedback, setAutoFeedback] = useState(false)
@@ -426,7 +434,7 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
       h('select', {
         value: MODEL_OPTIONS.some(option => option.id === state?.config?.model) ? (state?.config?.model ?? '') : '__custom__',
         disabled: saving,
-        onChange: (ev: any) => {
+        onChange: (ev: FieldEvent) => {
           const next = String(ev.target.value ?? '')
           if (!next || next === '__custom__') return
           const opt = MODEL_OPTIONS.find(o => o.id === next)
@@ -437,11 +445,11 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
       h('input', {
         value: state?.config?.model ?? '', disabled: saving, style: wideInputStyle, maxLength: 200,
         placeholder: '输入任意模型 ID', title: '自定义模型 ID；必须支持当前 Verifier 的标签/评分协议',
-        onBlur: (ev: any) => {
+        onBlur: (ev: FieldEvent) => {
           const next = String(ev.target.value ?? '').trim()
           if (next && next !== state?.config?.model) void savePatch({ model: next })
         },
-        onKeyDown: (ev: any) => { if (ev.key === 'Enter') ev.currentTarget.blur() },
+        onKeyDown: (ev: FieldEvent) => { if (ev.key === 'Enter') ev.currentTarget.blur() },
       }),
     ),
     h('small', null, MODEL_OPTIONS.find(option => option.id === state?.config?.model)?.note ?? '自定义模型：需自行确认 logprob/标签门禁'),
@@ -461,11 +469,11 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
       h('input', {
         value: state?.config?.verifierSmallModel ?? '', disabled: saving, style: wideInputStyle, maxLength: 200,
         placeholder: '留空=全部用主模型', title: '分层小模型：completion/evidence 这类机械 lane 改用它（如 nvidia/nemotron-3-ultra-550b-a55b）；难 lane 与锦标赛仍用主模型',
-        onBlur: (ev: any) => {
+        onBlur: (ev: FieldEvent) => {
           const next = String(ev.target.value ?? '').trim()
           if (next !== (state?.config?.verifierSmallModel ?? '')) void savePatch({ verifierSmallModel: next })
         },
-        onKeyDown: (ev: any) => { if (ev.key === 'Enter') ev.currentTarget.blur() },
+        onKeyDown: (ev: FieldEvent) => { if (ev.key === 'Enter') ev.currentTarget.blur() },
       })),
     h('div', { style: rowStyle },
       h('button', { type: 'button', disabled: busy || saving, onClick: () => { void verify() } }, busy ? '验证中...' : '验证当前会话'),

@@ -24,6 +24,8 @@ walk(sourceRoot)
 
 const fileSet = new Set(files)
 const edges = new Map()
+// Blind casts found while walking each file; reported with the boundary rules.
+const seamBreaches = []
 
 function resolveLocal(from, specifier) {
   if (!specifier.startsWith('.')) return null
@@ -72,9 +74,30 @@ for (const file of files) {
       if (node.expression.kind === ts.SyntaxKind.ImportKeyword) addEdge(file, node.arguments[0].text, true)
       if (ts.isIdentifier(node.expression) && node.expression.text === 'require') addEdge(file, node.arguments[0].text, true)
     }
+    const breach = blindCast(node)
+    if (breach) {
+      const { line } = source.getLineAndCharacterOfPosition(node.getStart(source))
+      seamBreaches.push(relative(file) + ':' + (line + 1) + ': ' + breach + ' — ' + node.getText(source).replace(/\s+/g, ' ').slice(0, 80))
+    }
     ts.forEachChild(node, visit)
   }
   visit(source)
+}
+
+// Type seams. DSH contexts, sidecar frames, and provider bodies enter the
+// plugin as `unknown` and are narrowed once at a declared boundary
+// (dsh-context.ts guards, bridge.ts frame parsers, config.ts's schema-derived
+// validator). A cast through `never`/`any`/`unknown` re-opens such a seam at
+// an arbitrary call site with no runtime check behind it, so none may appear
+// in src/. Narrow with a type predicate or a parser instead.
+function blindCast(node) {
+  const isKind = (type, kind) => type && type.kind === kind
+  if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) {
+    if (isKind(node.type, ts.SyntaxKind.NeverKeyword)) return 'cast to never'
+    if (isKind(node.type, ts.SyntaxKind.AnyKeyword)) return 'cast to any'
+    if (ts.isAsExpression(node) && ts.isAsExpression(node.expression) && isKind(node.expression.type, ts.SyntaxKind.UnknownKeyword)) return 'double cast through unknown'
+  }
+  return null
 }
 
 const problems = []
@@ -96,6 +119,9 @@ for (const edge of edges.values()) {
   }
   if (from === 'src/selection/proc.ts' && to.startsWith('src/')) {
     reject('the bounded process runner is a leaf: live.ts and checks.ts both build on it, so it may import Node only')
+  }
+  if (from === 'src/dsh-context.ts' && to.startsWith('src/')) {
+    reject('the DSH context seam is a leaf: Host and selection both narrow through it, so it may import nothing')
   }
   if (from === 'src/config.ts' && isSelection(edge.to)) {
     reject('configuration owns policy types and may not depend on selection implementation')
@@ -143,6 +169,7 @@ function visitCycle(file) {
 }
 for (const file of files) visitCycle(file)
 if (cycle) problems.push('module cycle: ' + cycle.map(relative).join(' -> '))
+for (const breach of seamBreaches) problems.push('blind cast: ' + breach)
 
 if (problems.length > 0) {
   console.error('Architecture check failed:')
@@ -150,5 +177,5 @@ if (problems.length > 0) {
   process.exitCode = 1
 } else {
   const runtimeCount = [...edges.values()].filter(edge => edge.runtime).length
-  console.log('Architecture check passed: ' + files.length + ' modules, ' + runtimeCount + ' runtime edges, ' + (edges.size - runtimeCount) + ' type-only edges, 0 cycles')
+  console.log('Architecture check passed: ' + files.length + ' modules, ' + runtimeCount + ' runtime edges, ' + (edges.size - runtimeCount) + ' type-only edges, 0 cycles, 0 blind casts')
 }

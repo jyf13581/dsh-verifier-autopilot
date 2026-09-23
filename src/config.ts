@@ -206,26 +206,30 @@ export function createSettingsSourceHooks(host: { replaceConfig(next: Config): v
   }
 }
 
+/** @deprecated Since the sixth architecture pass this is an identity copy:
+ *  configuration never carries credential values (only `apiKeyEnv` names),
+ *  so there is nothing to clean before it leaves through `/state`. Kept one
+ *  release for embedders; `VerifierHost.snapshot()` no longer calls it. */
 export function cleanConfig(config: Config): Config {
-  return { ...config, apiKeyEnv: config.apiKeyEnv }
+  return { ...config }
 }
 
 export function validateConfigPatch(value: unknown): Partial<Config> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('config-object-required')
   const input = value as Record<string, unknown>
-  const output: Partial<Config> = {}
+  const output: Record<string, unknown> = {}
   for (const key of Object.keys(input) as Array<keyof Config>) {
     const shape = CONFIG_FIELDS.get(key)
     if (!shape) throw new Error('unknown-config-key:' + key)
     const item = input[key]
     if (shape.kind === 'boolean') {
       if (typeof item !== 'boolean') throw new Error('config-boolean-required:' + key)
-      output[key] = item as never
+      output[key] = item
       continue
     }
     if (shape.kind === 'union') {
       if (typeof item !== 'string' || !shape.choices.includes(item)) throw new Error(unionErrorCode(key))
-      output[key] = item as never
+      output[key] = item
       continue
     }
     if (key === 'selectionPostAuditTestCommand') {
@@ -233,7 +237,7 @@ export function validateConfigPatch(value: unknown): Partial<Config> {
       // default and must be accepted.
       if (typeof item !== 'string') throw new Error('config-string-required:' + key)
       if (/[\u0000-\u0008\u000B-\u001F\u007F]/.test(item) || item.length > 2000) throw new Error('config-invalid-string:' + key)
-      output[key] = item as never
+      output[key] = item
       continue
     }
     if (key === 'verifierSmallModel') {
@@ -241,7 +245,7 @@ export function validateConfigPatch(value: unknown): Partial<Config> {
       // can always clear it and fall back to the single-model verifier.
       if (typeof item !== 'string') throw new Error('config-string-required:' + key)
       if (/[\u0000-\u0008\u000B-\u001F\u007F]/.test(item) || item.length > 200) throw new Error('config-invalid-string:' + key)
-      output[key] = item as never
+      output[key] = item
       continue
     }
     if (shape.kind === 'string') {
@@ -264,14 +268,17 @@ export function validateConfigPatch(value: unknown): Partial<Config> {
         if (!parsed.hostname) throw new Error('config-baseURL-host-required:' + key)
         if (parsed.username || parsed.password) throw new Error('config-baseURL-credentials-forbidden:' + key)
       }
-      output[key] = normalized as never
+      output[key] = normalized
       continue
     }
     // Numbers: kind, integrality, and bounds all come from the schema.
     if (typeof item !== 'number' || !Number.isFinite(item)) throw new Error('config-number-required:' + key)
     if (shape.integer && !Number.isInteger(item)) throw new Error('config-integer-required:' + key)
     if ((shape.min !== undefined && item < shape.min) || (shape.max !== undefined && item > shape.max)) throw new Error('config-out-of-range:' + key)
-    output[key] = item as never
+    output[key] = item
   }
-  return output
+  // Every value above was checked against CONFIG_FIELDS, which is derived
+  // from the same Schemastery schema that defines Config. This is the one
+  // place the checked record takes the Config type.
+  return output as Partial<Config>
 }

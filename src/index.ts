@@ -39,7 +39,7 @@ export function apply(ctx: HostContext, config?: Config): void {
   const initial = validateConfigPatch({ ...DEFAULT_CONFIG, ...(config ?? {}) }) as Config
   const host = new VerifierHost(ctx, initial, { recordsFile: defaultRecordsFile(), selectionsFile: defaultSelectionsFile() })
   host.start()
-  installSettingsSection(ctx as any, SETTINGS_NAMESPACE, Config, host.getConfig(), createSettingsSourceHooks(host))
+  installSettingsSection(ctx, SETTINGS_NAMESPACE, Config, host.getConfig(), createSettingsSourceHooks(host))
   ctx.effect(() => {
     const disposers = apiRoutes(host).map(route => ctx.webServer.register(route))
     return async () => { for (const dispose of disposers) dispose(); await host.dispose() }

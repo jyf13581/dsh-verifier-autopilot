@@ -16,7 +16,7 @@
 
 ## 3. 场景
 
-`generateScenarios({ seed: 7, defectCount: 20, cleanCount: 10 })`，一次生成、落盘存档、全程复用同一份。约束不泄漏由 scripts/test.mjs 锁定；独立 node checks 提供 repairValid/regressed 的客观判定依据。
+`generateScenarios({ seed: 7, defectCount: 20, cleanCount: 10 })`，一次生成、落盘存档、全程复用同一份。约束不泄漏由 scripts/tests/repair-v2.test.mjs 锁定；独立 node checks 提供 repairValid/regressed 的客观判定依据。
 
 ## 4. 指标（与 computeRepairMetrics 公式逐字一致）
 

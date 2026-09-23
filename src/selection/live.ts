@@ -16,17 +16,16 @@ import path from 'node:path'
 import type { CandidateFactory, CandidateSpec, DiffStatLite, SelectionAgentHandle, WorkspaceManager } from './candidates.js'
 import type { TrajectoryEvent } from './trajectory.js'
 import { runProcess } from './proc.js'
+import { isAgentScope, type AgentCreate } from '../dsh-context.js'
 
 interface LiveAgentLike {
   id: string
   ctx: unknown
-  session: { events: readonly TrajectoryEvent[] }
+  session: { events: readonly TrajectoryEvent[]; header?: { delegationDepth?: number } }
 }
 
 interface LiveContext {
-  agents: {
-    create(options: Record<string, unknown>): Promise<{ agent: unknown; dispose(): Promise<void> }>
-  }
+  agents: { create: AgentCreate }
 }
 
 /** Evidence listings (numstat, status, patches) legitimately exceed the
@@ -252,12 +251,11 @@ function makeChildSetup(
   route: { provider?: string; model?: string },
 ) {
   return (agentCtx: unknown) => {
-    type AssembleCtx = {
-      get(name: string): unknown
-      on(name: string, handler: (...args: never[]) => unknown): unknown
-      agent?: { session: { append(type: string, data: Record<string, unknown>): void } }
-    }
-    const aCtx = agentCtx as unknown as AssembleCtx
+    // DSH hands the child's scoped context in untyped; the seam is checked
+    // once here. Without hooks and service lookup none of the setup below can
+    // apply, and the child would run with whatever defaults DSH gives it.
+    if (!isAgentScope(agentCtx)) return
+    const aCtx = agentCtx
     if (parent) {
       try {
         const presets = aCtx.get('agentPresets') as { composeFrom?: (child: unknown, parentCtx: unknown) => void } | undefined
@@ -286,21 +284,21 @@ function makeChildSetup(
     }
     const selection: { current?: { provider?: string; model?: string }; assembled?: { provider?: string; model?: string } } = { current: selected, assembled: undefined }
     try {
-      aCtx.on('system-prompt/assemble' as never, (async (_assembly: unknown, _context: unknown, next: () => Promise<{ variables?: Record<string, unknown> }>) => {
+      aCtx.on('system-prompt/assemble', async (_assembly: unknown, _context: unknown, next: () => Promise<{ variables?: Record<string, unknown> }>) => {
         const cur = selection.current
         const assembled = await next()
         selection.assembled = cur
         if (!cur) return assembled
         return { ...assembled, variables: { ...assembled.variables, provider: cur.provider, model: cur.model } }
-      }) as never)
-      aCtx.on('agent/request' as never, (async (_payload: unknown, next: () => Promise<Record<string, unknown>>) => {
+      })
+      aCtx.on('agent/request', async (_payload: unknown, next: () => Promise<Record<string, unknown>>) => {
         const resolved = await next()
         const sel = selection.assembled
         if (!sel) return resolved
         const rest = { ...resolved }
         delete rest.reasoningEffort
         return { ...rest, ...(sel.provider !== undefined ? { provider: sel.provider } : {}), ...(sel.model !== undefined ? { model: sel.model } : {}) }
-      }) as never)
+      })
     } catch { /* prompt/request waterfalls absent in embedded contexts */ }
   }
 }
@@ -320,8 +318,7 @@ export function makeLiveCandidateFactory(args: {
   } catch { /* explicit sandbox override, if any, remains authoritative */ }
   return {
     async create(spec: CandidateSpec): Promise<SelectionAgentHandle> {
-      const header = parent ? ((parent.session as { header?: { delegationDepth?: number } }).header ?? {}) : {}
-      const parentDepth = Number(header.delegationDepth ?? 0)
+      const parentDepth = Number(parent?.session.header?.delegationDepth ?? 0)
       const depth = Number.isSafeInteger(parentDepth) && parentDepth > 0 ? parentDepth + 1 : 1
       // A candidate that joins no preset resolves its tools against the empty
       // global layer (agent-presets logs exactly this: "published without

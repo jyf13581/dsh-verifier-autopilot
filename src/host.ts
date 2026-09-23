@@ -13,7 +13,7 @@ import {
   type AggregateResult,
 } from './verifier.js'
 import { VerificationCoordinator, type ScheduleEntry, type RunContext } from './coordinator.js'
-import { Config, cleanConfig, validateConfigPatch } from './config.js'
+import { Config, validateConfigPatch } from './config.js'
 import {
   PLUGIN_SOURCE_NAME, auditAggregateCitations, auditFindingCitation,
   feedbackSentCount, flatten, traceFor, turnBounds, turnGateDecision,
@@ -23,6 +23,7 @@ import { appendJsonlLedger, compactJsonlLedger, ledgerExceeds, readJsonlLedger }
 import type { StateResponse, VerificationRecord, WebRoute } from './protocol.js'
 import { resolveKey, type Credentials } from './util.js'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from './diagnostics.js'
+import { isHookSource, requireHookSource, type AgentCreate, type HookSource } from './dsh-context.js'
 import { SelectionHost } from './selection/host.js'
 import { runChecks } from './selection/checks.js'
 import { evaluateDelivery } from './selection/candidates.js'
@@ -33,7 +34,11 @@ import { createModelProber, type ModelProber } from './selection/probe.js'
 export type { Credentials } from './util.js'
 export type Agent = { id: string; session: { events: readonly EventRecord[]; header?: { cwd?: string; parentSession?: string } }; ctx: Context; followup: (message: UserMessage) => void | Promise<void> }
 export type { WebRoute } from './protocol.js'
-export type HostContext = Context & { webServer: { register(route: WebRoute): () => void }; credentials?: Credentials; agents?: { list(): Agent[]; get(id: string): Agent | undefined }; llm?: { listModels(provider: string): Promise<Array<{ id: string; provider?: string }>> } }
+/** What the plugin needs from DSH's agent registry: enumeration and lookup
+ *  of live agents (legacy verification) plus child creation (best-of-N
+ *  candidates). Declared here, once, in the plugin's own terms. */
+export type AgentsService = { list(): Agent[]; get(id: string): Agent | undefined; create: AgentCreate }
+export type HostContext = Context & { webServer: { register(route: WebRoute): () => void }; credentials?: Credentials; agents?: AgentsService; llm?: { listModels(provider: string): Promise<Array<{ id: string; provider?: string }>> } }
 
 /** Phase 2 durability: finished records append to a JSONL trail so history
  *  survives hot reloads and stays queryable per session/turn. The trail is
@@ -181,8 +186,8 @@ export class VerifierHost {
       run: (entry, runContext) => this.executeEntry(entry, runContext),
     })
     this.selections = new SelectionHost({
-      agents: this.ctx.agents as never,
-      liveAgents: this.ctx.agents as never,
+      agents: this.ctx.agents,
+      liveAgents: this.ctx.agents,
       defaultRoute: () => {
         try {
           return (this.ctx.get('agentDefaultModel') as { currentSelection?: () => { provider?: string; model?: string } } | undefined)?.currentSelection?.()
@@ -513,10 +518,10 @@ export class VerifierHost {
     this.started = true
     this.loadHistory()
     for (const agent of this.ctx.agents?.list() ?? []) this.attach(agent)
-    const events = this.ctx as unknown as { on: (name: string, handler: (...args: any[]) => any, options?: { prepend?: boolean }) => (() => void) | void }
-    const created = events.on('agent/created', payload => this.attach(payload?.agent))
+    const events = requireHookSource(this.ctx, 'host context')
+    const created = events.on('agent/created', (payload: { agent?: Agent } | undefined) => this.attach(payload?.agent))
     if (typeof created === 'function') this.disposers.push(created)
-    const disposed = events.on('agent/disposed', payload => this.detach(payload?.agent))
+    const disposed = events.on('agent/disposed', (payload: { agent?: { id?: string } } | undefined) => this.detach(payload?.agent))
     if (typeof disposed === 'function') this.disposers.push(disposed)
     this.recoverAutopilotRelays()
     // Storage hygiene runs off the critical path: candidate directories a
@@ -608,13 +613,25 @@ export class VerifierHost {
     // Candidate children (parentSession set) belong to the best-of-N selection
     // path: legacy auto verification + feedback followups there would contaminate
     // the trajectories select() compares. Manual /verify stays available.
-    if ((agent.session as { header?: { parentSession?: string } }).header?.parentSession) return
+    if (agent.session.header?.parentSession) return
     const id = String(agent.id)
     if (this.agents.has(id)) return
+    // An agent whose scoped context has no hook surface can never report
+    // idle or reach pre-step through us; registering it would only create a
+    // session the scheduler can never run. Report and skip.
+    if (!isHookSource(agent.ctx)) {
+      this.diagnostics.warn('agent.attach', 'agent context exposes no on(); status and pre-step hooks were not installed', { agent: id })
+      return
+    }
     this.agents.set(id, agent)
-    const scoped = agent.ctx as unknown as { on: (name: string, handler: (...args: any[]) => any, options?: { prepend?: boolean }) => (() => void) | void }
-    const status = scoped.on('agent/status', payload => this.handleStatus(agent, payload))
-    const preStep = scoped.on('agent/pre-step', (payload, next) => this.handleAutopilotPreStep(agent, payload, next), { prepend: true })
+    // Widen to the plugin's hook view: the cordis Context type only knows the
+    // events declared at its own link time, not DSH's agent events.
+    const scoped: HookSource = agent.ctx
+    const status = scoped.on('agent/status', (payload: { status?: string } | undefined) => this.handleStatus(agent, payload))
+    const preStep = scoped.on('agent/pre-step', (
+      payload: { messages: UserMessage[]; turn: number; step: number; signal: AbortSignal },
+      next: () => Promise<{ kind: 'reject' } | { kind: 'enter'; messages: UserMessage[] }>,
+    ) => this.handleAutopilotPreStep(agent, payload, next), { prepend: true })
     this.agentListeners.set(id, () => {
       if (typeof status === 'function') status()
       if (typeof preStep === 'function') preStep()
@@ -769,7 +786,7 @@ export class VerifierHost {
   }
 
   snapshot(): StateResponse {
-    return { config: cleanConfig(this.config), agents: this.agents.size, records: this.records.slice(0, 20), selection: this.selections.snapshot(), diagnostics: this.diagnostics.snapshot() }
+    return { config: { ...this.config }, agents: this.agents.size, records: this.records.slice(0, 20), selection: this.selections.snapshot(), diagnostics: this.diagnostics.snapshot() }
   }
 
   /** The degradation ledger behind `/state`, for tests and embedded hosts. */
