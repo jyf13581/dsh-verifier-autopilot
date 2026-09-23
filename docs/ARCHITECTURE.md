@@ -297,7 +297,9 @@ What each gate covers:
 - `npm test`: deterministic Node regression suite over emitted modules,
   including evidence, verifier, API, Host, ledger, and selection behavior.
 - `bridge/self_test.py`: offline framing, validation, shutdown, retry, and
-  optional-provider gates for the Python boundary.
+  optional-provider gates for the Python boundary. Set
+  `DSH_VA_REQUIRE_LLM_VERIFIER=1` in the real bridge venv to require provider
+  availability and the provider-specific mojibake gate.
 - `git diff --check "$(git merge-base origin/main HEAD)" HEAD`: whitespace/EOL
   guard over the committed change range. A bare `git diff --check` in a clean
   checkout checks nothing.

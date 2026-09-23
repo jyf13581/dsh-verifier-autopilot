@@ -147,7 +147,9 @@
 - src/selection/retry.ts：仅瞬时错误重试、绝对 deadline、caller abort、动态剩余 timeout。
 - src/selection/trajectory.ts：去除 runtime/header/retry/injected-message 噪声，生成有界证据。
 - src/selection/checks.ts：在候选 cwd 顺序执行 caller-supplied pwsh checks。
-- src/index.ts：配置、legacy verifier、autopilot pre-step、API、GUI Host 装配。
+- src/config.ts：Schemastery 配置 schema、默认值、patch allowlist 与 settings source hooks。
+- src/api.ts：HTTP/SSE transport、鉴权、限流与状态码映射。
+- src/index.ts：legacy verifier、autopilot pre-step、API、GUI Host 的薄装配入口。
 - src/client/index.ts：Verifier 与 Candidate selection 面板。
 - bridge/llm_verifier_sidecar.py：上游 llm_verifier 的 select/progress/preflight 适配和 usage。
 - bridge/PROTOCOL.md：sidecar wire contract。
@@ -294,7 +296,7 @@ provider 注意事项：candidateOptions 必须能补成完整 provider+model；
 ~~~text
 bash scripts/build.sh
 npm test
-D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe bridge/self_test.py
+DSH_VA_REQUIRE_LLM_VERIFIER=1 D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe bridge/self_test.py
 git diff --check
 ~~~
 

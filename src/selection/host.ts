@@ -164,8 +164,10 @@ export function normalizeSelectionTimeoutMs(value: unknown, fallback?: number): 
 }
 
 export function normalizeMarginThreshold(value: unknown, fallback = PROVISIONAL_MARGIN_THRESHOLD): number {
-  const parsed = Number(value === undefined ? fallback : value)
-  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 0.5) {
+  const parsed = value === undefined ? fallback : value
+  // The wire contract says number: do not let JS coercion turn null into zero
+  // or accept numeric strings at this provider-spend boundary.
+  if (typeof parsed !== 'number' || !Number.isFinite(parsed) || parsed < 0 || parsed > 0.5) {
     throw new SelectionApiError(400, 'margin-threshold-invalid', 'marginThreshold must be a finite number in [0,0.5]')
   }
   return parsed

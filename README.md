@@ -103,7 +103,7 @@ python3 bridge/self_test.py
 git diff --check "$(git merge-base origin/main HEAD)" HEAD
 ~~~
 
-The test runner imports `lib`, so build both targets first. Published DSH release-candidate peer ranges currently conflict; the complete lockfile plus `--force` is intentional and is validated in CI. `scripts/build.sh` remains the installed-DSH packaging route with host-specific fallbacks; `build:host` plus `build:client` is the portable repository build. Provider-backed sidecar selection additionally needs the optional `llm_verifier` environment; offline protocol gates report its absence transparently.
+The test runner imports `lib`, so build both targets first. Published DSH release-candidate peer ranges currently conflict; the complete lockfile plus `--force` is intentional and is validated in CI. `scripts/build.sh` remains the installed-DSH packaging route with host-specific fallbacks; `build:host` plus `build:client` is the portable repository build. Provider-backed sidecar selection additionally needs the optional `llm_verifier` environment; offline protocol gates report its absence transparently. In the real bridge venv, run `DSH_VA_REQUIRE_LLM_VERIFIER=1 python bridge/self_test.py` (using that venv's Python) so a missing or broken provider installation is a hard failure rather than an optional skip.
 
 Client HMR requires a running pnpm run dev:web watcher from the DSH source checkout. No watcher is currently running, so client changes require build, plugin reload, and a GUI refresh.
 

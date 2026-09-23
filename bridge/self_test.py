@@ -1,9 +1,10 @@
 """Offline self-test for the llm-verifier sidecar (no network).
 
-Six gates: health / bad_frame / invalid_request / single-candidate
-short-circuit / missing_api_key / shutdown. Run with the bridge venv:
+Run with the bridge venv:
   D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe bridge/self_test.py
-Exit code 0 iff all gates pass.
+Set DSH_VA_REQUIRE_LLM_VERIFIER=1 in that venv to make a missing/broken
+llm_verifier installation fail health and provider-specific gates instead of
+reporting an optional SKIP. Exit code 0 iff every required gate passes.
 """
 import json
 import os
@@ -25,6 +26,7 @@ def rpc(proc, frame):
 
 def main():
     env = dict(os.environ)
+    require_llm_verifier = env.get("DSH_VA_REQUIRE_LLM_VERIFIER") == "1"
     llm_available = False
     env["SMOKE_KEY"] = "dummy-not-a-real-key"
     env.pop("DEFINITELY_MISSING_KEY", None)
@@ -38,12 +40,14 @@ def main():
         health = r.get("result", {})
         llm_available = health.get("select_available") is True
         # A plain CI Python environment may not carry the optional provider
-        # library. Health still passes when it reports that state truthfully;
-        # provider-backed behavior remains covered only in the bridge venv.
+        # library. Health passes when it reports that state truthfully unless
+        # the bridge-venv strict switch explicitly requires provider support.
         gates.append(("health", r.get("ok") is True
                       and isinstance(health.get("select_available"), bool)
+                      and (llm_available or not require_llm_verifier)
                       and "python" in health,
-                      json.dumps(r)[:200]))
+                      ("strict=%s " % require_llm_verifier)
+                      + json.dumps(r)[:200]))
         # (b) malformed line
         proc.stdin.write("{not json\n")
         proc.stdin.flush()
@@ -171,11 +175,13 @@ def main():
                       ra > 0.9 and rb < 0.1,
                       "ra=%.4f rb=%.4f (want ra>0.9, rb<0.1)" % (ra, rb)))
     except ModuleNotFoundError as exc:
-        if not llm_available and exc.name == "llm_verifier":
+        if (not require_llm_verifier and not llm_available
+                and exc.name == "llm_verifier"):
             gates.append(("mojibake_expectation", True,
                           "SKIP optional llm_verifier is not installed"))
         else:
-            gates.append(("mojibake_expectation", False, repr(exc)))
+            gates.append(("mojibake_expectation", False,
+                          "required provider gate unavailable: %r" % exc))
     except Exception as exc:
         gates.append(("mojibake_expectation", False, repr(exc)))
     # (h) relay account-pool resilience: _ResilientClient per-call 429 retry,
