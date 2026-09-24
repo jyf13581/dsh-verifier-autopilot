@@ -64,6 +64,11 @@ test("R2 2.2: a check script the candidate deleted is the candidate's failure; a
     assert.equal(missingTool.ok, false)
     assert.equal(missingTool.harnessError, true, "the lookup probe proves the program is absent on this host")
     assert.match(missingTool.outputTail, /^harness: `definitely-not-installed-xyz` does not resolve/)
+    const [noisy] = await runChecks(dir, [{
+      name: "missing-tool-after-noise",
+      command: sh ? "yes noise | head -n 400; definitely-not-installed-xyz" : "1..400 | ForEach-Object { 'noise' }; definitely-not-installed-xyz",
+    }], { outputTailChars: 300 })
+    assert.equal(noisy.harnessError, undefined, "the leading program (yes / a range expression) resolves: the failure stays the candidate's")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

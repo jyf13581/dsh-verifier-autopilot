@@ -11,7 +11,7 @@
 | 轮 | 状态 | 报告 | 回归测试 |
 |---|---|---|---|
 | R1 信任边界与执行安全 | ✅ 已完成（1.1 沙箱和 1.9 默认中转待负责人决策） | `docs/reviews/R1-TRUST-BOUNDARY.md` | `scripts/tests/trust-boundary.test.mjs` |
-| R2 选择判定链正确性 | ⏳ 待开始 | | |
+| R2 选择判定链正确性 | ✅ 已完成（2.1–2.5、2.7 已修复；2.6 维持 K.5 语义并写入决策表；新发现的部分重复去重问题 2.1c 已修复） | `docs/reviews/R2-SELECTION-CORRECTNESS.md` | `scripts/tests/selection-correctness.test.mjs` |
 | R3 证据与度量有效性 | ⏳ | | |
 | R4 并发、生命周期与资源回收 | ⏳ | | |
 | R5 持久化、审计包、脱敏与协议 | ⏳ | | |
@@ -100,11 +100,11 @@ HTTP 控制面: /state /config /select /selections/* /verify /probe /eval /event
 |---|---|---|
 | 2.1 ✅ | **diff 指纹碰撞**：指纹只哈希 numstat（路径 + 行数）和未跟踪文件的“名字:大小”，不包含内容。两个候选把 `x = 1` 分别改成 `x = 2` 和 `x = 9`，指纹完全相同，结果被判为 no-search-space 去重，更好的那个可能被直接丢掉 | `live.ts:573`（已复现：两个 worktree 都是 `84b7ab7f7b15343a`） |
 | 2.2 ✅ | **harness-error 分类可被候选输出伪造或误触发**：真实测试失败时，只要输出里出现 `": not found"`、`command not found`、`syntax error` 这类字样，就会被标成 harnessError，候选因此不被淘汰。候选删掉测试脚本导致的 `not found` 同样能逃过淘汰 | `checks.ts:60-68`（已复现：`AssertionError…; helper: not found; exit 1` 得到 `harnessError=true`） |
-| 2.3 | `objective_only_result` **不可达**：只有当所有幸存者都 `objectiveEvidence==='pass'`（全部检查通过）时才会进这个分支，此时各候选的通过数必然相等，“严格有序”的条件永远不成立。README 把它列为一种 outcome，测试里一次都没出现过 | `candidates.ts:883` |
-| 2.4 | has-work 门把任何非 meta 工具调用都算作执行证据，只读的 `read`/`grep` 也算，`insufficient_evidence` 几乎不会触发 | `trajectory.ts META_TOOLS`、`candidates.ts` has-work 段 |
-| 2.5 | 候选超时只调用 `agent.cancel?.()`，随后 `whenIdle()` 没有硬上限；如果 cancel 没生效，run 会一直挂住，直到被外部 abort | `candidates.ts:575` 附近 |
-| 2.6 | verifier 故障时只有“全部幸存者都通过检查”才走 `verifier_unavailable`，否则整轮 `failed`；没配检查时的 verifier 故障直接失败，这是否符合裁决 K.5 需要确认 | `candidates.ts` ranking 的 catch 段 |
-| 2.7 | 轨迹截断只保留尾部 24k，任务陈述和早期关键证据会被丢掉；verifier 看不到被截掉的部分，但仍然被要求判断“完整性” | `trajectory.ts renderTrajectory` |
+| 2.3 ✅ | `objective_only_result` **不可达**：只有当所有幸存者都 `objectiveEvidence==='pass'`（全部检查通过）时才会进这个分支，此时各候选的通过数必然相等，“严格有序”的条件永远不成立。README 把它列为一种 outcome，测试里一次都没出现过 | `candidates.ts:883` |
+| 2.4 ✅ | has-work 门把任何非 meta 工具调用都算作执行证据，只读的 `read`/`grep` 也算，`insufficient_evidence` 几乎不会触发 | `trajectory.ts META_TOOLS`、`candidates.ts` has-work 段 |
+| 2.5 ✅ | 候选超时只调用 `agent.cancel?.()`，随后 `whenIdle()` 没有硬上限；如果 cancel 没生效，run 会一直挂住，直到被外部 abort | `candidates.ts:575` 附近 |
+| 2.6 ✅ | verifier 故障时只有“全部幸存者都通过检查”才走 `verifier_unavailable`，否则整轮 `failed`；没配检查时的 verifier 故障直接失败，这是否符合裁决 K.5 需要确认 | `candidates.ts` ranking 的 catch 段 |
+| 2.7 ✅ | 轨迹截断只保留尾部 24k，任务陈述和早期关键证据会被丢掉；verifier 看不到被截掉的部分，但仍然被要求判断“完整性” | `trajectory.ts renderTrajectory` |
 
 方法：
 - 画出 outcome × winnerBasis × retained slot × relay 分支的**完整决策表**，逐格对照代码和测试。

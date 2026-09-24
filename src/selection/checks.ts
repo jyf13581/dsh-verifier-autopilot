@@ -148,8 +148,9 @@ const SHELL_PROBE_TIMEOUT_MS = 15000
  *  one probe serves every candidate of a run and every later run. */
 const parseProbes = new Map<string, Promise<ProcessResult>>()
 
-function probeShell(shell: CheckShell, script: string, options: RunChecksOptions): Promise<ProcessResult> {
+function probeShell(shell: CheckShell, script: string, options: RunChecksOptions, signal?: AbortSignal): Promise<ProcessResult> {
   return runProcess(shell.file, [...shell.args, script], {
+    signal,
     // Neutral directory: nothing a candidate wrote can influence a probe.
     cwd: tmpdir(),
     env: scrubSecretEnv(options.secretEnvNames),
@@ -284,10 +285,12 @@ async function runOne(cwd: string, check: ObjectiveCheck, shell: CheckShell, opt
   if (!ok && result.end === 'exit' && !options.signal?.aborted) {
     const word = leadingCommandWord(check.command)
     if (word && shell.resolves) {
-      const lookup = await probeShell(shell, shell.resolves(word), options)
+      const lookup = await probeShell(shell, shell.resolves(word), options, options.signal)
       if (lookup.end === 'exit' && lookup.code !== 0) {
         harnessError = true
-        outputTail = ('harness: `' + word + '` does not resolve in ' + shell.name + ' on this host\n' + result.out).slice(-(options.outputTailChars ?? 2000))
+        const prefix = 'harness: `' + word + '` does not resolve in ' + shell.name + ' on this host\n'
+        const room = Math.max(0, (options.outputTailChars ?? 2000) - prefix.length)
+        outputTail = prefix + (room > 0 ? result.out.slice(-room) : '')
       }
     }
   }
