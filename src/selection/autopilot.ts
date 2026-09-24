@@ -281,6 +281,7 @@ export function buildAutopilotRelay(record: SelectionRecord): string {
       + ' condition=' + (record.marginCondition ?? 'n/a'))
   }
   if (record.noSearchSpace) lines.push('Flag: no-search-space (all survivor diffs identical; deduped before the verifier)')
+  if (!record.noSearchSpace && record.dedupedCandidates?.length) lines.push('Flag: deduped ' + record.dedupedCandidates.map((i) => 'c' + i).join(', ') + ' (byte-identical to a kept survivor; not ranked separately)')
   if (record.llmOnly) lines.push('Flag: llm-only (no candidate carried passing objective checks; LLM was the only signal)')
   if (record.checksUnreliable) lines.push('Flag: checks-unreliable (at least one check failed as a shell-level harness error and was NOT used to eliminate)')
   if (record.note) lines.push('Note: ' + neutralizeControlMarkers(record.note))

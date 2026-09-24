@@ -72,7 +72,7 @@ export interface CandidateRecord {
  *  `outcome` first. */
 export type SelectionOutcome =
   | 'ranked_winner'             // margin above threshold; verifier preference
-  | 'objective_only_result'     // verifier absent; strict deterministic order
+  | 'objective_only_result'     // LEGACY, never produced since review R2 2.3 (unreachable: see ranking catch); kept so old ledger rows still type-check and relay
   | 'single_candidate_fallback' // exactly one survivor; never compared
   | 'insufficient_evidence'     // survivors produced no verifiable work
   | 'abstain'                   // margin inside the provisional calibrated noise band
@@ -115,6 +115,10 @@ export interface SelectionRecord {
   /** All survivors shared one diff fingerprint — deduped before the verifier
    *  (ruling F3); the record is a fallback, never a ranking claim. */
   noSearchSpace?: boolean
+  /** Original indices removed before ranking because their workspace was
+   *  byte-identical to a lower-index survivor (review R2 2.1). Each carries
+   *  eliminatedBy ['duplicate-diff:c<kept>']. */
+  dedupedCandidates?: number[]
   /** No candidate carried deterministic objective evidence (checks pass); any
    *  ranking on this record was LLM-only. */
   llmOnly?: boolean
@@ -287,6 +291,9 @@ export interface SelectionRunInput {
   algorithmSeed?: number
   selectionId?: string
   candidateTimeoutMs?: number
+  /** How long after candidateTimeoutMs a cancelled candidate may take to go
+   *  idle before the runner stops waiting (review R2 2.5). Default 30 s. */
+  cancelGraceMs?: number
   selectTimeoutMs?: number
   verifier: {
     model: string
@@ -368,7 +375,7 @@ function invalidSelectionResult(detail: string): BridgeError {
 function deterministicPreface(cand: CandidateRecord, taskKind: string | undefined): string {
   const lines = ['[DETERMINISTIC EVIDENCE — collected by the runner, not claimed by the candidate]']
   lines.push('Task kind: ' + (taskKind ?? 'unknown'))
-  lines.push('Execution-class tool calls: ' + String(cand.execToolCalls ?? 0) + ' (catalog/meta tools excluded; raw tool-call count ' + (cand.toolCalls ?? cand.execToolCalls ?? 0) + ')')
+  lines.push('Execution-class tool calls: ' + String(cand.execToolCalls ?? 0) + ' (catalog/meta and read-only tools excluded; raw tool-call count ' + (cand.toolCalls ?? cand.execToolCalls ?? 0) + ')')
   const d = cand.diffStat
   lines.push(d
     ? 'Worktree diff vs source HEAD: ' + d.files + ' files changed (+' + d.insertions + ' / -' + d.deletions + '), ' + d.untracked + ' untracked files'
@@ -460,6 +467,7 @@ export class SelectionRunner {
     const diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null> = new Array(n).fill(null)
     const seed = input.seed && input.seed.length > 0 ? input.seed : undefined
     const candidateTimeout = input.candidateTimeoutMs ?? 600000
+    const cancelGrace = Math.max(0, input.cancelGraceMs ?? 30_000)
     // A signal that is already aborted never fires 'abort' again: a run that
     // starts after its host was disposed/cancelled must still see it, or it
     // would provision worktrees and spawn agents for a dead selection.
@@ -572,6 +580,8 @@ export class SelectionRunner {
         // seed events must not be mistaken for candidate failures.
         const preRunCount = agent.session.events.length
         let timedOut = false
+        let cancelIgnored = false
+        let hardStop: ReturnType<typeof setTimeout> | null = null
         const timer = setTimeout(() => {
           timedOut = true
           try { agent.cancel?.() } catch { /* no-op */ }
@@ -670,8 +680,16 @@ export class SelectionRunner {
             if (input.signal.aborted) onSig()
             else input.signal.addEventListener('abort', onSig, { once: true })
           }
+          // Hard stop (review R2 2.5): cancel() is advisory. A candidate that
+          // ignores it must not pin the whole selection (and the one active
+          // slot) forever; after the grace the runner stops waiting and the
+          // loser pass disposes the handle.
+          const hardStopP = new Promise<'hard-stop'>((resolve) => {
+            hardStop = setTimeout(() => resolve('hard-stop'), candidateTimeout + cancelGrace)
+          })
           try {
-            await Promise.race([agent.whenIdle(), abortP])
+            const settledBy = await Promise.race([agent.whenIdle().then(() => 'idle' as const), abortP, hardStopP])
+            if (settledBy === 'hard-stop') { timedOut = true; cancelIgnored = true }
           } finally {
             input.signal?.removeEventListener('abort', onSig)
           }
@@ -681,7 +699,7 @@ export class SelectionRunner {
             cand.error = 'progress-abandoned (lastScore=' + (pgLastScore === null ? 'n/a' : pgLastScore.toFixed(3)) + ')'
           } else if (timedOut) {
             cand.status = 'failed'
-            cand.error = 'candidate-timeout'
+            cand.error = cancelIgnored ? 'candidate-timeout (cancel not acknowledged within ' + cancelGrace + 'ms)' : 'candidate-timeout'
           } else {
             // A turn that ended in error (e.g. prompt assembly failure) is a
             // failed candidate, not a finished one — never feed it to the
@@ -701,6 +719,7 @@ export class SelectionRunner {
           cand.error = errText(e)
         } finally {
           clearTimeout(timer)
+          if (hardStop) clearTimeout(hardStop)
           // The progress monitor must die with the candidate on EVERY exit
           // path: after an abort or a followup failure the interval used to
           // keep ticking (each tick returned early on status, so it never
@@ -812,13 +831,27 @@ export class SelectionRunner {
           record.nComparisons = 0
           record.fallback = { index: sole.index, sessionId: sole.sessionId, workspace: sole.workspace }
         } else {
-          // Identical diff surfaces = zero search space: dedupe BEFORE paying
-          // the tournament (ruling F3). Applies only when git evidence exists
-          // for every survivor; otherwise the verifier decides.
-          const fingerprints = survivors.map((c) => c.diffStat?.fingerprint)
-          if (requiresWork
-            && fingerprints.every((fp) => typeof fp === 'string')
-            && new Set(fingerprints).size === 1) {
+          // Identical workspaces = no search space between them: dedupe BEFORE
+          // paying the tournament (ruling F3), per fingerprint rather than
+          // all-or-nothing (review R2 2.1). Two byte-identical twins among
+          // three survivors used to reach the verifier as a near-zero-margin
+          // top-2 and force an abstain on what is one solution. Empty diffs
+          // never dedupe: candidates that changed nothing differ only in their
+          // answers, which is exactly what the verifier compares.
+          if (requiresWork) {
+            const keptByFingerprint = new Map<string, CandidateRecord>()
+            for (const cand of survivors) {
+              const diff = cand.diffStat
+              if (!diff || (diff.files === 0 && diff.untracked === 0) || typeof diff.fingerprint !== 'string') continue
+              const kept = keptByFingerprint.get(diff.fingerprint)
+              if (!kept) { keptByFingerprint.set(diff.fingerprint, cand); continue }
+              cand.status = 'eliminated'
+              cand.eliminatedBy = [...(cand.eliminatedBy ?? []), 'duplicate-diff:c' + kept.index]
+              ;(record.dedupedCandidates ??= []).push(cand.index)
+            }
+            survivors = record.candidates.filter((c) => c.status === 'finished')
+          }
+          if (survivors.length === 1) {
             const kept = survivors[0]
             record.noSearchSpace = true
             record.outcome = 'single_candidate_fallback'
@@ -828,7 +861,7 @@ export class SelectionRunner {
             record.ranking = [kept.index]
             record.nComparisons = 0
             record.fallback = { index: kept.index, sessionId: kept.sessionId, workspace: kept.workspace }
-            record.note = 'all survivors produced identical diff surfaces; deduped before verifier (no-search-space)'
+            record.note = 'all survivors produced byte-identical workspaces; deduped before verifier (no-search-space)'
           } else {
             if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted before verifier select', false)
             // Ceiling matches host.ts MAX_SELECTION_TIMEOUT_MS (600s since
@@ -879,24 +912,10 @@ export class SelectionRunner {
               record.outcome = 'verifier_unavailable'
               diag.warn('verifier.unavailable', bridgeFailure, { selectionId: record.selectionId })
               record.note = 'ranking failed after retries: ' + errText(bridgeFailure)
-              const passCounts = survivors.map((c) => (c.checks ?? []).filter((x) => x.ok).length)
-              if (new Set(passCounts).size === passCounts.length) {
-                // A strictly ordered deterministic signal exists: report it as
-                // an objective-only result, explicitly not a verifier ranking.
-                const ordered = [...survivors].sort((a, b) => {
-                  const pa = (a.checks ?? []).filter((x) => x.ok).length
-                  const pb = (b.checks ?? []).filter((x) => x.ok).length
-                  return pb - pa || a.index - b.index
-                })
-                const lead = ordered[0]
-                record.outcome = 'objective_only_result'
-                record.winnerBasis = 'objective-check-only'
-                record.ranking = ordered.map((c) => c.index)
-                record.scores = record.candidates.map(() => null)
-                record.nComparisons = 0
-                retainedIdx = lead.index
-                record.fallback = { index: lead.index, sessionId: lead.sessionId, workspace: lead.workspace }
-              }
+              // No objective-only ordering exists here (review R2 2.3): this
+              // branch is reached only when EVERY survivor passed EVERY check,
+              // so pass counts are equal by construction. The former
+              // objective_only_result path was unreachable and never tested.
             }
             if (selectResult) {
               validateSelectionResult(selectResult, survivors.length)

@@ -60,7 +60,7 @@ implementation code.
 | `src/selection/live.ts` | Live DSH candidate adapters and isolated Git-worktree management (prepare, remove, enumerate). |
 | `src/selection/proc.ts` | Bounded child-process runner shared by the Git helpers and the check harness: capped output (head or tail), timeout/abort with kill escalation, flush-bounded completion, spawn failure distinct from exit. Leaf: imports Node only. |
 | `src/selection/trajectory.ts` | Candidate trajectory rendering plus shared context/handoff bounding. The candidate runner depends here rather than back on autopilot orchestration. |
-| `src/selection/checks.ts` | Objective check execution and normalization. Resolves one shell per process from a platform chain (`pwsh`, then Windows PowerShell or `/bin/sh`); a shell that cannot start is a harness error, never evidence against a candidate. |
+| `src/selection/checks.ts` | Objective check execution and normalization. Resolves one shell per process from a platform chain (`pwsh`, then Windows PowerShell or `/bin/sh`); a shell that cannot start, a command it cannot parse (parse-only probe in a temp dir), or a leading program that does not resolve is a harness error, never evidence against a candidate; output text is never classified (review R2 2.2). |
 | `src/selection/bridge.ts` | Framed subprocess client for the Python verifier sidecar, and the only place a sidecar frame becomes a typed value: `parseHealthResult` / `parseSelectResult` / `parseProgressResult` / `parseErrorFrame` (malformed shape → `bridge_protocol`). |
 | `src/selection/retry.ts` | Bounded retry policy for transient bridge failures. |
 | `src/selection/probe.ts` | Availability/capability probing. |
