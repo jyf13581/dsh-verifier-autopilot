@@ -747,7 +747,7 @@ export class SelectionRunner {
       for (const cand of record.candidates) {
         if (cand.status !== 'finished') continue
         if (!input.checks || input.checks.length === 0) { cand.objectiveEvidence = 'none'; continue }
-        cand.checks = await runChecks(cand.workspace, input.checks, { signal: input.signal })
+        cand.checks = await runChecks(cand.workspace, input.checks, { signal: input.signal, secretEnvNames: input.verifier.apiKeyEnv ? [input.verifier.apiKeyEnv] : [] })
         const failed = cand.checks.filter((c) => !c.ok)
         if (failed.length > 0 && failed.every((c) => c.harnessError)) {
           cand.checksInvalid = true

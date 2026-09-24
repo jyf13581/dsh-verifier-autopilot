@@ -11,7 +11,7 @@
  * harness error: recorded, never evidence against the candidate (ruling B-10).
  */
 
-import { runProcess } from './proc.js'
+import { runProcess, scrubSecretEnv } from './proc.js'
 
 export interface ObjectiveCheck {
   name: string
@@ -81,6 +81,10 @@ export interface RunChecksOptions {
   /** Shell preference chain; the first one that starts is used for every
    *  check. Defaults to the platform chain. */
   shells?: readonly CheckShell[]
+  /** Extra variable names to withhold from the check environment (the
+   *  configured verifier key). Credential-shaped names are always withheld:
+   *  checks execute candidate-authored code (review R1 1.2). */
+  secretEnvNames?: readonly string[]
 }
 
 const SHELL_PROBE_TIMEOUT_MS = 15000
@@ -152,6 +156,7 @@ async function runOne(cwd: string, check: ObjectiveCheck, shell: CheckShell, opt
   // boundary — keep check commands self-contained in the candidate workspace.
   const result = await runProcess(shell.file, [...shell.args, check.command], {
     cwd,
+    env: scrubSecretEnv(options.secretEnvNames),
     timeoutMs: check.timeoutMs ?? options.defaultTimeoutMs ?? 60000,
     signal: options.signal,
     cap: options.outputTailChars ?? 2000,

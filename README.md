@@ -85,7 +85,8 @@ API prefix: /@dsh-external/dsh-verifier-autopilot/api
 - GET /selections lists active, retained handles, and recent records.
 - POST /selections/cancel, /release, and /discard manage lifecycle.
 - GET /state and /events drive the GUI.
-- Mutating/provider-spending endpoints require Bearer DSH_VA_API_TOKEN when that environment variable is set.
+- Mutating/provider-spending endpoints require Bearer DSH_VA_API_TOKEN when that environment variable is set (the panel prompts for it once). Every POST requires a JSON content type and refuses `Sec-Fetch-Site: cross-site`.
+- Without a token, HTTP cannot set `selectionPostAuditTestCommand` or point `baseURL`/`apiKeyEnv` outside the shipped endpoint presets; use the DSH settings service for those.
 - /select is limited to 12 admitted starts per sliding hour.
 
 The conversation panel contains Verifier and Candidate selection tabs. Verifier exposes lanes 轮数 / 思考强度 / 输出上限 / 验证模型; Candidate selection exposes 模式、质量策略、普通/深档 N、评估轮数 K、枢轴迭代 P、思考强度、provider 与模型池（全部即改即存）。Autopilot starts selection in the background and immediately returns the source decision; a completed winner is appended later as a plugin relay, and source idle/detach/dispose owns winner cleanup. The authoritative GUI is the existing http://127.0.0.1:3080/ instance; do not start a replacement server.

@@ -41,6 +41,22 @@ export function boundCandidateHandoff(text: string, maxChars = 14_000): string {
   return boundText(text.trim(), maxChars)
 }
 
+/** Orchestration section headers the Host itself writes into verifier payloads,
+ *  candidate context, and the source relay. Candidate-controlled text (tool
+ *  output, assistant prose, handoff excerpts) must never be able to open one of
+ *  these sections: a forged `[DETERMINISTIC EVIDENCE ...]` block would claim
+ *  runner-collected evidence to the verifier, and a forged `[END CANDIDATE c1]`
+ *  followed by `[FINALIZER CONTRACT]` would issue instructions to the source
+ *  finalizer (review R1 1.8). */
+const CONTROL_MARKER = /\[(\s*)(DETERMINISTIC EVIDENCE|TRAJECTORY\b|END CANDIDATE|CANDIDATE\s+c\d|FINALIZER CONTRACT|AUTOPILOT\b|SINGLE-SURVIVOR|CURRENT TASK|RELEVANT RECENT CONVERSATION|DELIVERY CONTRACT|EXTRACTED TOOL EVIDENCE|VERIFIER FEEDBACK)/gi
+
+/** Defang Host control markers inside untrusted text. The content survives
+ *  verbatim for the reader, but it can no longer be mistaken for a section the
+ *  Host opened. Idempotent: the rewritten form never matches again. */
+export function neutralizeControlMarkers(text: string): string {
+  return text.replace(CONTROL_MARKER, (_match, space: string, marker: string) => '[UNTRUSTED-QUOTE:' + (space || ' ') + marker)
+}
+
 /** Meta/navigation tools that never modify the workspace or execute anything.
  *  tool_call is a dispatcher: its inner name is not visible in the event we
  *  see, so it conservatively counts as meta (never as execution evidence). */
@@ -135,7 +151,7 @@ export function renderTrajectory(
       continue
     }
   }
-  let text = lines.join(String.fromCharCode(10))
+  let text = neutralizeControlMarkers(lines.join(String.fromCharCode(10)))
   if (text.length > totalCap) {
     const keep = text.slice(text.length - totalCap)
     const firstNl = keep.indexOf(String.fromCharCode(10))

@@ -7,12 +7,12 @@
 import {
   buildVerifierPrompt, verifyFive, verifyRoute,
 } from './verifier.js'
-import type { Config } from './config.js'
+import { DEFAULT_CONFIG, type Config } from './config.js'
 import { SelectionApiError } from './selection/host.js'
 import type { SelectionRecord } from './selection/candidates.js'
 import { VERIFICATION_HISTORY_LIMIT, VerifyAbortedError } from './host.js'
 import {
-  API_PREFIX,
+  API_PREFIX, MODEL_OPTIONS,
   type ConfigResponse, type HeaderValue, type SelectionActionResponse,
   type SelectionIdRequest, type SelectionItemResponse, type SelectionReleaseResponse,
   type SelectionSnapshot, type SelectionStartRequest, type SelectionStartResponse,
@@ -89,6 +89,61 @@ export function createRateLimiter(limit: number, windowMs: number, now: () => nu
   return Object.assign(function acquire() { if (!peek()) return false; commit(); return true }, { peek, commit })
 }
 
+/** Review R1 (1.4/1.5): fields whose HTTP mutation is a credential-egress or
+ *  command-execution lever. Over the unauthenticated default transport they are
+ *  settings-service-only (the DSH settings UI / settings file is the trusted
+ *  operator channel); an HTTP caller may change them only when the operator
+ *  configured DSH_VA_API_TOKEN and the request carried it.
+ *
+ *  - selectionPostAuditTestCommand runs through the check shell in the USER'S
+ *    source repository on the next source idle. Clearing it ('') is always
+ *    allowed: that only removes privilege.
+ *  - baseURL + apiKeyEnv together decide which secret is sent as a Bearer
+ *    header to which host (/probe, autopilot probes, verifier lanes, sidecar).
+ *    Unprivileged callers may only select one of the shipped endpoint tuples,
+ *    exactly what the GUI model picker sends. */
+export const PRIVILEGED_CONFIG_FIELDS = ['selectionPostAuditTestCommand', 'baseURL', 'apiKeyEnv'] as const
+
+function egressKey(baseURL: string, apiKeyEnv: string): string {
+  return normalizeBaseUrl(baseURL.trim()).toLowerCase() + '\u0000' + apiKeyEnv
+}
+
+const ALLOWED_EGRESS = new Set<string>([
+  egressKey(DEFAULT_CONFIG.baseURL, DEFAULT_CONFIG.apiKeyEnv),
+  ...MODEL_OPTIONS.map(option => egressKey(option.baseURL, option.apiKeyEnv)),
+])
+
+/** Exported for regression tests: null when the patch is admissible for this
+ *  caller, otherwise the stable error code of the refused field. */
+export function httpConfigPolicyViolation(patch: unknown, current: Config, privileged: boolean): string | null {
+  if (privileged || !patch || typeof patch !== 'object' || Array.isArray(patch)) return null
+  const input = patch as Record<string, unknown>
+  const has = (key: string): boolean => Object.prototype.hasOwnProperty.call(input, key)
+  if (has('selectionPostAuditTestCommand') && input.selectionPostAuditTestCommand !== '') {
+    return 'privileged-config-field:selectionPostAuditTestCommand'
+  }
+  if (has('baseURL') || has('apiKeyEnv')) {
+    const baseURL = has('baseURL') ? input.baseURL : current.baseURL
+    const apiKeyEnv = has('apiKeyEnv') ? input.apiKeyEnv : current.apiKeyEnv
+    // Type errors are left to validateConfigPatch; only well-typed tuples are policed here.
+    if (typeof baseURL === 'string' && typeof apiKeyEnv === 'string' && !ALLOWED_EGRESS.has(egressKey(baseURL, apiKeyEnv))) {
+      return 'privileged-config-field:egress-target'
+    }
+  }
+  return null
+}
+
+/** Review R1 (1.6): every POST route shares one admission gate so none can be
+ *  driven as a cross-site "simple request". A JSON content type forces a CORS
+ *  preflight that this transport never answers, and browsers that send
+ *  Sec-Fetch-Site mark forged cross-site requests explicitly. */
+function mutationRefusal(req: WebRequest, authorized: (req: WebRequest) => boolean): { status: number; error: string } | null {
+  if (!authorized(req)) return { status: 403, error: 'unauthorized' }
+  if (headerText(req.headers['sec-fetch-site']).toLowerCase() === 'cross-site') return { status: 403, error: 'cross-site-request' }
+  if (!headerText(req.headers['content-type']).toLowerCase().startsWith('application/json')) return { status: 415, error: 'json-required' }
+  return null
+}
+
 /** Shared body contract for the selection lifecycle routes (cancel, release,
  *  discard): a JSON object carrying a non-empty selectionId. A literal `null`
  *  body used to reach `body.selectionId` and throw inside the async handler. */
@@ -158,28 +213,34 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   const verifyLimiter = createRateLimiter(API_RATE_LIMITS.verifyPerMinute, 60_000)
   // Optional local API token (Phase 2 trust boundary): set DSH_VA_API_TOKEN to
   // require `authorization: Bearer <token>` on mutating / provider-spending
-  // endpoints. Read-only views stay open to the local operator.
+  // endpoints. Read-only views stay open to the local operator. The panel
+  // prompts for the token on the first 403 and replays it (review R1 1.3).
+  // A configured token is also what unlocks PRIVILEGED_CONFIG_FIELDS over HTTP.
   const requiredToken = process.env.DSH_VA_API_TOKEN || ''
   const authorized = (req: WebRequest): boolean => !requiredToken || headerText(req.headers.authorization) === 'Bearer ' + requiredToken
+  const refuse = (req: WebRequest) => mutationRefusal(req, authorized)
   const state: WebRoute = { kind: 'exact', path: API_PREFIX + '/state', handler: (req, res) => {
     if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     json(res, 200, host.snapshot())
   } }
   const config: WebRoute = { kind: 'exact', path: API_PREFIX + '/config', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-    if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    if (!headerText(req.headers['content-type']).toLowerCase().startsWith('application/json')) return json(res, 415, { ok: false, error: 'json-required' })
+    const refusal = refuse(req)
+    if (refusal) return json(res, refusal.status, { ok: false, error: refusal.error })
     let patch: unknown
     try {
       patch = await readJson(req)
     } catch {
       return json(res, 400, { ok: false, error: 'invalid-json-body' })
     }
+    const violation = httpConfigPolicyViolation(patch, host.getConfig(), requiredToken !== '')
+    if (violation) return json(res, 403, { ok: false, error: violation })
     try { host.setConfig(patch as Partial<Config>); json(res, 200, { ok: true, config: host.getConfig() } satisfies ConfigResponse) } catch (error) { json(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) }) }
   } }
   const verify: WebRoute = { kind: 'exact', path: API_PREFIX + '/verify', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-    if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
+    const refusal = refuse(req)
+    if (refusal) return json(res, refusal.status, { ok: false, error: refusal.error })
     let body: Record<string, unknown>
     try {
       body = await readJson(req) as Record<string, unknown>
@@ -201,8 +262,8 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   } }
   const evalRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/eval', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-    if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    if (!headerText(req.headers['content-type']).toLowerCase().startsWith('application/json')) return json(res, 415, { ok: false, error: 'json-required' })
+    const refusal = refuse(req)
+    if (refusal) return json(res, refusal.status, { ok: false, error: refusal.error })
     let body: Record<string, unknown>
     try {
       body = await readJson(req) as Record<string, unknown>
@@ -246,7 +307,8 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   } }
   const probe: WebRoute = { kind: 'exact', path: API_PREFIX + '/probe', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-    if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
+    const refusal = refuse(req)
+    if (refusal) return json(res, refusal.status, { ok: false, error: refusal.error })
     let body: Record<string, unknown>
     try {
       body = await readJson(req) as Record<string, unknown>
@@ -328,8 +390,8 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   const selectLimiter = createRateLimiter(API_RATE_LIMITS.selectPerHour, 3_600_000)
   const selectRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/select', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-    if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    if (!headerText(req.headers['content-type']).toLowerCase().startsWith('application/json')) return json(res, 415, { ok: false, error: 'json-required' })
+    const refusal = refuse(req)
+    if (refusal) return json(res, refusal.status, { ok: false, error: refusal.error })
     let body: Record<string, unknown>
     try {
       body = await readJson(req) as Record<string, unknown>
@@ -368,7 +430,8 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   } }
   const cancelSelectionRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/cancel', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-    if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
+    const refusal = refuse(req)
+    if (refusal) return json(res, refusal.status, { ok: false, error: refusal.error })
     const parsed = await readSelectionIdRequest(req)
     if (!parsed.ok) return json(res, parsed.status, { ok: false, error: parsed.error })
     const selectionId = parsed.selectionId
@@ -381,7 +444,8 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   } }
   const releaseWinnerRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/release', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-    if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
+    const refusal = refuse(req)
+    if (refusal) return json(res, refusal.status, { ok: false, error: refusal.error })
     const parsed = await readSelectionIdRequest(req)
     if (!parsed.ok) return json(res, parsed.status, { ok: false, error: parsed.error })
     const selectionId = parsed.selectionId
@@ -398,7 +462,8 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   } }
   const discardWinnerRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/discard', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
-    if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
+    const refusal = refuse(req)
+    if (refusal) return json(res, refusal.status, { ok: false, error: refusal.error })
     const parsed = await readSelectionIdRequest(req)
     if (!parsed.ok) return json(res, parsed.status, { ok: false, error: parsed.error })
     const selectionId = parsed.selectionId

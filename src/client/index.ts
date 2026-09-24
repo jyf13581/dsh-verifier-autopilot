@@ -33,6 +33,33 @@ const SETTINGS_NAMESPACE = SETTINGS_NAMESPACE_ID
 const panelStyle = { padding: 12, display: 'grid', gap: 8, fontSize: 12, borderTop: '1px solid var(--border-color, #ddd)' }
 const rowStyle = { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }
 
+/** Review R1 (1.3): when the Host sets DSH_VA_API_TOKEN every mutating route
+ *  requires `authorization: Bearer <token>`. The bundle cannot embed a secret,
+ *  so the operator enters it once on the first 403; it is kept only in this
+ *  browser's localStorage and replayed on later writes. Without a token the
+ *  request is unchanged, so the default (token unset) deployment is unaffected. */
+const API_TOKEN_STORAGE_KEY = 'dsh-verifier-autopilot.apiToken'
+
+function storedApiToken(): string {
+  try { return window.localStorage.getItem(API_TOKEN_STORAGE_KEY) ?? '' } catch { return '' }
+}
+
+async function postJson(path: string, body: unknown): Promise<Response> {
+  const send = (token: string): Promise<Response> => fetch(API + path, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...(token ? { authorization: 'Bearer ' + token } : {}) },
+    body: JSON.stringify(body),
+  })
+  const response = await send(storedApiToken())
+  if (response.status !== 403) return response
+  const refusal = await response.clone().json().catch(() => null) as { error?: unknown } | null
+  if (refusal?.error !== 'unauthorized' || typeof window.prompt !== 'function') return response
+  const entered = window.prompt('此 Host 设置了 DSH_VA_API_TOKEN，请输入 API token（只保存在本浏览器的 localStorage）：')?.trim()
+  if (!entered) return response
+  try { window.localStorage.setItem(API_TOKEN_STORAGE_KEY, entered) } catch { /* private mode: use it for this request only */ }
+  return send(entered)
+}
+
 /** Poll cadence while the SSE stream is delivering: the stream carries every
  *  Host change, so polling degrades to a slow reconciliation sweep. */
 const STREAMING_POLL_MS = 15000
@@ -150,7 +177,7 @@ function DurableSettingsPanel(props: { scope: SettingsScope }): VNode {
     try {
       if (durableReady) await props.scope.set(field, next)
       else {
-        const response = await fetch(API + '/config', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ [field]: next }) })
+        const response = await postJson('/config', { [field]: next })
         if (!response.ok) throw new Error('HTTP ' + response.status)
         setHostConfig(previous => ({ ...previous, [field]: next }))
       }
@@ -195,7 +222,7 @@ function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsSco
   }, () => { void refresh() }, 3000)
 
   const post = async (path: string, body: Record<string, unknown>): Promise<boolean> => {
-    const response = await fetch(API + path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    const response = await postJson(path, body)
     if (!response.ok) {
       const text = await response.text().catch(() => '')
       setStatus(path + ' 失败: HTTP ' + response.status + ' ' + text.slice(0, 120))
@@ -355,7 +382,7 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
         // committed snapshot is observed by the Host in a known order.
         for (const [field, value] of Object.entries(patch)) await scope.set(field, value)
       } else {
-        const response = await fetch(API + '/config', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(patch) })
+        const response = await postJson('/config', patch)
         const result = await response.json().catch(() => ({ ok: false, error: 'invalid-response' })) as ConfigResponse | ApiErrorResponse
         if (!response.ok || !result.ok) throw new Error(result.ok ? 'HTTP ' + response.status : result.error)
       }
@@ -375,7 +402,7 @@ function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScop
     setBusy(true)
     setStatus('五路验证中...')
     try {
-      const response = await fetch(API + '/verify', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId: props.sessionId }) })
+      const response = await postJson('/verify', { sessionId: props.sessionId })
       const result = await response.json() as VerifyResponse | ApiErrorResponse
       if (!response.ok || !result.ok) throw new Error(result.ok ? 'HTTP ' + response.status : result.error)
       await refresh()
