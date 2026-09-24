@@ -14,7 +14,7 @@
  */
 
 import path from 'node:path'
-import { existsSync, mkdirSync, readdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
@@ -290,8 +290,12 @@ function safeChecks(input: unknown): ObjectiveCheck[] | undefined {
     if (typeof item.command !== 'string' || !item.command.trim() || item.command.length > 2000) {
       throw new SelectionApiError(400, 'check-command-invalid', 'checks[' + i + '].command must be a non-empty string <= 2000 chars')
     }
+    // A non-numeric timeout used to become NaN and reach setTimeout (review R1 1.7).
+    if (item.timeoutMs !== undefined && (typeof item.timeoutMs !== 'number' || !Number.isFinite(item.timeoutMs))) {
+      throw new SelectionApiError(400, 'check-timeout-invalid', 'checks[' + i + '].timeoutMs must be a finite number of milliseconds')
+    }
     const timeoutMs = item.timeoutMs === undefined ? undefined
-      : Math.max(1000, Math.min(300000, Math.floor(Number(item.timeoutMs))))
+      : Math.max(1000, Math.min(300000, Math.floor(item.timeoutMs)))
     return { name: item.name.trim(), command: item.command, timeoutMs }
   })
 }
@@ -382,18 +386,80 @@ function safeCandidateInstructions(input: unknown, count: number): string[] | un
   })
 }
 
+/** Criteria reach the verifier prompt of every comparison, so their size is a
+ *  provider-spend and prompt-shape lever (review R1 1.7). */
+const MAX_CRITERIA = 8
+const MAX_CRITERION_KEY_CHARS = 80
+const MAX_CRITERION_TEXT_CHARS = 2000
+
+function criteriaTooLarge(entries: Array<[string, string]>): boolean {
+  return entries.length > MAX_CRITERIA
+    || entries.some(([key, text]) => !key.trim() || key.length > MAX_CRITERION_KEY_CHARS || !text.trim() || text.length > MAX_CRITERION_TEXT_CHARS)
+}
+
 function safeCriteria(input: unknown): BridgeSelectRequest['criteria'] {
   if (input === undefined || input === null) {
     return { correctness: 'The candidate objectively completed the task, with concrete tool or test evidence backing the claim; unverified claims fail.' }
   }
+  const bounded = (entries: Array<[string, string]>): void => {
+    if (criteriaTooLarge(entries)) {
+      throw new SelectionApiError(400, 'criteria-too-large', 'criteria allow at most ' + MAX_CRITERIA + ' entries with non-empty names <= ' + MAX_CRITERION_KEY_CHARS + ' chars and descriptions <= ' + MAX_CRITERION_TEXT_CHARS + ' chars')
+    }
+  }
   if (typeof input === 'object' && !Array.isArray(input) && Object.values(input as Record<string, unknown>).every((v) => typeof v === 'string')) {
     if (Object.keys(input as Record<string, unknown>).length === 0) throw new SelectionApiError(400, 'criteria-empty', 'criteria map must not be empty')
+    bounded(Object.entries(input as Record<string, string>))
     return input as Record<string, string>
   }
   if (Array.isArray(input) && input.length > 0 && input.every((c) => c && typeof c === 'object' && typeof c.id === 'string' && typeof c.name === 'string' && typeof c.description === 'string')) {
-    return input as Array<{ id: string; name: string; description: string }>
+    const list = input as Array<{ id: string; name: string; description: string }>
+    bounded(list.map((c) => [c.id, c.name + ' ' + c.description] as [string, string]))
+    return list
   }
   throw new SelectionApiError(400, 'criteria-invalid', 'criteria must be a {name: description} map or a list of {id,name,description}')
+}
+
+/** Review R1 (1.7): scalar /select fields that used to flow unvalidated into
+ *  the runner, the audit pack, and the sidecar. Each check fails loudly with a
+ *  stable code instead of letting a wrong type or unbounded string through. */
+const AGENT_PRESET = /^[A-Za-z0-9._-]{1,80}$/
+const MAX_GROUND_TRUTH_NOTE_CHARS = 4000
+const MAX_SOURCE_CWD_CHARS = 1024
+
+export function validateStartScalars(body: StartSelectionBody): void {
+  if (body.agentPreset !== undefined && (typeof body.agentPreset !== 'string' || !AGENT_PRESET.test(body.agentPreset))) {
+    throw new SelectionApiError(400, 'agent-preset-invalid', 'agentPreset must be 1..80 chars of [A-Za-z0-9._-]')
+  }
+  if (body.groundTruthNote !== undefined && body.groundTruthNote !== null
+    && (typeof body.groundTruthNote !== 'string' || body.groundTruthNote.length > MAX_GROUND_TRUTH_NOTE_CHARS)) {
+    throw new SelectionApiError(400, 'ground-truth-note-invalid', 'groundTruthNote must be a string <= ' + MAX_GROUND_TRUTH_NOTE_CHARS + ' chars or null')
+  }
+  if (body.algorithmSeed !== undefined && !Number.isSafeInteger(body.algorithmSeed)) {
+    throw new SelectionApiError(400, 'algorithm-seed-invalid', 'algorithmSeed must be a safe integer')
+  }
+  for (const key of ['candidateProvider', 'candidateModel'] as const) {
+    const value: unknown = body[key]
+    if (value !== undefined && (typeof value !== 'string' || !value.trim() || value.length > 160)) {
+      throw new SelectionApiError(400, 'candidate-route-invalid', key + ' must be a non-empty string <= 160 chars')
+    }
+  }
+  if (body.sourceCwd !== undefined && typeof body.sourceCwd !== 'string') {
+    throw new SelectionApiError(400, 'source-cwd-invalid', 'sourceCwd must be a string')
+  }
+}
+
+/** An operator-supplied headless sourceCwd must name an existing absolute
+ *  directory; relative paths would resolve against the HOST process cwd, the
+ *  exact tree the 2026-09-13 isolation incident damaged. */
+function safeSourceCwd(value: string): string {
+  const cwd = value.trim()
+  if (cwd.length > MAX_SOURCE_CWD_CHARS || /[\u0000-\u001f]/.test(cwd) || !path.isAbsolute(cwd)) {
+    throw new SelectionApiError(400, 'source-cwd-invalid', 'sourceCwd must be an absolute path <= ' + MAX_SOURCE_CWD_CHARS + ' chars')
+  }
+  let isDirectory = false
+  try { isDirectory = statSync(cwd).isDirectory() } catch { isDirectory = false }
+  if (!isDirectory) throw new SelectionApiError(400, 'source-cwd-invalid', 'sourceCwd must name an existing directory')
+  return cwd
 }
 
 export class SelectionHost {
@@ -514,6 +580,7 @@ export class SelectionHost {
    *  is the RUNNING placeholder later replaced in place in the history list. */
   async start(body: StartSelectionBody, runtime?: { sourceCwd?: string }): Promise<SelectionRecord> {
     if (this.disposed) throw new SelectionApiError(503, 'selection-host-disposed', 'selection host is disposed')
+    validateStartScalars(body)
     const sourceSessionId = typeof body.sourceSessionId === 'string' && body.sourceSessionId.trim() ? body.sourceSessionId.trim() : undefined
     let parent: ReturnType<SelectionsAgentProvider['get']>
     let problem = typeof body.problem === 'string' && body.problem.trim() ? body.problem.trim() : undefined
@@ -530,7 +597,7 @@ export class SelectionHost {
       // Explicit operator-supplied Git workspace for a headless manual run.
       // The workspace adapter still creates isolated worktrees inside it, so
       // candidates never inherit the host process directory.
-      sourceCwd = body.sourceCwd.trim()
+      sourceCwd = safeSourceCwd(body.sourceCwd)
     }
     if (!problem) throw new SelectionApiError(400, 'problem-required', 'problem is required when the source session has no direct user task')
     const hasCandidateOptions = body.candidateOptions !== undefined && body.candidateOptions !== null

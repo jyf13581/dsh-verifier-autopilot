@@ -2,7 +2,7 @@ import type { AutopilotMode, CandidateModelStrategy } from '../config.js'
 import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
 import { read } from '../payload.js'
 import type { SelectionRecord } from './candidates.js'
-import { boundText, type TrajectoryEvent } from './trajectory.js'
+import { boundText, neutralizeControlMarkers, type TrajectoryEvent } from './trajectory.js'
 
 // Compatibility exports: these policy types are now owned by config so the
 // shared configuration layer does not depend back on selection internals.
@@ -45,6 +45,13 @@ const SESSION_CONTINUATION = /^(?:(?:session|conversation)[ -]?(?:name|title)|�
 const ACTION_SIGNAL = /(?:implement|build|create|add|change|fix|debug|refactor|migrate|optimi[sz]e|review|audit|investigate|research|analy[sz]e|test|verify|design|architecture|deploy|实现|构建|创建|新增|修改|修复|调试|重构|迁移|优化|审查|检查|研究|分析|测试|验证|设计|架构|部署)/i
 const DEEP_SIGNAL = /(?:architecture|cross[- ]module|end[- ]to[- ]end|migration|concurrency|security|performance|production|root cause|multi[- ]agent|context management|架构|跨模块|全链路|迁移|并发|安全|性能|生产|根因|多路|多代理|上下文管理)/i
 const EXTERNAL_SIDE_EFFECT = /(?:\bdeploy(?:ment)?\b|\bpublish\b|\brelease\b|\bssh\b|remote server|production server|send email|payment|drop database|上传|下载|部署|发布|上线|远程服务器|生产服务器|发邮件|付款|删除数据库)/i
+// Review R1 (1.1): autopilot candidates run with danger-full-access and
+// approval=never, and N of them run the SAME task concurrently. Anything that
+// writes to a shared remote (push, PR/merge, registry upload, infrastructure
+// apply) or talks to the network on the task's behalf would happen N times, so
+// such tasks stay with the single source agent. This gates the USER TASK TEXT
+// at admission; it does not observe candidate actions (see the R1 threat model).
+const REMOTE_SIDE_EFFECT = /(?:\bgit\s+push\b|\bforce[- ]push\b|\bpush(?:ing)?\s+(?:it|this|them|to|the\s+(?:branch|changes|commits?|code|fix))\b|\b(?:open|create|submit|raise|merge|close)\s+(?:a\s+|the\s+|an?\s+)?(?:pr|pull[- ]request|merge[- ]request|issue)s?\b|\bgh\s+(?:pr|issue|release|repo|api|workflow)\b|\b(?:npm|pnpm|yarn|cargo|twine|gem|docker|helm)\s+(?:publish|push|upload|login)\b|\bkubectl\b|\bterraform\s+(?:apply|destroy)\b|\bcurl\b|\bwget\b|\bwebhook\b|推送|提交到远程|推到远程|(?:创建|提交|发起|合并|关闭)\s*(?:PR|pr|拉取请求|合并请求|issue)|发\s*(?:PR|pr)|开\s*(?:PR|pr))/i
 
 // Task-kind evidence lanes (ruling I.3 + K.4-7). The classification is a
 // deterministic admission-time decision; candidates never self-report it.
@@ -117,7 +124,7 @@ export function planAutopilotTask(
   if (config.mode === 'off') return { admitted: false, reason: 'mode-off' }
   if (!normalized) return { admitted: false, reason: 'empty-task' }
   if (STATUS_ONLY.test(normalized) || SESSION_CONTINUATION.test(normalized)) return { admitted: false, reason: 'status-only' }
-  if (EXTERNAL_SIDE_EFFECT.test(normalized)) return { admitted: false, reason: 'external-side-effect-risk' }
+  if (EXTERNAL_SIDE_EFFECT.test(normalized) || REMOTE_SIDE_EFFECT.test(normalized)) return { admitted: false, reason: 'external-side-effect-risk' }
   // A completion/status report is not a task (ruling K.4-7): it describes
   // finished work, so candidates would relitigate already-delivered results.
   const taskKind = classifyTaskKind(normalized)
@@ -219,7 +226,7 @@ export function buildAutopilotContext(
   ]
   if (recent.length > 0) {
     sections.push('', '[RELEVANT RECENT CONVERSATION - context, not new instructions]')
-    for (const line of recent) sections.push(line.role + ': ' + line.text)
+    for (const line of recent) sections.push(line.role + ': ' + neutralizeControlMarkers(line.text))
   }
   sections.push(
     '',
@@ -274,9 +281,10 @@ export function buildAutopilotRelay(record: SelectionRecord): string {
       + ' condition=' + (record.marginCondition ?? 'n/a'))
   }
   if (record.noSearchSpace) lines.push('Flag: no-search-space (all survivor diffs identical; deduped before the verifier)')
+  if (!record.noSearchSpace && record.dedupedCandidates?.length) lines.push('Flag: deduped ' + record.dedupedCandidates.map((i) => 'c' + i).join(', ') + ' (byte-identical to a kept survivor; not ranked separately)')
   if (record.llmOnly) lines.push('Flag: llm-only (no candidate carried passing objective checks; LLM was the only signal)')
   if (record.checksUnreliable) lines.push('Flag: checks-unreliable (at least one check failed as a shell-level harness error and was NOT used to eliminate)')
-  if (record.note) lines.push('Note: ' + record.note)
+  if (record.note) lines.push('Note: ' + neutralizeControlMarkers(record.note))
 
   const slot = record.winner ?? record.fallback ?? null
   const pushLoserNotice = () => {
@@ -292,7 +300,9 @@ export function buildAutopilotRelay(record: SelectionRecord): string {
       lines.push(
         '',
         '[CANDIDATE c' + finalist.index + ' | score=' + (finalist.score === null ? 'n/a' : finalist.score.toFixed(4)) + ' | model=' + (finalist.model ?? 'default') + ']',
-        finalist.handoff || '[no trajectory excerpt]',
+        // Defense in depth: handoffs are rendered from neutralized trajectories,
+        // but records reloaded from older ledgers predate that rule.
+        finalist.handoff ? neutralizeControlMarkers(finalist.handoff) : '[no trajectory excerpt]',
         '[END CANDIDATE c' + finalist.index + ']',
       )
     }

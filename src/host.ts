@@ -417,8 +417,11 @@ export class VerifierHost {
         // G-4 post-audit BEFORE discard: compare the source repo state against
         // the start-time snapshot. Audited-but-unevidenced integration reports
         // 'no'; observed HEAD/dirty evidence without running tests can only be
-        // 'unknown' — 'yes' requires deterministic passing tests, which this
-        // hook intentionally never runs on the user's repository.
+        // 'unknown' — 'yes' requires deterministic passing tests. Those run
+        // ONLY when the operator configured selectionPostAuditTestCommand, and
+        // then they DO execute in the user's source repository (review R1
+        // 1.5): the field is settings-only over the unauthenticated HTTP
+        // transport, and the command runs with credential variables withheld.
         const rec = this.selections.getSelection(selectionId)
         const slot = rec ? (rec.winner ?? rec.fallback) : undefined
         if (rec && slot && slot.discardedAt === undefined && !rec.delivery) {
@@ -441,7 +444,7 @@ export class VerifierHost {
                 let postAuditError: string | undefined
                 if (testCommand && (headChanged === true || state.dirtyEntries > 0)) {
                   try {
-                    const results = await runChecks(cwd, [{ name: 'post-audit', command: testCommand, timeoutMs: 120000 }])
+                    const results = await runChecks(cwd, [{ name: 'post-audit', command: testCommand, timeoutMs: 120000 }], { secretEnvNames: [this.config.apiKeyEnv] })
                     testsExit = results[0]?.exitCode ?? null
                     testsRan = true
                   } catch (runError) {

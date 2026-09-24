@@ -8,7 +8,7 @@
  */
 
 import { cp, lstat, mkdir, readdir, readlink, rm, rmdir } from 'node:fs/promises'
-import { statSync } from 'node:fs'
+import { createReadStream } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
@@ -535,9 +535,46 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
  *  adapter produces it and re-exports the type so the two can never drift.
  *  files = tracked files whose worktree bytes differ from HEAD; untracked =
  *  non-ignored new files (candidate NEW artifacts live here); fingerprint =
- *  stable hash of numstat lines + untracked name:size, so equal fingerprints
- *  mean the same diff shape. */
+ *  stable hash of every changed or new path together with its CONTENT digest,
+ *  so equal fingerprints mean byte-identical deliverables (review R2 2.1: the
+ *  previous numstat+size hash collided for any two edits with equal line
+ *  counts, e.g. `x = 2` vs `x = 9`, and deduped a different solution away). */
 export type { DiffStatLite }
+
+/** Bytes hashed per fingerprint before falling back to size-only entries: the
+ *  snapshot limits already bound workspaces, this bounds a candidate that
+ *  generated huge artifacts. */
+const FINGERPRINT_CONTENT_BUDGET = 256 * 1024 * 1024
+const FINGERPRINT_MAX_PATHS = 10_000
+
+function nulList(out: string): string[] {
+  return out.split(String.fromCharCode(0)).filter(Boolean)
+}
+
+function hashFile(file: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(file)
+    stream.on('data', (chunk) => hash.update(chunk))
+    stream.on('error', reject)
+    stream.on('end', () => resolve(hash.digest('hex')))
+  })
+}
+
+/** Content identity of one workspace path: deleted, symlink target, or file
+ *  bytes plus the executable bit (git tracks it, so it is part of the diff). */
+async function contentDigest(file: string, budget: { left: number }): Promise<string> {
+  let info
+  try { info = await lstat(file) } catch { return 'deleted' }
+  if (info.isSymbolicLink()) {
+    try { return 'link:' + await readlink(file) } catch { return 'link:?' }
+  }
+  if (!info.isFile()) return 'other'
+  const mode = (info.mode & 0o111) !== 0 ? 'x' : '-'
+  if (info.size > budget.left) return mode + 'size:' + info.size
+  budget.left -= info.size
+  try { return mode + (await hashFile(file)) } catch { return mode + 'unreadable:' + info.size }
+}
 
 /** Objective work evidence for one candidate workspace (ruling K.5 / J.4).
  *  Returns null when the workspace is not a git worktree (manual blank
@@ -551,32 +588,24 @@ export async function gitDiffStat(cwd: string): Promise<DiffStatLite | null> {
     let files = 0
     let insertions = 0
     let deletions = 0
-    const numLines: string[] = []
     for (const line of numstat.out.split(/\r?\n/)) {
       const parts = line.split('\t')
       if (parts.length < 3) continue
       files += 1
       insertions += parts[0] === '-' ? 0 : Number(parts[0]) || 0
       deletions += parts[1] === '-' ? 0 : Number(parts[1]) || 0
-      numLines.push(line)
     }
-    const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard'], cwd)
-    const untrackedEntries: string[] = []
-    if (others.code === 0) {
-      for (const rel of others.out.split(/\r?\n/).filter(Boolean).slice(0, 5000)) {
-        let size = -1
-        try { size = statSync(path.join(cwd, rel)).size } catch { /* raced away */ }
-        untrackedEntries.push(rel + ':' + size)
-      }
+    const changed = await execWide('git', ['-C', cwd, 'diff', '--name-only', '-z', 'HEAD'], cwd)
+    if (changed.code !== 0) return null
+    const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard', '-z'], cwd)
+    const untracked = others.code === 0 ? nulList(others.out) : []
+    const paths = [...new Set([...nulList(changed.out), ...untracked])].sort().slice(0, FINGERPRINT_MAX_PATHS)
+    const budget = { left: FINGERPRINT_CONTENT_BUDGET }
+    const hash = createHash('sha256')
+    for (const rel of paths) {
+      hash.update(rel).update(String.fromCharCode(0)).update(await contentDigest(path.join(cwd, rel), budget)).update('\n')
     }
-    untrackedEntries.sort()
-    const fingerprint = createHash('sha256')
-      .update(numLines.join('\n'))
-      .update('\n--UNTRACKED--\n')
-      .update(untrackedEntries.join('\n'))
-      .digest('hex')
-      .slice(0, 16)
-    return { files, insertions, deletions, untracked: untrackedEntries.length, fingerprint }
+    return { files, insertions, deletions, untracked: untracked.length, fingerprint: hash.digest('hex').slice(0, 16) }
   } catch {
     return null
   }
