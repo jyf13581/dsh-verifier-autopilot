@@ -146,14 +146,14 @@
 - src/selection/bridge.ts：长驻 framed JSONL sidecar、timeout/abort、child 重启、密钥边界。
 - src/selection/retry.ts：仅瞬时错误重试、绝对 deadline、caller abort、动态剩余 timeout。
 - src/selection/trajectory.ts：去除 runtime/header/retry/injected-message 噪声，生成有界证据。
-- src/selection/checks.ts：在候选 cwd 顺序执行 caller-supplied pwsh checks。
+- src/selection/checks.ts：在候选 cwd 顺序执行 caller-supplied checks；shell 按平台链解析一次（pwsh → win32 的 powershell / 其他平台的 /bin/sh），结果记录 `shell` 字段。src/selection/proc.ts：live.ts 与 checks.ts 共用的有界子进程 runner（叶子模块）。
 - src/config.ts：Schemastery 配置 schema、默认值、patch allowlist 与 settings source hooks。
 - src/api.ts：HTTP/SSE transport、鉴权、限流与状态码映射。
 - src/index.ts：legacy verifier、autopilot pre-step、API、GUI Host 的薄装配入口。
 - src/client/index.ts：Verifier 与 Candidate selection 面板。
 - bridge/llm_verifier_sidecar.py：上游 llm_verifier 的 select/progress/preflight 适配和 usage。
 - bridge/PROTOCOL.md：sidecar wire contract。
-- scripts/test.mjs：当前 173 项离线回归（含 settings source -> live Host 同步、quality-first 调度、后台 autopilot relay/取消与 manual candidateTimeoutMs 配置兜底）。
+- scripts/tests/*.test.mjs：离线回归按领域拆成 16 个文件（evidence / verifier-scoring / verifier-lanes / host / api / config / repair-v2 / bridge / selection-runner / selection-host / autopilot / workspaces / storage / process-checks / diagnostics / payload），共享夹具在 scripts/tests/helpers/；`npm test` = `node --test "scripts/tests/*.test.mjs"`，每个文件独立进程，可单独运行。sidecar 协议帧的唯一来源是 bridge/protocol-fixtures.json（self_test.py、stub sidecar、bridge 测试三方共用）。
 
 ## 2. 当前生产契约
 
@@ -181,8 +181,9 @@
 - autopilot candidate timeout 默认 600000ms（2026-09-10 抬界裁决：300s 实测落在强候选真实工作区间中段，见 §6.4.4 第 7 条；commit 9927986）；直接 /select 未传值时跟随 Host 配置；输入范围 30000..1800000ms。
 - candidate turn/end reason.kind=error 必须记 failed；timeout、agent-create、progress-abandoned 和 check 淘汰均保留原因。
 - progressGuard 默认关闭；启用时使用 llm_verifier.track，只有连续低分且没有新 tool/result 才取消，默认 60s、minScore=0.15、grace=3、maxChecks=8。
-- objective checks 最多 5 条、command 最长 2000 字符；顺序运行 pwsh -NoProfile -Command，默认 60s，记录 stdout+stderr 尾部 2000 字符。
-- checks 没有命令 allowlist，也不是 DSH fs sandbox。Windows timeout 只 kill pwsh.exe，孙进程可能存活；命令必须自包含且只作用于候选 workspace。
+- objective checks 最多 5 条、command 最长 2000 字符；顺序运行于进程内解析出的第一个可启动 shell（优先 `pwsh -NoProfile -Command`；没有 pwsh 时 win32 退到 `powershell`，其他平台退到 `/bin/sh -c`），默认 60s，记录 stdout+stderr 尾部 2000 字符与实际 shell 名。命令写成哪种方言由部署机决定——跨平台部署请用两种 shell 都能跑的命令（如 `npm test`）。
+- 整条链都启动不了、或 shell 启动失败（ENOENT）时是 harness error（`harnessError:true`，尾部以 `harness:` 开头）：候选保留并标 `checksInvalid`，与 B-10 的"解析错误不淘汰"同一路径。
+- checks 没有命令 allowlist，也不是 DSH fs sandbox。timeout 只 kill shell 进程，孙进程可能存活（runner 会在 exit 后最多等 1s flush 再放弃管道）；命令必须自包含且只作用于候选 workspace。
 - **checks 门禁可反噬**：若 check 的失败输出是 shell 解释器级错误（`is not recognized as`、ParserError 等），判 `checksInvalid=true`，候选不因此淘汰、该 check 视为缺省（rerun 时同指纹 check 全失败即属此类）；record 以 `checksUnreliable` 明示。
 
 ### 2.4 Preflight、ranking、margin gate 与重试
@@ -220,9 +221,9 @@
 - **2026-09-05 修复**：候选工作区若位于"宿主外壳 git 仓库"内部（本插件托管 `D:/tools/dsh-plugins/dsh-verifier-autopilot` 自带 .git），`git rev-parse --show-toplevel` 会把普通候选目录冒名成外层仓库 worktree，discoverLease 以 workspace-path-outside-managed-root 炸开整个 remove()/discard 路径。现为：toplevel 落在管理根之外即认定"非 worktree"，按普通目录 rm；回归测试为 `workspace manager: a foreign git repo above the managed root must not hijack lease discovery`。
 - **2026-09-08 起 relay 按 outcome 区分文案**：ranked_winner 才带原 finalizer 契约；single_candidate_fallback 明示「未经候选间比较」；objective_only_result 明示「仅客观检查排序」；abstain/insufficient_evidence/verifier_unavailable 不附 finalizer 契约、double-finalist 等同权证据或明确叫停。想冒充选优的措辞不存在了。
 - **审计包**：`finishRun` 与 `discardWinner` 都在清理工作区**之前**把 `.data/selection-artifacts/{selectionId}.json` 落盘（race：先写盘后回收）。内含起跑有效配置快照（含 candidateOptions 实际值、verifier/model/effort/baseURL host、taskKind、checks 名）、sourceModel、sourceHeadAtStart、margin/threshold/condition、outcome/winnerBasis、noSearchSpace/llmOnly/checksUnreliable 标志、finalists 摘录；discard 时重写以追加 discardedAt 与 delivery。manual 与历史 record 无此包，但保留历史文件字段兼容。
-- **审计包 v2（2026-09-10，G/F6 补齐）**：一个 `SelectionRunResult.artifacts` 在 runner 内部于 loser dispose **之前**捕获；落为目录 `.data/selection-artifacts/{id}/`：`record.json` + `traces/c{i}.txt`（候选渲染轨迹全文）+ `diffs/c{i}.patch`（`git add -N . && git diff HEAD` 的全量 patch、含 untracked 清单、256KB 截断标记）。同一条写旧的 `{id}.json` 平面文件已废弃；`writeArtifact` 的 settle-vs-discard 两阶段不变。
+- **审计包 v2（2026-09-10，G/F6 补齐）**：一个 `SelectionRunResult.artifacts` 在 runner 内部于 loser dispose **之前**捕获；落为目录 `.data/selection-artifacts/{id}/`：`record.json` + `traces/c{i}.txt`（候选渲染轨迹全文）+ `diffs/c{i}.patch`（`git add -N . && git diff HEAD` 的全量 patch、含 untracked 清单、256KB 截断标记；intent-to-add 写在临时 `GIT_INDEX_FILE` 副本里，候选真实 index 不被改动）。同一条写旧的 `{id}.json` 平面文件已废弃；`writeArtifact` 的 settle-vs-discard 两阶段不变。
 - **source 后置审计（G-4）**：autopilot winner/fallback 在 source idle/detach/dispose 前的 cleanupAutopilotWinners 里做 HEAD-before/after + 工作区脏读数，写入 `delivery`，`delivered` 三值：观察到集成证据但测试未运行 → `unknown`；审计执行且无变化 → `no`；未执行 → `unknown`。插件不擅自跑用户的测试。
-- manual 历史工件没有自动 artifact GC；autopilot 当前路径有 source-idle cleanup。不要把两者写成统一生命周期。
+- **存储生命周期（2026-09-23 起）**：审计包与 ledger 窗口同寿——`SelectionHost.collectArtifacts()` 在成功加载 ledger 后、以及新 run 挤出旧记录时，删除 `.data/selection-artifacts/` 下 id 不在窗口（最新 `SELECTIONS_HISTORY_LIMIT`=200 条）内的目录与旧版平面 `{id}.json`；ledger 读不到/为空则一律不删；目录里非 `sel-*` 形状的条目不碰。候选目录孤儿由 `reclaimOrphanWorkspaces()` 在 Host start 后台处理：有记录且非保留 winner/fallback（`discardedAt` 未设）且非进行中 → 回收并清 session store；**无记录的目录只报 `workspaces.unknown`，绝不删**（可能是 aged-out 的手动 winner）。running 占位行现在在 start() 时就落 ledger，进程中途死亡后重载得到 `interrupted-by-reload` 而非空洞。manual winner 的保留/丢弃仍由操作员决定，autopilot 仍走 source-idle cleanup——GC 只清"再也没人能引用"的东西，不把两者写成统一生命周期。
 
 ## 3. Host API、ledger 与 GUI
 
@@ -272,7 +273,7 @@ API prefix：/@dsh-external/dsh-verifier-autopilot/api
 | selection workspace | .data/selection-workspaces |
 | selection ledger | .data/selections.jsonl |
 | legacy ledger | .data/records.jsonl |
-| Python | D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe |
+| Python | `DSH_VA_PYTHON` 优先；未设置时若 D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe 存在则用它，否则回退 PATH 上的 `python`（win32）/`python3` |
 
 provider 注意事项：candidateOptions 必须能补成完整 provider+model；半路由或未知模型 fail-fast（catalog 不再是 allowlist——2026-09-13/16 改造后 `availableModels = preferred ∪ catalog`，不在 `/models` 里的 operator 自定义 ID 也会被直接探活，由探活决定去留）。selectionModels 是按质量排序的优先列表。quality-first 会把全部 N 个候选压到探活后的第一名可用模型；exploration 才会轮换已有模型。因此 standard N=2 出现两个同模型候选是默认行为，不是记录错误。
 

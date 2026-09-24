@@ -15,9 +15,11 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 import { rmdir } from 'node:fs/promises'
 import path from 'node:path'
 import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
+import { read, readString } from '../payload.js'
 import { boundCandidateHandoff, renderTrajectory, type TrajectoryEvent } from './trajectory.js'
 import { runChecks, type CheckResult, type ObjectiveCheck } from './checks.js'
 export type { CheckResult, ObjectiveCheck } from './checks.js'
@@ -211,6 +213,10 @@ export interface CandidateFactory {
 export interface WorkspaceManager {
   prepare(sel: { selectionId: string; index: number; sourceCwd?: string; strictSnapshot?: boolean }): Promise<string>
   remove(path: string): Promise<void>
+  /** Every candidate directory currently under the managed root, whether or
+   *  not this process created it. Absent = the manager cannot enumerate
+   *  (test fakes), and orphan reclamation is skipped. */
+  listManaged?(): Promise<Array<{ selectionId: string; index: number; dir: string }>>
   /** Best-effort purge of the candidate's DSH session-store record (the
    *  persisted journal under the session root). Without this the GUI forever
    *  lists disposed losers as dead sessions pointing at deleted workspaces
@@ -236,6 +242,9 @@ export interface SelectionRunnerDeps {
   /** Test seam for bounded verifier backoff; production uses abort-aware timers. */
   sleep?: RetrySleep
   now?: () => number
+  /** Degradation sink for best-effort paths (loser cleanup, evidence
+   *  capture, progress sampling, ranking retries). Process default if omitted. */
+  diagnostics?: Diagnostics
 }
 
 export interface SelectionRunInput {
@@ -378,8 +387,10 @@ function deterministicPreface(cand: CandidateRecord, taskKind: string | undefine
 /** Validate the untrusted sidecar payload before any index is mapped back to
  * an agent. A malformed result must fail transparently; it must never crown a
  * candidate by accident or turn a partial ranking into a winner. */
-function validateSelectionResult(outcome: BridgeSelectResult, candidateCount: number): void {
-  const value = outcome as unknown as Record<string, unknown>
+function validateSelectionResult(value: { [K in keyof BridgeSelectResult]?: unknown }, candidateCount: number): void {
+  // Typed as "these fields, contents unknown": the bridge parsed the wire
+  // shape, but an injected bridge (tests, embedded hosts) has not, and the
+  // candidate-count invariants below belong to the runner either way.
   const index = value.index
   const scores = value.scores
   const ranking = value.ranking
@@ -441,31 +452,57 @@ export class SelectionRunner {
       candidates: [],
       verifierModel: input.verifier.model,
     }
-    const publish = () => { try { input.onUpdate?.(record) } catch { /* observers never own the run */ } }
+    const diag = this.deps.diagnostics ?? defaultDiagnostics
+    const publish = () => { try { input.onUpdate?.(record) } catch { diag.count('selection.observer_error') } }
     publish()
     const handles: Array<SelectionAgentHandle | null> = new Array(n).fill(null)
     const trajectories: Array<string | null> = new Array(n).fill(null)
     const diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null> = new Array(n).fill(null)
     const seed = input.seed && input.seed.length > 0 ? input.seed : undefined
     const candidateTimeout = input.candidateTimeoutMs ?? 600000
-    let aborted = false
+    // A signal that is already aborted never fires 'abort' again: a run that
+    // starts after its host was disposed/cancelled must still see it, or it
+    // would provision worktrees and spawn agents for a dead selection.
+    let aborted = input.signal?.aborted === true
     const onAbort = () => { aborted = true }
     input.signal?.addEventListener('abort', onAbort, { once: true })
 
+    // Run-scoped serial progress sampler. The sidecar is one serial pipe: N
+    // candidates ticking together used to push N progress frames into it at
+    // once, so with a slow verifier the tail frame could outlive the bridge
+    // timeout and tear the whole sidecar down. Samples now run one at a time
+    // in FIFO order with at most one queued sample per candidate; a tick that
+    // finds its own sample still pending is skipped (a sample is a best-effort
+    // observation, not a scheduled obligation).
+    let progressChain: Promise<void> = Promise.resolve()
+    const progressPending = new Set<number>()
+    const enqueueProgressSample = (index: number, sample: () => Promise<void>): void => {
+      if (progressPending.has(index)) return
+      progressPending.add(index)
+      const run = async () => {
+        try { await sample() } catch { /* sampling never owns the run */ } finally { progressPending.delete(index) }
+      }
+      progressChain = progressChain.then(run, run)
+    }
+
+    // Loser cleanup is best-effort by contract (a leaked worktree must never
+    // fail a settled selection) but not silent: every leaked resource is a
+    // diagnostic the operator can act on.
     const disposeLoser = async (i: number) => {
       const h = handles[i]
-      if (h) { try { await h.dispose() } catch { /* loser cleanup best-effort */ } }
+      if (h) { try { await h.dispose() } catch (error) { diag.warn('loser.dispose', error, { selectionId: record.selectionId, candidate: i }) } }
       const ws = record.candidates[i]?.workspace
       if (ws) {
-        try { await this.deps.workspaces.remove(ws) } catch { /* best-effort */ }
+        try { await this.deps.workspaces.remove(ws) } catch (error) { diag.warn('loser.workspace', error, { selectionId: record.selectionId, candidate: i, workspace: ws }) }
         // Dispose BEFORE purge: the agent may still flush its journal at
         // disposal time; purging first would race a late write into re-creating
         // the directory.
-        try { await this.deps.workspaces.purgeSessionRecord?.(ws) } catch { /* best-effort */ }
+        try { await this.deps.workspaces.purgeSessionRecord?.(ws) } catch (error) { diag.warn('loser.session', error, { selectionId: record.selectionId, candidate: i }) }
       }
     }
 
     try {
+      if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted before workspace preparation', false)
       // 1. Workspaces first: prepare sequentially (git worktree locks serialize).
       for (let i = 0; i < n; i += 1) {
         let workspace: string
@@ -559,7 +596,10 @@ export class SelectionRunner {
           let lastEvidence = -1
           const evidenceCount = () => agent.session.events.filter((ev) => ev.type === 'tool/result').length
           monitor = setInterval(() => {
-            void (async () => {
+            if (pgCancelled || cand.status !== 'running') return
+            enqueueProgressSample(cand.index, async () => {
+              // Re-check after the queue wait: the candidate may have settled
+              // (or the run aborted) while another candidate's sample ran.
               if (pgCancelled || cand.status !== 'running') return
               samples += 1
               const evidence = evidenceCount()
@@ -576,10 +616,20 @@ export class SelectionRunner {
                     apiKeyEnv: input.verifier.apiKeyEnv,
                     effort: input.verifier.effort,
                     nEvaluations: 1,
+                    // A run abort must not leave a sample occupying the pipe.
+                    signal: input.signal,
                   })
                   score = r.score
                 }
-              } catch { score = null }
+              } catch (error) {
+                score = null
+                diag.count('progress.sample_failed')
+                // A run abort is the caller's decision, not a degradation. The
+                // bridge already recorded the per-request detail (timeout text,
+                // stderr tail); here the stable code keeps one entry per outage
+                // instead of one per tick.
+                if (!input.signal?.aborted) diag.warn('progress.sample', error instanceof BridgeError ? 'sidecar ' + error.code : error, { selectionId: record.selectionId })
+              }
               if (score !== null) {
                 pgLastScore = score
                 ;(cand.progress ??= []).push({ at: this.now(), score })
@@ -598,7 +648,7 @@ export class SelectionRunner {
                 clearInterval(monitor)
                 monitor = null
               }
-            })()
+            })
           }, interval)
         }
         try {
@@ -637,10 +687,10 @@ export class SelectionRunner {
             // failed candidate, not a finished one — never feed it to the
             // verifier as if it were a real rollout.
             const tail = agent.session.events.slice(preRunCount)
-            const bad = tail.filter((ev) => ev.type === 'turn/end' && ((ev.data ?? {}) as { reason?: { kind?: string } }).reason?.kind === 'error')
+            const bad = tail.filter((ev) => ev.type === 'turn/end' && read(ev.data, 'reason', 'kind') === 'error')
             if (bad.length > 0) {
               cand.status = 'failed'
-              const reason = ((bad[bad.length - 1].data ?? {}) as { reason?: { error?: { message?: string } } }).reason?.error?.message
+              const reason = readString(bad[bad.length - 1].data, 'reason', 'error', 'message')
               cand.error = 'turn-error' + (reason ? ': ' + reason.slice(0, 160) : '')
             } else {
               cand.status = 'finished'
@@ -651,6 +701,11 @@ export class SelectionRunner {
           cand.error = errText(e)
         } finally {
           clearTimeout(timer)
+          // The progress monitor must die with the candidate on EVERY exit
+          // path: after an abort or a followup failure the interval used to
+          // keep ticking (each tick returned early on status, so it never
+          // reached its maxChecks self-stop) and pinned the event loop.
+          if (monitor) { clearInterval(monitor); monitor = null }
         }
         // Trajectory accounting is best-effort and runs for finished AND
         // failed candidates alike — a crashed candidate's partial trajectory
@@ -667,17 +722,17 @@ export class SelectionRunner {
           cand.execToolCalls = r.execToolCalls
           cand.trajectoryChars = r.totalChars
           trajectories[cand.index] = r.text
-        } catch { /* render is observability, never fatal */ }
+        } catch (error) { diag.warn('evidence.render', error, { selectionId: record.selectionId, candidate: cand.index }) }
         // Objective diff evidence (ruling I.5): the workspace's git surface is
         // the has-work gate's primary trust anchor. Best-effort; a non-git
         // workspace yields null and the gate falls back to tool calls.
         if (this.deps.diffStat) {
-          try { cand.diffStat = await this.deps.diffStat(cand.workspace) } catch { cand.diffStat = null }
+          try { cand.diffStat = await this.deps.diffStat(cand.workspace) } catch (error) { cand.diffStat = null; diag.warn('evidence.diffstat', error, { selectionId: record.selectionId, candidate: cand.index }) }
         }
         // Full patch capture for the artifact pack — BEFORE any cleanup could
         // delete the worktree (loser disposal runs later).
         if (this.deps.diffFull) {
-          try { diffPatches[cand.index] = await this.deps.diffFull(cand.workspace) } catch { diffPatches[cand.index] = null }
+          try { diffPatches[cand.index] = await this.deps.diffFull(cand.workspace) } catch (error) { diffPatches[cand.index] = null; diag.warn('evidence.diff', error, { selectionId: record.selectionId, candidate: cand.index }) }
         }
         publish()
       }))
@@ -809,9 +864,10 @@ export class SelectionRunner {
                 maxAttempts: 2,
                 now,
                 onAttempt: (attempt) => { record.rankingAttempts = attempt; publish() },
-                onRetry: (error) => {
+                onRetry: (error, attempt) => {
                   const errors = record.rankingRetryErrors ?? (record.rankingRetryErrors = [])
                   errors.push(error.message.slice(0, 300))
+                  diag.warn('verifier.ranking_retry', error, { selectionId: record.selectionId, attempt })
                   publish()
                 },
               })
@@ -821,6 +877,7 @@ export class SelectionRunner {
               // their eligibility honestly instead of dropping to failed.
               if (!survivors.every((c) => c.objectiveEvidence === 'pass')) throw bridgeFailure
               record.outcome = 'verifier_unavailable'
+              diag.warn('verifier.unavailable', bridgeFailure, { selectionId: record.selectionId })
               record.note = 'ranking failed after retries: ' + errText(bridgeFailure)
               const passCounts = survivors.map((c) => (c.checks ?? []).filter((x) => x.ok).length)
               if (new Set(passCounts).size === passCounts.length) {

@@ -5,6 +5,10 @@ Run with the bridge venv:
 Set DSH_VA_REQUIRE_LLM_VERIFIER=1 in that venv to make a missing/broken
 llm_verifier installation fail health and provider-specific gates instead of
 reporting an optional SKIP. Exit code 0 iff every required gate passes.
+
+Frame-level gates come from bridge/protocol-fixtures.json (`conformance`): the
+same file the TypeScript bridge tests and the stub sidecar consume, so a
+protocol change is made once and every consumer sees it.
 """
 import json
 import os
@@ -14,6 +18,8 @@ import sys
 PY = sys.executable
 SIDECAR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "llm_verifier_sidecar.py")
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "protocol-fixtures.json")
 
 
 def rpc(proc, frame):
@@ -24,133 +30,94 @@ def rpc(proc, frame):
     return json.loads(line)
 
 
+def _subset(expected, actual):
+    """True when every key of `expected` matches `actual` (recursing into dicts)."""
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(
+            k in actual and _subset(v, actual[k]) for k, v in expected.items())
+    return expected == actual
+
+
+def _resolve_placeholders(value, env):
+    """`$NAME_OR_default` expands to env[NAME] or the default: the fixture stays
+    literal JSON while a case can still depend on the ambient environment."""
+    if isinstance(value, dict):
+        return {k: _resolve_placeholders(v, env) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve_placeholders(v, env) for v in value]
+    if isinstance(value, str) and value.startswith("$") and "_OR_" in value:
+        name, default = value[1:].split("_OR_", 1)
+        return env.get(name, default)
+    return value
+
+
+def run_conformance(proc, cases, env, require_llm_verifier):
+    """Drive every fixture case through one sidecar process, in order. Returns
+    (gates, llm_available). Every case is a gate; the health case additionally
+    decides whether provider-dependent gates may SKIP."""
+    gates = []
+    llm_available = False
+    for case in cases:
+        name = case["name"]
+        expect = _resolve_placeholders(case["expect"], env)
+        try:
+            if "raw" in case:
+                proc.stdin.write(case["raw"] + "\n")
+                proc.stdin.flush()
+                r = json.loads(proc.stdout.readline())
+            else:
+                r = rpc(proc, case["request"])
+        except Exception as exc:  # noqa: BLE001 - the harness reports, never dies
+            gates.append((name, False, "harness exception " + repr(exc)))
+            break
+        problems = []
+        if r.get("ok") is not expect["ok"]:
+            problems.append("ok=%r" % r.get("ok"))
+        if "id" in expect and r.get("id") != expect["id"]:
+            problems.append("id=%r" % r.get("id"))
+        if "error_code" in expect and (r.get("error") or {}).get("code") != expect["error_code"]:
+            problems.append("error=%r" % r.get("error"))
+        result = r.get("result")
+        if "result_keys" in expect and (not isinstance(result, dict)
+                                        or sorted(result) != sorted(expect["result_keys"])):
+            problems.append("result keys=%r" % (sorted(result) if isinstance(result, dict) else result,))
+        if "result" in expect and not _subset(expect["result"], result):
+            problems.append("result=%r" % (result,))
+        if "exit_code" in expect:
+            rc = proc.wait(timeout=10)
+            if rc != expect["exit_code"]:
+                problems.append("rc=%r" % rc)
+        if name == "health" and isinstance(result, dict):
+            llm_available = result.get("select_available") is True
+            # A plain CI Python environment may not carry the optional provider
+            # library. Health passes when it reports that state truthfully unless
+            # the bridge-venv strict switch explicitly requires provider support.
+            if not isinstance(result.get("select_available"), bool):
+                problems.append("select_available not boolean")
+            elif require_llm_verifier and not llm_available:
+                problems.append("strict mode requires select_available")
+        gates.append((name, not problems, (", ".join(problems) or "ok") + "  " + json.dumps(r)[:160]))
+    return gates, llm_available
+
+
 def main():
     env = dict(os.environ)
     require_llm_verifier = env.get("DSH_VA_REQUIRE_LLM_VERIFIER") == "1"
-    llm_available = False
     env["SMOKE_KEY"] = "dummy-not-a-real-key"
     env.pop("DEFINITELY_MISSING_KEY", None)
+    with open(FIXTURES, "r", encoding="utf-8") as fh:
+        fixtures = json.load(fh)
     proc = subprocess.Popen([PY, SIDECAR], stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             text=True, env=env)
-    gates = []
+    # Protocol conformance: the canonical cases in bridge/protocol-fixtures.json,
+    # shared with the TypeScript bridge tests and the stub sidecar, so the three
+    # sides of the pipe cannot drift apart silently.
     try:
-        # (a) health
-        r = rpc(proc, {"id": "h1", "type": "health"})
-        health = r.get("result", {})
-        llm_available = health.get("select_available") is True
-        # A plain CI Python environment may not carry the optional provider
-        # library. Health passes when it reports that state truthfully unless
-        # the bridge-venv strict switch explicitly requires provider support.
-        gates.append(("health", r.get("ok") is True
-                      and isinstance(health.get("select_available"), bool)
-                      and (llm_available or not require_llm_verifier)
-                      and "python" in health,
-                      ("strict=%s " % require_llm_verifier)
-                      + json.dumps(r)[:200]))
-        # (b) malformed line
-        proc.stdin.write("{not json\n")
-        proc.stdin.flush()
-        r = json.loads(proc.stdout.readline())
-        gates.append(("bad_frame", r.get("ok") is False and r.get("id") is None
-                      and r["error"]["code"] == "bad_frame", json.dumps(r)[:200]))
-        # (c) empty candidates -> invalid_request, no network
-        r = rpc(proc, {"id": "s1", "type": "select", "problem": "p",
-                       "candidates": [], "criteria": {"c": "d"},
-                       "ground_truth_note": None, "n_evaluations": 1,
-                       "pivots": 0, "seed": 0, "model": "m",
-                       "base_url": "http://127.0.0.1:9/v1",
-                       "api_key_env": "SMOKE_KEY", "cache": None,
-                       "on_error": "raise", "max_workers": None,
-                       "progress": False})
-        gates.append(("empty_candidates", r.get("ok") is False
-                      and r["error"]["code"] == "invalid_request",
-                      json.dumps(r)[:200]))
-        # (d) single candidate -> index 0, no provider call
-        r = rpc(proc, {"id": "s2", "type": "select", "problem": "p",
-                       "candidates": ["only trace"], "criteria": {"c": "d"},
-                       "ground_truth_note": None, "n_evaluations": 1,
-                       "pivots": 0, "seed": 0, "model": "m",
-                       "base_url": "http://127.0.0.1:9/v1",
-                       "api_key_env": "SMOKE_KEY", "cache": None,
-                       "on_error": "raise", "max_workers": None,
-                       "progress": False})
-        res = r.get("result", {})
-        gates.append(("single_candidate", r.get("ok") is True
-                      and res.get("index") == 0
-                      and res.get("n_comparisons") == 0
-                      and res.get("usage", {}).get("calls") == 0,
-                      json.dumps(r)[:300]))
-        # (e) api_key_env missing from env
-        r = rpc(proc, {"id": "s3", "type": "select", "problem": "p",
-                       "candidates": ["a", "b"], "criteria": {"c": "d"},
-                       "ground_truth_note": None, "n_evaluations": 1,
-                       "pivots": 0, "seed": 0, "model": "m",
-                       "base_url": "http://127.0.0.1:9/v1",
-                       "api_key_env": "DEFINITELY_MISSING_KEY", "cache": None,
-                       "on_error": "raise", "max_workers": None,
-                       "progress": False})
-        gates.append(("missing_api_key", r.get("ok") is False
-                      and r["error"]["code"] == "missing_api_key",
-                      json.dumps(r)[:200]))
-        # (e2) effort field: unknown level is invalid_request; a valid level on
-        # a single candidate short-circuits offline AND is request-scoped —
-        # the health probe afterwards must NOT observe the override.
-        r = rpc(proc, {"id": "s4", "type": "select", "problem": "p",
-                       "candidates": ["a", "b"], "criteria": {"c": "d"},
-                       "ground_truth_note": None, "n_evaluations": 1,
-                       "pivots": 0, "seed": 0, "model": "m",
-                       "base_url": "http://127.0.0.1:9/v1",
-                       "api_key_env": "SMOKE_KEY", "cache": None,
-                       "on_error": "raise", "max_workers": None,
-                       "progress": False, "effort": "turbo"})
-        bad_level = r.get("ok") is False and r["error"]["code"] == "invalid_request"
-        r = rpc(proc, {"id": "s5", "type": "select", "problem": "p",
-                       "candidates": ["only"], "criteria": {"c": "d"},
-                       "ground_truth_note": None, "n_evaluations": 1,
-                       "pivots": 0, "seed": 0, "model": "m",
-                       "base_url": "http://127.0.0.1:9/v1",
-                       "api_key_env": "SMOKE_KEY", "cache": None,
-                       "on_error": "raise", "max_workers": None,
-                       "progress": False, "effort": "max"})
-        good_ok = r.get("ok") is True and r.get("result", {}).get("index") == 0
-        base_effort = os.environ.get("DEEPSEEK_EFFORT", "off")
-        r = rpc(proc, {"id": "h2", "type": "health"})
-        kept = r.get("result", {}).get("deepseek_effort") == base_effort
-        gates.append(("effort_scoping", bad_level and good_ok and kept,
-                      "bad=%s single=%s kept=%s (%r)" % (bad_level, good_ok, kept, base_effort)))
-        # (f) shutdown -> exit 0
-        r = rpc(proc, {"id": "x", "type": "shutdown"})
-        rc = proc.wait(timeout=10)
-        gates.append(("shutdown", r.get("ok") is True and rc == 0,
-                      "rc=%s" % rc))
-    except Exception as exc:
-        gates.append(("harness_exception", False, repr(exc)))
-        proc.kill()
-    # (g2) progress frame validation: malformed -> invalid_request; missing key -> missing_api_key (no network)
-    try:
-        proc2 = subprocess.Popen([PY, SIDECAR], stdin=subprocess.PIPE,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 text=True, env=env)
-        try:
-            r = rpc(proc2, {"id": "p0", "type": "progress", "problem": "x",
-                            "steps": [], "model": "m",
-                            "base_url": "http://127.0.0.1:9/v1",
-                            "api_key_env": "SMOKE_KEY", "n_evaluations": 1})
-            ok1 = r.get("ok") is False and r["error"]["code"] == "invalid_request"
-            r = rpc(proc2, {"id": "p1", "type": "progress", "problem": "x",
-                            "steps": ["s1"], "model": "m",
-                            "base_url": "http://127.0.0.1:9/v1",
-                            "api_key_env": "DEFINITELY_MISSING_KEY",
-                            "n_evaluations": 1})
-            ok2 = r.get("ok") is False and r["error"]["code"] == "missing_api_key"
-            rpc(proc2, {"id": "p2", "type": "shutdown"})
-            proc2.wait(timeout=10)
-        finally:
-            proc2.kill()
-        gates.append(("progress_frame_validation", ok1 and ok2, ""))
-    except Exception as exc:
-        gates.append(("progress_frame_validation", False, repr(exc)))
+        gates, llm_available = run_conformance(proc, fixtures["conformance"], env, require_llm_verifier)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
     # (g) mojibake-tolerant tag lookup: import the patched sidecar module and
     # score a synthetic K3-shaped token stream (no '<' before the open tag).
     try:

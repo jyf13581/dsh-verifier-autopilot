@@ -1,0 +1,183 @@
+{
+  "_comment": "Canonical frames of the sidecar JSON Lines protocol (bridge/PROTOCOL.md). Single source for bridge/self_test.py (the real sidecar must satisfy every `conformance` case offline), scripts/tests/fixtures/stub_sidecar.py (answers with the `responses`/`errors` frames), and scripts/tests/bridge.test.mjs (the TypeScript bridge must emit the `requests` frames and parse the `responses`). Change the protocol here first; the three consumers then disagree loudly until they are updated.",
+  "version": 1,
+  "requests": {
+    "health": { "id": "h1", "type": "health" },
+    "select": {
+      "id": "s1",
+      "type": "select",
+      "problem": "demo pair",
+      "candidates": ["cand-0", "cand-1"],
+      "criteria": { "c1": "demo criterion" },
+      "ground_truth_note": null,
+      "n_evaluations": 4,
+      "pivots": 1,
+      "seed": 0,
+      "effort": null,
+      "model": "m",
+      "base_url": "http://127.0.0.1:9/v1",
+      "api_key_env": "SMOKE_KEY",
+      "cache": null,
+      "on_error": "raise",
+      "max_workers": null,
+      "min_interval_ms": 0,
+      "call_retries": 2,
+      "progress": false
+    },
+    "progress": {
+      "id": "p1",
+      "type": "progress",
+      "problem": "demo pair",
+      "steps": ["step one"],
+      "model": "m",
+      "base_url": "http://127.0.0.1:9/v1",
+      "api_key_env": "SMOKE_KEY",
+      "n_evaluations": 1,
+      "effort": null
+    },
+    "shutdown": { "id": "x1", "type": "shutdown" }
+  },
+  "responses": {
+    "health": {
+      "id": "h1",
+      "ok": true,
+      "result": {
+        "python": "3.12.0 (stub)",
+        "llm_verifier_version": "0.2.0",
+        "select_available": true,
+        "note": "client must be deepseek-flagged: sampled score tags, no prefill support on this relay",
+        "deepseek_effort": "off"
+      }
+    },
+    "select": {
+      "id": "s1",
+      "ok": true,
+      "result": {
+        "index": 0,
+        "best_preview": "cand-0",
+        "scores": [1.0, 0.9],
+        "ranking": [0, 1],
+        "n_comparisons": 2,
+        "criteria": ["c1"],
+        "usage": {
+          "calls": 1,
+          "input_tokens": 10,
+          "cached_input_tokens": 0,
+          "uncached_input_tokens": 10,
+          "output_tokens": 5,
+          "reasoning_tokens": 0,
+          "cache_hit_rate": 0.0
+        }
+      }
+    },
+    "progress": {
+      "id": "p1",
+      "ok": true,
+      "result": {
+        "score": 0.75,
+        "usage": {
+          "calls": 1,
+          "input_tokens": 10,
+          "cached_input_tokens": 0,
+          "uncached_input_tokens": 10,
+          "output_tokens": 5,
+          "reasoning_tokens": 0,
+          "cache_hit_rate": 0.0
+        }
+      }
+    },
+    "shutdown": { "id": "x1", "ok": true, "result": {} },
+    "bad_frame": {
+      "id": null,
+      "ok": false,
+      "error": { "code": "bad_frame", "message": "malformed JSON line", "retriable": false }
+    }
+  },
+  "errors": {
+    "bad_frame": { "code": "bad_frame", "message": "malformed JSON line", "retriable": false },
+    "invalid_request": { "code": "invalid_request", "message": "candidates must be a list of >=1 strings", "retriable": false },
+    "missing_api_key": { "code": "missing_api_key", "message": "env var SMOKE_KEY not set", "retriable": false },
+    "bridge_unavailable": { "code": "bridge_unavailable", "message": "llm_verifier dependency is unavailable", "retriable": false },
+    "client_init": { "code": "client_init", "message": "failed to initialize the OpenAI client", "retriable": false },
+    "missing_logprobs": { "code": "missing_logprobs", "message": "score token logprobs missing from the response", "retriable": false },
+    "timeout": { "code": "timeout", "message": "provider request timed out", "retriable": true },
+    "provider_error": { "code": "provider_error", "message": "relay said 500", "retriable": true },
+    "selection_failed": { "code": "selection_failed", "message": "unexpected failure during selection", "retriable": false }
+  },
+  "malformed_results": [
+    { "name": "result is not an object", "type": "select", "result": "nope" },
+    { "name": "scores missing", "type": "select", "result": { "index": 0, "ranking": [0, 1], "n_comparisons": 2, "criteria": ["c1"], "usage": {} } },
+    { "name": "scores not numeric", "type": "select", "result": { "index": 0, "scores": ["1", "0.9"], "ranking": [0, 1], "n_comparisons": 2, "criteria": ["c1"], "usage": {} } },
+    { "name": "index not an integer", "type": "select", "result": { "index": 0.5, "scores": [1.0, 0.9], "ranking": [0, 1], "n_comparisons": 2, "criteria": ["c1"], "usage": {} } },
+    { "name": "ranking not integers", "type": "select", "result": { "index": 0, "scores": [1.0, 0.9], "ranking": [0.5, 1], "n_comparisons": 2, "criteria": ["c1"], "usage": {} } },
+    { "name": "criteria not strings", "type": "select", "result": { "index": 0, "scores": [1.0, 0.9], "ranking": [0, 1], "n_comparisons": 2, "criteria": [1], "usage": {} } },
+    { "name": "health without select_available", "type": "health", "result": { "python": "3.12.0" } },
+    { "name": "progress score not a number", "type": "progress", "result": { "score": "0.75", "usage": {} } }
+  ],
+  "conformance": [
+    {
+      "name": "health",
+      "request": { "id": "h1", "type": "health" },
+      "expect": { "ok": true, "result_keys": ["python", "llm_verifier_version", "select_available", "note", "deepseek_effort"] }
+    },
+    {
+      "name": "bad_frame",
+      "raw": "{not json",
+      "expect": { "ok": false, "id": null, "error_code": "bad_frame" }
+    },
+    {
+      "name": "empty_candidates",
+      "request": { "id": "s1", "type": "select", "problem": "p", "candidates": [], "criteria": { "c": "d" }, "ground_truth_note": null, "n_evaluations": 1, "pivots": 0, "seed": 0, "model": "m", "base_url": "http://127.0.0.1:9/v1", "api_key_env": "SMOKE_KEY", "cache": null, "on_error": "raise", "max_workers": null, "progress": false },
+      "expect": { "ok": false, "error_code": "invalid_request" }
+    },
+    {
+      "name": "single_candidate",
+      "request": { "id": "s2", "type": "select", "problem": "p", "candidates": ["only trace"], "criteria": { "c": "d" }, "ground_truth_note": null, "n_evaluations": 1, "pivots": 0, "seed": 0, "model": "m", "base_url": "http://127.0.0.1:9/v1", "api_key_env": "SMOKE_KEY", "cache": null, "on_error": "raise", "max_workers": null, "progress": false },
+      "expect": {
+        "ok": true,
+        "result_keys": ["index", "best_preview", "scores", "ranking", "n_comparisons", "criteria", "usage"],
+        "result": { "index": 0, "best_preview": "only trace", "scores": [1.0], "ranking": [0], "n_comparisons": 0, "criteria": ["c"], "usage": { "calls": 0 } }
+      }
+    },
+    {
+      "name": "missing_api_key",
+      "request": { "id": "s3", "type": "select", "problem": "p", "candidates": ["a", "b"], "criteria": { "c": "d" }, "ground_truth_note": null, "n_evaluations": 1, "pivots": 0, "seed": 0, "model": "m", "base_url": "http://127.0.0.1:9/v1", "api_key_env": "DEFINITELY_MISSING_KEY", "cache": null, "on_error": "raise", "max_workers": null, "progress": false },
+      "expect": { "ok": false, "error_code": "missing_api_key" }
+    },
+    {
+      "name": "unknown_effort_level",
+      "request": { "id": "s4", "type": "select", "problem": "p", "candidates": ["a", "b"], "criteria": { "c": "d" }, "ground_truth_note": null, "n_evaluations": 1, "pivots": 0, "seed": 0, "model": "m", "base_url": "http://127.0.0.1:9/v1", "api_key_env": "SMOKE_KEY", "cache": null, "on_error": "raise", "max_workers": null, "progress": false, "effort": "turbo" },
+      "expect": { "ok": false, "error_code": "invalid_request" }
+    },
+    {
+      "name": "effort_single_candidate",
+      "request": { "id": "s5", "type": "select", "problem": "p", "candidates": ["only"], "criteria": { "c": "d" }, "ground_truth_note": null, "n_evaluations": 1, "pivots": 0, "seed": 0, "model": "m", "base_url": "http://127.0.0.1:9/v1", "api_key_env": "SMOKE_KEY", "cache": null, "on_error": "raise", "max_workers": null, "progress": false, "effort": "max" },
+      "expect": { "ok": true, "result": { "index": 0 } }
+    },
+    {
+      "name": "effort_is_request_scoped",
+      "request": { "id": "h2", "type": "health" },
+      "expect": { "ok": true, "result": { "deepseek_effort": "$DEEPSEEK_EFFORT_OR_off" } }
+    },
+    {
+      "name": "progress_empty_steps",
+      "request": { "id": "p0", "type": "progress", "problem": "x", "steps": [], "model": "m", "base_url": "http://127.0.0.1:9/v1", "api_key_env": "SMOKE_KEY", "n_evaluations": 1 },
+      "expect": { "ok": false, "error_code": "invalid_request" }
+    },
+    {
+      "name": "progress_missing_api_key",
+      "request": { "id": "p1", "type": "progress", "problem": "x", "steps": ["s1"], "model": "m", "base_url": "http://127.0.0.1:9/v1", "api_key_env": "DEFINITELY_MISSING_KEY", "n_evaluations": 1 },
+      "expect": { "ok": false, "error_code": "missing_api_key" }
+    },
+    {
+      "name": "unknown_type",
+      "request": { "id": "u1", "type": "dance" },
+      "expect": { "ok": false, "error_code": "invalid_request" }
+    },
+    {
+      "name": "shutdown",
+      "request": { "id": "x1", "type": "shutdown" },
+      "expect": { "ok": true, "exit_code": 0 }
+    }
+  ]
+}

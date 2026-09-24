@@ -14,12 +14,12 @@ import { VERIFICATION_HISTORY_LIMIT, VerifyAbortedError } from './host.js'
 import {
   API_PREFIX,
   type ConfigResponse, type HeaderValue, type SelectionActionResponse,
-  type SelectionItemResponse, type SelectionReleaseResponse,
+  type SelectionIdRequest, type SelectionItemResponse, type SelectionReleaseResponse,
   type SelectionSnapshot, type SelectionStartRequest, type SelectionStartResponse,
   type SelectionsListResponse, type StateResponse, type VerificationRecord,
   type VerifyResponse, type WebRequest, type WebResponse, type WebRoute,
 } from './protocol.js'
-import { normalizeBaseUrl, resolveKey, type Credentials } from './util.js'
+import { normalizeBaseUrl, redactSecrets, resolveKey, type Credentials } from './util.js'
 
 /** Structural domain seam consumed by the transport. VerifierHost satisfies it
  * at the composition root, while API tests can use a focused fake without
@@ -89,7 +89,69 @@ export function createRateLimiter(limit: number, windowMs: number, now: () => nu
   return Object.assign(function acquire() { if (!peek()) return false; commit(); return true }, { peek, commit })
 }
 
+/** Shared body contract for the selection lifecycle routes (cancel, release,
+ *  discard): a JSON object carrying a non-empty selectionId. A literal `null`
+ *  body used to reach `body.selectionId` and throw inside the async handler. */
+async function readSelectionIdRequest(req: WebRequest): Promise<{ ok: true; selectionId: string } | { ok: false; status: number; error: string }> {
+  let body: unknown
+  try {
+    body = await readJson(req)
+  } catch {
+    return { ok: false, status: 400, error: 'invalid-json-body' }
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { ok: false, status: 400, error: 'json-object-required' }
+  const selectionId = typeof (body as Partial<SelectionIdRequest>).selectionId === 'string' ? (body as SelectionIdRequest).selectionId.trim() : ''
+  if (!selectionId) return { ok: false, status: 400, error: 'selection-id-required' }
+  return { ok: true, selectionId }
+}
+
+/** The one shape of an unexpected failure on this transport: a JSON 500 whose
+ *  message is secret-redacted and bounded. Provider errors can echo request
+ *  URLs, headers, or response bodies, so no route may forward `error.message`
+ *  to the operator unfiltered. */
+function internalFailure(res: WebResponse, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error)
+  json(res, 500, { ok: false, error: redactSecrets(message).slice(0, 240) })
+}
+
+/** One status/error mapping for every selection route: domain admission
+ *  errors keep their HTTP status and code; anything else is the bounded,
+ *  secret-redacted 500 above instead of an unhandled rejection in the web server. */
+function selectionFailure(res: WebResponse, error: unknown): void {
+  if (error instanceof SelectionApiError) return json(res, error.status, { ok: false, error: error.code, message: error.message })
+  internalFailure(res, error)
+}
+
+/** Provider-spending routes stop spending when nobody is left to read the
+ *  answer: the returned signal aborts once the response closes before the
+ *  handler ended it. A `close` that follows our own `end()` aborts nothing
+ *  that is still running, so the signal is safe to attach unconditionally. */
+function clientAbortSignal(res: WebResponse): AbortSignal {
+  const controller = new AbortController()
+  res.once('close', () => controller.abort(new Error('client-disconnected')))
+  return controller.signal
+}
+
 /** Exported for regression tests: builds the Host API routes for this host. */
+/** Model ids from an OpenAI-style `/models` listing body of unknown shape:
+ *  `{ data: [{ id }] }`, or bare strings, capped at 50; anything else is an
+ *  empty list, never a throw. */
+/** `error.message` from an OpenAI-style error body, when it has one. */
+function upstreamErrorMessage(body: unknown): string | undefined {
+  if (typeof body !== 'object' || body === null || !('error' in body)) return undefined
+  const error = body.error
+  if (typeof error !== 'object' || error === null || !('message' in error)) return undefined
+  return typeof error.message === 'string' ? error.message : undefined
+}
+
+function modelIdsOf(body: unknown): string[] {
+  if (typeof body !== 'object' || body === null || !('data' in body) || !Array.isArray(body.data)) return []
+  return body.data.slice(0, 50).map((entry: unknown) => {
+    if (typeof entry === 'object' && entry !== null && 'id' in entry) return String(entry.id)
+    return String(entry)
+  })
+}
+
 export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   const evalLimiter = createRateLimiter(API_RATE_LIMITS.evalPerMinute, 60_000)
   const probeLimiter = createRateLimiter(API_RATE_LIMITS.probePerMinute, 60_000)
@@ -107,7 +169,13 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
     if (!headerText(req.headers['content-type']).toLowerCase().startsWith('application/json')) return json(res, 415, { ok: false, error: 'json-required' })
-    try { host.setConfig(await readJson(req)); json(res, 200, { ok: true, config: host.getConfig() } satisfies ConfigResponse) } catch (error) { json(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) }) }
+    let patch: unknown
+    try {
+      patch = await readJson(req)
+    } catch {
+      return json(res, 400, { ok: false, error: 'invalid-json-body' })
+    }
+    try { host.setConfig(patch as Partial<Config>); json(res, 200, { ok: true, config: host.getConfig() } satisfies ConfigResponse) } catch (error) { json(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) }) }
   } }
   const verify: WebRoute = { kind: 'exact', path: API_PREFIX + '/verify', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
@@ -128,7 +196,7 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
       json(res, 200, { ok: true, record } satisfies VerifyResponse)
     } catch (error) {
       if (error instanceof VerifyAbortedError) return json(res, 503, { ok: false, error: 'verification-aborted' })
-      json(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
+      internalFailure(res, error)
     }
   } }
   const evalRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/eval', handler: async (req, res) => {
@@ -142,6 +210,9 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
       return json(res, 400, { ok: false, error: 'invalid-json-body' })
     }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { ok: false, error: 'json-object-required' })
+    // Up to five lanes with a retry each: a caller that disconnected must not
+    // keep that provider spend running to completion.
+    const signal = clientAbortSignal(res)
     try {
       const problem = typeof body.problem === 'string' ? body.problem.slice(0, 8000) : ''
       const trace = typeof body.trace === 'string' ? body.trace.slice(0, 60000) : ''
@@ -152,9 +223,13 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
       const prompt = buildVerifierPrompt(problem, trace, criterion)
       const routeOverride = typeof body.routes === 'number' ? { routes: Math.max(1, Math.min(5, Math.floor(body.routes))) } : {}
       if (typeof body.allowLabelFallback === 'boolean') (routeOverride as Record<string, unknown>).allowLabelFallback = body.allowLabelFallback
-      const aggregate = await verifyFive({ ...host.getConfig(), ...routeOverride }, host.getCredentials(), prompt)
+      const aggregate = await verifyFive({ ...host.getConfig(), ...routeOverride }, host.getCredentials(), prompt, { signal })
+      if (signal.aborted) return
       json(res, 200, { ok: true, aggregate })
-    } catch (error) { json(res, 500, { ok: false, error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240) }) }
+    } catch (error) {
+      if (signal.aborted) return
+      internalFailure(res, error)
+    }
   } }
   const recordsRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/records', handler: (req, res) => {
     if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
@@ -181,6 +256,7 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
     }
     if (!body || typeof body !== 'object' || Array.isArray(body)) return json(res, 400, { ok: false, error: 'json-object-required' })
     if (!probeLimiter()) return json(res, 429, { ok: false, error: 'rate-limited' })
+    const signal = clientAbortSignal(res)
     try {
       const config = host.getConfig()
       const key = await resolveKey(host.getCredentials(), config.apiKeyEnv)
@@ -192,17 +268,17 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
       if (body.listModels) {
         const listResponse = await fetch(target + '/models', {
           headers: { authorization: 'Bearer ' + key },
-          signal: AbortSignal.timeout(30000),
+          signal: AbortSignal.any([AbortSignal.timeout(30000), signal]),
         })
-        const listBody = await listResponse.json().catch(() => ({}) as any)
-        const ids = Array.isArray(listBody?.data) ? listBody.data.map((m: any) => String(m?.id ?? m)).slice(0, 50) : []
+        const listBody: unknown = await listResponse.json().catch(() => ({}))
+        const ids = modelIdsOf(listBody)
         // Upstream health maps straight into ok: a non-2xx listing is NOT a ready provider.
         return json(res, 200, {
           ok: listResponse.ok,
           transportOk: listResponse.ok,
           status: listResponse.status,
           models: ids,
-          apiError: listResponse.ok ? undefined : String(listBody?.error?.message ?? 'HTTP ' + listResponse.status).slice(0, 240),
+          apiError: listResponse.ok ? undefined : (upstreamErrorMessage(listBody) ?? 'HTTP ' + listResponse.status).slice(0, 240),
         })
       }
       // Ride the production lane path end-to-end: same prompt shape, parser,
@@ -210,7 +286,8 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
       const nl = String.fromCharCode(10)
       const problem = ['Reply with exactly three lines and nothing else:', 'finding: probe', '<score_A> K </score_A>', '<score_B> M </score_B>'].join(nl)
       const prompt = buildVerifierPrompt(problem, '[EXTRACTED TOOL EVIDENCE] none' + nl + 'PROBE TRACE: no trajectory; this request only checks protocol readiness.', 'Probe criterion: follow the output protocol exactly.')
-      const result = await verifyRoute(config, host.getCredentials(), prompt, 1)
+      const result = await verifyRoute(config, host.getCredentials(), prompt, 1, { signal })
+      if (signal.aborted) return
       const hasScoreTags = Boolean(result.scoreALabel && result.scoreBLabel)
       const scoreTokenLogprobs = result.ok && result.scoreSource === 'logprobs'
       json(res, 200, {
@@ -230,7 +307,10 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
         strictReady: result.ok === true && result.scoreSource === 'logprobs',
         model: config.model,
       })
-    } catch (error) { json(res, 500, { ok: false, error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240) }) }
+    } catch (error) {
+      if (signal.aborted) return
+      internalFailure(res, error)
+    }
   } }
   const events: WebRoute = { kind: 'exact', path: API_PREFIX + '/events', handler: (req, res) => {
     if (req.method !== 'GET') return json(res, 405, { ok: false, error: 'method-not-allowed' })
@@ -272,8 +352,7 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
       selectLimiter.commit()
       json(res, 202, { ok: true, selection } satisfies SelectionStartResponse)
     } catch (error) {
-      if (error instanceof SelectionApiError) return json(res, error.status, { ok: false, error: error.code, message: error.message })
-      json(res, 500, { ok: false, error: error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240) })
+      selectionFailure(res, error)
     }
   } }
   const selectionsRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections', handler: (req, res) => {
@@ -290,48 +369,47 @@ export function apiRoutes(host: VerifierApiHost): WebRoute[] {
   const cancelSelectionRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/cancel', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    let body: Record<string, unknown>
+    const parsed = await readSelectionIdRequest(req)
+    if (!parsed.ok) return json(res, parsed.status, { ok: false, error: parsed.error })
+    const selectionId = parsed.selectionId
     try {
-      body = await readJson(req) as Record<string, unknown>
-    } catch {
-      return json(res, 400, { ok: false, error: 'invalid-json-body' })
+      if (!host.selections.cancel(selectionId)) return json(res, 404, { ok: false, error: 'selection-not-active' })
+      json(res, 200, { ok: true } satisfies SelectionActionResponse)
+    } catch (error) {
+      selectionFailure(res, error)
     }
-    const selectionId = typeof body.selectionId === 'string' ? body.selectionId.trim() : ''
-    if (!selectionId) return json(res, 400, { ok: false, error: 'selection-id-required' })
-    if (!host.selections.cancel(selectionId)) return json(res, 404, { ok: false, error: 'selection-not-active' })
-    json(res, 200, { ok: true } satisfies SelectionActionResponse)
   } }
   const releaseWinnerRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/release', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    let body: Record<string, unknown>
+    const parsed = await readSelectionIdRequest(req)
+    if (!parsed.ok) return json(res, parsed.status, { ok: false, error: parsed.error })
+    const selectionId = parsed.selectionId
     try {
-      body = await readJson(req) as Record<string, unknown>
-    } catch {
-      return json(res, 400, { ok: false, error: 'invalid-json-body' })
+      const selection = host.selections.getSelection(selectionId)
+      if (!selection || !selection.winner) return json(res, 404, { ok: false, error: 'selection-or-winner-not-found' })
+      // Manual winners release at settlement; autopilot winners release when the
+      // source turn settles. The route stays idempotent for stale GUI panels.
+      const released = await host.selections.releaseWinner(selectionId)
+      json(res, 200, { ok: true, state: released } satisfies SelectionReleaseResponse)
+    } catch (error) {
+      selectionFailure(res, error)
     }
-    const selectionId = typeof body.selectionId === 'string' ? body.selectionId.trim() : ''
-    if (!selectionId) return json(res, 400, { ok: false, error: 'selection-id-required' })
-    const selection = host.selections.getSelection(selectionId)
-    if (!selection || !selection.winner) return json(res, 404, { ok: false, error: 'selection-or-winner-not-found' })
-    // Manual winners release at settlement; autopilot winners release when the
-    // source turn settles. The route stays idempotent for stale GUI panels.
-    const released = await host.selections.releaseWinner(selectionId)
-    json(res, 200, { ok: true, state: released } satisfies SelectionReleaseResponse)
   } }
   const discardWinnerRoute: WebRoute = { kind: 'exact', path: API_PREFIX + '/selections/discard', handler: async (req, res) => {
     if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'method-not-allowed' })
     if (!authorized(req)) return json(res, 403, { ok: false, error: 'unauthorized' })
-    let body: Record<string, unknown>
+    const parsed = await readSelectionIdRequest(req)
+    if (!parsed.ok) return json(res, parsed.status, { ok: false, error: parsed.error })
+    const selectionId = parsed.selectionId
     try {
-      body = await readJson(req) as Record<string, unknown>
-    } catch {
-      return json(res, 400, { ok: false, error: 'invalid-json-body' })
+      // Workspace/journal removal can fail (foreign toplevel, locked worktree):
+      // that is a 500 carrying the reason, never a hung request.
+      if (!(await host.selections.discardWinner(selectionId))) return json(res, 404, { ok: false, error: 'no-discardable-winner' })
+      json(res, 200, { ok: true } satisfies SelectionActionResponse)
+    } catch (error) {
+      selectionFailure(res, error)
     }
-    const selectionId = typeof body.selectionId === 'string' ? body.selectionId.trim() : ''
-    if (!selectionId) return json(res, 400, { ok: false, error: 'selection-id-required' })
-    if (!(await host.selections.discardWinner(selectionId))) return json(res, 404, { ok: false, error: 'no-discardable-winner' })
-    json(res, 200, { ok: true } satisfies SelectionActionResponse)
   } }
   return [state, config, verify, recordsRoute, evalRoute, probe, events, selectRoute, selectionsRoute, cancelSelectionRoute, releaseWinnerRoute, discardWinnerRoute]
 }

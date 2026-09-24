@@ -26,7 +26,8 @@ export interface ModelProberOptions {
 
 export interface ModelProber {
   /** true = model answered; false = timeout / HTTP failure. Results are
-   *  cached: an ok verdict lasts until reload, a dead verdict cools off. */
+   *  cached: an ok verdict lasts until reload, a dead verdict cools off.
+   *  Concurrent probes of the same model share one in-flight request. */
   probe(model: string): Promise<boolean>
   /** Force a model into the dead window (e.g. after a rollout failure). */
   markDead(model: string, detail?: string): void
@@ -39,35 +40,50 @@ export function createModelProber(options: ModelProberOptions): ModelProber {
   const timeoutMs = options.probeTimeoutMs ?? 10_000
   const cooldownMs = options.deadCooldownMs ?? 120_000
   const table = new Map<string, ProbeVerdict>()
+  /** One request per model at a time: parallel pre-steps (or a duplicated
+   *  entry in the preferred list) coalesce onto the same verdict instead of
+   *  spending N identical provider calls. */
+  const inFlight = new Map<string, Promise<boolean>>()
+
+  const probeOnce = async (model: string): Promise<boolean> => {
+    let ok = false
+    let detail: string | undefined
+    try {
+      const response = await doFetch(options.baseURL.replace(/\/+$/, '') + '/chat/completions', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer ' + options.apiKey },
+        body: JSON.stringify({
+          model,
+          max_tokens: 1,
+          messages: [{ role: 'user', content: 'ping' }],
+        }),
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      ok = response.ok
+      detail = 'http-' + response.status
+      // The verdict is the status line; release the connection instead of
+      // leaving an unread body to pin a keep-alive socket until GC.
+      try { await response.body?.cancel() } catch { /* already drained or closed */ }
+    } catch (error) {
+      ok = false
+      detail = error instanceof Error ? error.message.slice(0, 120) : String(error).slice(0, 120)
+    }
+    table.set(model, { ok, at: now(), detail })
+    return ok
+  }
 
   return {
-    async probe(model: string): Promise<boolean> {
+    probe(model: string): Promise<boolean> {
       const cached = table.get(model)
       if (cached) {
-        if (cached.ok) return true
-        if (now() - cached.at < cooldownMs) return false
+        if (cached.ok) return Promise.resolve(true)
+        if (now() - cached.at < cooldownMs) return Promise.resolve(false)
       }
-      let ok = false
-      let detail: string | undefined
-      try {
-        const response = await doFetch(options.baseURL.replace(/\/+$/, '') + '/chat/completions', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', authorization: 'Bearer ' + options.apiKey },
-          body: JSON.stringify({
-            model,
-            max_tokens: 1,
-            messages: [{ role: 'user', content: 'ping' }],
-          }),
-          signal: AbortSignal.timeout(timeoutMs),
-        })
-        ok = response.ok
-        detail = 'http-' + response.status
-      } catch (error) {
-        ok = false
-        detail = error instanceof Error ? error.message.slice(0, 120) : String(error).slice(0, 120)
-      }
-      table.set(model, { ok, at: now(), detail })
-      return ok
+      const pending = inFlight.get(model)
+      if (pending) return pending
+      const request = probeOnce(model).finally(() => { inFlight.delete(model) })
+      inFlight.set(model, request)
+      return request
     },
     markDead(model: string, detail?: string): void {
       table.set(model, { ok: false, at: now(), detail })

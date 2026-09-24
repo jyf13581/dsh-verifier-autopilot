@@ -14,7 +14,8 @@
  */
 
 import path from 'node:path'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { randomUUID } from 'node:crypto'
 import { VerifierBridge, type BridgeSelectRequest, type BridgeSelectResult } from './bridge.js'
@@ -33,26 +34,26 @@ import { IsolatedWorkspaceManager, gitDiffStat, gitDiffFull, gitRepoState, makeL
 import type { TrajectoryEvent } from './trajectory.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
 import { appendJsonlLedger, atomicWriteFile, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from '../ledger.js'
+import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
+import type { AgentCreate } from '../dsh-context.js'
+import { read } from '../payload.js'
 import type { SelectionSnapshot, SelectionStartRequest } from '../protocol.js'
 
+/** Source-session lookup for manual runs: the seed cut, the problem text, and
+ *  the candidate's parent identity all come from here. Settlement notices go
+ *  back through `SelectionHostDeps.notify`, never through this provider, so
+ *  the shape asks for nothing more than the Host's own `Agent` offers. */
 export interface SelectionsAgentProvider {
   list(): Array<{ id: string }>
   get(id: string): {
     id: string
     ctx: unknown
     session: { events: readonly TrajectoryEvent[]; header?: { cwd?: string; delegationDepth?: number } }
-    /** Post a message into the source session (selection settlement notice). */
-    followup?: (message: {
-      id: string
-      role: 'user'
-      content: Array<{ type: 'text'; text: string }>
-      source: { kind: 'plugin'; plugin: string; form: string; summary?: string }
-    }) => void | Promise<void>
   } | undefined
 }
 
 interface LiveAgentsWiring {
-  create(options: Record<string, unknown>): Promise<{ agent: unknown; dispose(): Promise<void> }>
+  create: AgentCreate
 }
 
 export interface SelectionHostDeps {
@@ -89,6 +90,9 @@ export interface SelectionHostDeps {
    *  session (the operator keeps chatting there; without this the result is
    *  invisible outside the GUI panel). Best-effort; exceptions are contained. */
   notify?: (record: SelectionRecord) => void
+  /** Degradation sink shared with the runner and the sidecar bridge; the
+   *  process default when omitted. */
+  diagnostics?: Diagnostics
   /** Deterministic overrides for tests: bypass live factory/workspace/bridge. */
   testing?: {
     factory?: CandidateFactory
@@ -189,8 +193,18 @@ export function defaultSidecarPath(): string {
   return path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'bridge', 'llm_verifier_sidecar.py')
 }
 
+/** Operator venv documented in HANDOFF §4 (bridge dependencies live there on
+ *  the production Windows host). It is only used when it actually exists. */
+const OPERATOR_BRIDGE_VENV_PYTHON = 'D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe'
+
+/** Sidecar interpreter resolution: explicit `DSH_VA_PYTHON` wins; otherwise the
+ *  documented operator venv when present; otherwise the PATH interpreter, so a
+ *  fresh checkout (CI, another machine) gets a truthful `bridge_unavailable`
+ *  health verdict instead of ENOENT on a drive letter that does not exist. */
 export function defaultPythonPath(): string {
-  return process.env.DSH_VA_PYTHON || 'D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe'
+  if (process.env.DSH_VA_PYTHON) return process.env.DSH_VA_PYTHON
+  if (existsSync(OPERATOR_BRIDGE_VENV_PYTHON)) return OPERATOR_BRIDGE_VENV_PYTHON
+  return process.platform === 'win32' ? 'python' : 'python3'
 }
 
 export function defaultWorkspaceRoot(): string {
@@ -231,9 +245,9 @@ export function problemFromEvents(events: readonly TrajectoryEvent[]): string | 
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const ev = events[i]
     if (ev.type !== 'user/message') continue
-    const src = ((ev.data ?? {}) as { source?: { kind?: string } }).source ?? {}
-    if (src.kind && src.kind !== 'user') continue
-    const text = messageText((ev.data ?? {})['content'])
+    const sourceKind = read(ev.data, 'source', 'kind')
+    if (sourceKind && sourceKind !== 'user') continue
+    const text = messageText(read(ev.data, 'content'))
     if (text.trim()) return text.slice(0, 8000)
   }
   return undefined
@@ -245,6 +259,15 @@ function normalizeLoadedSelection(record: SelectionRecord): SelectionRecord {
 }
 
 const SAFE_SELECTION_ID = /^sel-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+
+export interface OrphanReclaim {
+  /** Candidate directories removed (known settled selection, not retained). */
+  reclaimed: number
+  /** Selection ids on disk with no record in the window (reported only). */
+  unknown: number
+  /** Removals that raised; each is a `workspaces.reclaim` diagnostic. */
+  failed: number
+}
 
 function isSelectionRecord(value: unknown): value is SelectionRecord {
   if (!value || typeof value !== 'object') return false
@@ -375,21 +398,45 @@ function safeCriteria(input: unknown): BridgeSelectRequest['criteria'] {
 
 export class SelectionHost {
   private readonly deps: SelectionHostDeps
+  private readonly diagnostics: Diagnostics
   private readonly now: () => number
   private readonly selections: SelectionRecord[] = []
   private active: { selectionId: string; controller: AbortController; run: Promise<void> | null } | null = null
   private readonly winners = new Map<string, SelectionAgentHandle>()
+  /** Per-selection FIFO for retained-candidate operations (release,
+   *  discard, shutdown disposal). Concurrent callers — GUI double-click,
+   *  idle + agent/disposed cleanup racing, dispose() during a discard —
+   *  run strictly one after another and observe sequential semantics. */
+  private readonly winnerOps = new Map<string, Promise<unknown>>()
   private bridgeSingleton: VerifierBridge | null = null
   private workspaceManager: WorkspaceManager | null = null
   private disposed = false
   private readonly listeners = new Set<() => void>()
   private readonly selectionsFile: string | null
+  /** Audit-pack collection is serialized: two passes must never race the same
+   *  directory removal, and a pass must never overlap a write for an id it
+   *  could not have observed. */
+  private artifactGc: Promise<number> = Promise.resolve(0)
+  private reclaiming: Promise<OrphanReclaim> | null = null
+  /** True once the in-memory history is known to reflect the ledger: at
+   *  least one record loaded from it, or one written to it by this process.
+   *  Until then the window proves nothing about which packs are stale. */
+  private ledgerKnown = false
 
   constructor(deps: SelectionHostDeps) {
     this.deps = deps
     this.now = deps.now ?? Date.now
+    this.diagnostics = deps.diagnostics ?? defaultDiagnostics
     this.selectionsFile = deps.selectionsFile === undefined ? null : deps.selectionsFile
-    if (this.selectionsFile) this.loadSelections(this.selectionsFile)
+    if (this.selectionsFile) {
+      // Audit packs live exactly as long as their record is in the history
+      // window; a ledger that could not be read (or is empty) proves nothing
+      // about what is stale, so collection waits for a successful load.
+      if (this.loadSelections(this.selectionsFile) > 0) {
+        this.ledgerKnown = true
+        void this.collectArtifacts()
+      }
+    }
   }
 
   subscribe(listener: () => void): () => void {
@@ -399,7 +446,10 @@ export class SelectionHost {
 
   private emit(): void {
     for (const listener of [...this.listeners]) {
-      try { listener() } catch { /* subscriber exceptions are isolated */ }
+      // Counted, not warned: a warning would notify the diagnostics
+      // subscribers, which re-enter emit() — a throwing listener must not
+      // become an infinite loop.
+      try { listener() } catch { this.diagnostics.count('selections.subscriber_error') }
     }
   }
 
@@ -420,6 +470,7 @@ export class SelectionHost {
       this.bridgeSingleton = new VerifierBridge({
         pythonPath: this.deps.pythonPath ?? defaultPythonPath(),
         scriptPath: this.deps.sidecarPath ?? defaultSidecarPath(),
+        diagnostics: this.diagnostics,
       })
     }
     return this.bridgeSingleton
@@ -453,6 +504,7 @@ export class SelectionHost {
       // but valid relay must not be rejected by a separate hard-coded deadline.
       maxAttempts: 2,
       now: this.now,
+      onRetry: (error, attempt) => this.diagnostics.warn('verifier.preflight_retry', error, { attempt, model: v.model }),
     })
     this.preflightOk.add(tuple)
   }
@@ -519,39 +571,19 @@ export class SelectionHost {
     const key = this.deps.resolveKey ? await this.deps.resolveKey(verifierConf.apiKeyEnv) : undefined
     if (!key) throw new SelectionApiError(400, 'missing-api-key', 'verifier credential is not configured: ' + verifierConf.apiKeyEnv)
 
-    // Admission must be re-checked HERE, immediately before the claim with no
-    // await in between: the credential resolve above yields, so a busy-check at
-    // the top of this method lets two concurrent starts both pass (TOCTOU —
-    // both runners would then burn real candidates fighting over this.active).
-    if (this.disposed) throw new SelectionApiError(503, 'selection-host-disposed', 'selection host is disposed')
-    if (this.active) {
-      throw new SelectionApiError(429, 'selection-busy', 'selection ' + this.active.selectionId + ' is already running; cancel it first')
-    }
-    const selectionId = 'sel-' + randomUUID()
-    const controller = new AbortController()
-    const placeholder: SelectionRecord = {
-      selectionId,
-      sourceSessionId: sourceSessionId ?? null,
-      startedAt: this.now(),
-      finishedAt: null,
-      status: 'running',
-      trigger: body.trigger === 'autopilot' ? 'autopilot' : 'manual',
-      ...(body.policy ? { policy: body.policy } : {}),
-      candidates: [],
-      verifierModel: verifierConf.model,
-    }
-    this.active = { selectionId, controller, run: null }
-    this.selections.unshift(placeholder)
-    this.selections.splice(SELECTIONS_HISTORY_LIMIT)
-    this.emit()
-
+    // Everything from here to the claim is pure construction or read-only
+    // inspection. Nothing below may have a side effect before admission is
+    // decided, and nothing may throw AFTER the claim: a post-claim throw (e.g.
+    // the live agent factory not being wired) used to leave `this.active` set
+    // with run=null, so every later start() answered 429 selection-busy until
+    // a reload and cancel() had nothing to abort.
     const testing = this.deps.testing ?? {}
     const workspaces = testing.workspaces ?? (this.workspaceManager ??= new IsolatedWorkspaceManager(this.deps.workspaceRoot ?? defaultWorkspaceRoot()))
     const factory = testing.factory ?? (() => {
       if (!this.deps.liveAgents) throw new SelectionApiError(503, 'live-agents-unavailable', 'live agent factory not wired')
       return makeLiveCandidateFactory({
         ctx: { agents: this.deps.liveAgents },
-        parent: parent as never,
+        parent,
         agentOptions: sharedRoute ?? {},
         agentPreset: body.agentPreset,
         // Autopilot candidates need to run real verification commands (e.g.
@@ -575,6 +607,7 @@ export class SelectionHost {
       diffFull: this.deps.testing?.diffFull ?? gitDiffFull,
       sleep: testing.retrySleep,
       now: this.now,
+      diagnostics: this.diagnostics,
     })
     // F5/I.5 — capture the EFFECTIVE configuration at start: later
     // build/reload/POST /config drift must never rewrite what actually ran.
@@ -598,16 +631,54 @@ export class SelectionHost {
     }
     // I.5: source attribution for the audit pack. The HEAD pins the source
     // repo state at start; the model is read from the session header when the
-    // host exposes it (null stays honest when unknown).
+    // host exposes it (null stays honest when unknown). This is the last await
+    // before the claim, so it must stay above the admission re-check.
     let sourceHeadAtStart: string | null = null
     let sourceModel: string | null = null
     if (sourceCwd && body.trigger === 'autopilot') {
-      try { sourceHeadAtStart = (await gitRepoState(sourceCwd))?.head ?? null } catch { sourceHeadAtStart = null }
+      try { sourceHeadAtStart = (await gitRepoState(sourceCwd))?.head ?? null } catch (error) { sourceHeadAtStart = null; this.diagnostics.warn('source.head', error, { sourceCwd }) }
     }
     try {
       const header = parent?.session.header as { model?: string } | undefined
       sourceModel = header?.model ?? null
     } catch { sourceModel = null }
+
+    // Admission must be re-checked HERE, immediately before the claim with no
+    // await in between: the credential resolve and the HEAD read above yield,
+    // so a busy-check at the top of this method lets two concurrent starts
+    // both pass (TOCTOU — both runners would then burn real candidates
+    // fighting over this.active). From the claim to `this.active.run = run`
+    // the code is synchronous and cannot throw, so dispose() always finds a
+    // run to await and a stuck claim is impossible.
+    if (this.disposed) throw new SelectionApiError(503, 'selection-host-disposed', 'selection host is disposed')
+    if (this.active) {
+      throw new SelectionApiError(429, 'selection-busy', 'selection ' + this.active.selectionId + ' is already running; cancel it first')
+    }
+    const selectionId = 'sel-' + randomUUID()
+    const controller = new AbortController()
+    const placeholder: SelectionRecord = {
+      selectionId,
+      sourceSessionId: sourceSessionId ?? null,
+      startedAt: this.now(),
+      finishedAt: null,
+      status: 'running',
+      trigger: body.trigger === 'autopilot' ? 'autopilot' : 'manual',
+      ...(body.policy ? { policy: body.policy } : {}),
+      candidates: [],
+      verifierModel: verifierConf.model,
+    }
+    this.active = { selectionId, controller, run: null }
+    this.selections.unshift(placeholder)
+    const evicted = this.selections.splice(SELECTIONS_HISTORY_LIMIT)
+    // The running row is persisted now, not only at settlement: a process that
+    // dies mid-run leaves an `interrupted-by-reload` record on the next load
+    // instead of an unexplained gap, and its candidate directories become
+    // attributable (and reclaimable) orphans instead of anonymous ones.
+    // persist() never throws, so the admission claim stays atomic.
+    if (this.selectionsFile) this.persist(placeholder)
+    if (evicted.length > 0) void this.collectArtifacts()
+    this.emit()
+
     const runInput: SelectionRunInput = {
       problem,
       candidateCount,
@@ -664,7 +735,7 @@ export class SelectionHost {
         await this.finishRun(placeholder, failed, undefined)
       }
     })()
-    if (this.active?.selectionId === selectionId) this.active.run = run
+    this.active.run = run
     return { ...placeholder }
   }
 
@@ -675,7 +746,10 @@ export class SelectionHost {
     if (retained) {
       if (record.trigger === 'autopilot') this.winners.set(record.selectionId, retained.handle)
       else {
-        try { await retained.handle.dispose() } catch { this.winners.set(record.selectionId, retained.handle) }
+        try { await retained.handle.dispose() } catch (error) {
+          this.winners.set(record.selectionId, retained.handle)
+          this.diagnostics.warn('winner.dispose', error, { selectionId: record.selectionId })
+        }
       }
     }
     if (this.active?.selectionId === record.selectionId) this.active = null
@@ -683,7 +757,7 @@ export class SelectionHost {
     this.writeArtifact(record, artifacts)
     this.emit()
     if (record.trigger !== 'autopilot' && this.deps.notify) {
-      try { this.deps.notify(record) } catch { /* notices must never disturb accounting */ }
+      try { this.deps.notify(record) } catch (error) { this.diagnostics.warn('selection.notify', error, { selectionId: record.selectionId }) }
     }
   }
 
@@ -724,9 +798,27 @@ export class SelectionHost {
     })
   }
 
+  /** Chain one retained-candidate operation behind whatever is already in
+   *  flight for the same selection. A failed predecessor never poisons the
+   *  chain; the map entry is dropped once the last operation settles. */
+  private serializeWinnerOp<T>(selectionId: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.winnerOps.get(selectionId) ?? Promise.resolve()
+    const next = previous.then(operation, operation)
+    this.winnerOps.set(selectionId, next)
+    void next.then(
+      () => { if (this.winnerOps.get(selectionId) === next) this.winnerOps.delete(selectionId) },
+      () => { if (this.winnerOps.get(selectionId) === next) this.winnerOps.delete(selectionId) },
+    )
+    return next
+  }
+
   /** Release the live candidate handle while retaining its persisted session
    *  and workspace. Failed disposal stays retained so a later call can retry. */
-  async releaseWinner(selectionId: string): Promise<'released' | 'not-retained'> {
+  releaseWinner(selectionId: string): Promise<'released' | 'not-retained'> {
+    return this.serializeWinnerOp(selectionId, () => this.releaseWinnerNow(selectionId))
+  }
+
+  private async releaseWinnerNow(selectionId: string): Promise<'released' | 'not-retained'> {
     const handle = this.winners.get(selectionId)
     if (!handle) return 'not-retained'
     await handle.dispose()
@@ -738,11 +830,18 @@ export class SelectionHost {
   /** Destroy the retained candidate outright (winner OR fallback). Each
    *  operation is idempotent; discardedAt is durable only after handle,
    *  workspace, session journal, and the audit pack have all settled. */
-  async discardWinner(selectionId: string): Promise<boolean> {
+  discardWinner(selectionId: string): Promise<boolean> {
+    return this.serializeWinnerOp(selectionId, () => this.discardWinnerNow(selectionId))
+  }
+
+  private async discardWinnerNow(selectionId: string): Promise<boolean> {
     const record = this.selections.find((s) => s.selectionId === selectionId)
     const slot = record ? (record.winner ?? record.fallback) : undefined
+    // The guard is evaluated inside the per-selection chain, so a second
+    // discard that arrived while the first was still removing the worktree
+    // sees discardedAt set and answers false instead of racing the removal.
     if (!record || !slot || slot.discardedAt !== undefined) return false
-    await this.releaseWinner(selectionId)
+    await this.releaseWinnerNow(selectionId)
     const manager = this.deps.testing?.workspaces
       ?? (this.workspaceManager ??= new IsolatedWorkspaceManager(this.deps.workspaceRoot ?? defaultWorkspaceRoot()))
     await manager.remove(slot.workspace)
@@ -764,17 +863,31 @@ export class SelectionHost {
     }
   }
 
-  private loadSelections(file: string): void {
+  /** Returns how many records were loaded; 0 also when the ledger is absent
+   *  or unreadable. */
+  private loadSelections(file: string): number {
     try {
+      let skippedRows = 0
       const loaded = readJsonlLedger(file, {
         limit: SELECTIONS_HISTORY_LIMIT,
         validate: isSelectionRecord,
         idOf: record => record.selectionId,
         normalize: normalizeLoadedSelection,
+        onSkippedRow: () => { skippedRows += 1 },
       })
-      if (ledgerExceeds(file, SELECTIONS_FILE_MAX_BYTES)) compactJsonlLedger(file, loaded)
+      // One entry per load, not one per row: a large torn ledger must not
+      // flush the whole diagnostics window with its own corruption.
+      if (skippedRows > 0) this.diagnostics.warn('selections.corrupt_rows', skippedRows + ' unreadable row(s) skipped while loading the selection ledger', { file, rows: skippedRows })
+      if (ledgerExceeds(file, SELECTIONS_FILE_MAX_BYTES)) {
+        this.diagnostics.count('selections.compact')
+        compactJsonlLedger(file, loaded)
+      }
       this.selections.push(...loaded)
-    } catch { /* observability must never break selection */ }
+      return loaded.length
+    } catch (error) {
+      this.diagnostics.warn('selections.load', error, { file })
+      return 0
+    }
   }
 
   /** Persist a settled record again after an out-of-band mutation (relay
@@ -790,13 +903,15 @@ export class SelectionHost {
   private persist(record: SelectionRecord): void {
     const file = this.selectionsFile
     if (!file) return
+    this.ledgerKnown = true
     try {
       if (ledgerExceeds(file, SELECTIONS_FILE_MAX_BYTES)) {
+        this.diagnostics.count('selections.compact')
         compactJsonlLedger(file, this.selections.slice(0, SELECTIONS_HISTORY_LIMIT))
         return
       }
       appendJsonlLedger(file, record)
-    } catch { /* observability must never break selection */ }
+    } catch (error) { this.diagnostics.warn('selections.append', error, { file, selectionId: record.selectionId }) }
   }
 
   /** Audit pack (ruling I.5/G, F6): one directory per selection, written at
@@ -832,7 +947,94 @@ export class SelectionHost {
           }
         }
       }
-    } catch { /* audit persistence is observability, never fatal */ }
+    } catch (error) { this.diagnostics.warn('artifact.write', error, { selectionId: record.selectionId }) }
+  }
+
+  /** Remove every audit pack whose selection is no longer in the history
+   *  window. The window (SELECTIONS_HISTORY_LIMIT newest records) is the only
+   *  retention policy this host has: a record outside it can no longer be
+   *  listed, discarded, or relayed, so its pack is unreachable evidence and
+   *  the directory would otherwise grow without bound. Only entries shaped
+   *  like a selection id are considered — dirs `sel-…` and the legacy flat
+   *  `sel-….json` — so nothing else in the directory is touched. Resolves to
+   *  the number of packs removed; never rejects. */
+  collectArtifacts(): Promise<number> {
+    const dir = this.artifactDir()
+    if (!dir || !this.ledgerKnown) return Promise.resolve(0)
+    const pass = async (): Promise<number> => {
+      let entries: string[]
+      try { entries = readdirSync(dir) } catch { return 0 }
+      const live = new Set(this.selections.map((record) => record.selectionId))
+      let removed = 0
+      for (const entry of entries) {
+        const selectionId = entry.endsWith('.json') ? entry.slice(0, -'.json'.length) : entry
+        if (!SAFE_SELECTION_ID.test(selectionId) || live.has(selectionId) || this.active?.selectionId === selectionId) continue
+        try {
+          await rm(path.join(dir, entry), { recursive: true, force: true })
+          removed += 1
+        } catch (error) { this.diagnostics.warn('artifacts.gc', error, { selectionId }) }
+      }
+      if (removed > 0) this.diagnostics.count('artifacts.gc_removed', removed)
+      return removed
+    }
+    this.artifactGc = this.artifactGc.then(pass, pass)
+    return this.artifactGc
+  }
+
+  /** Reclaim candidate directories left behind by a process that died
+   *  mid-selection, or by a loser cleanup that failed. Two rules keep this
+   *  safe for the operator:
+   *   - a directory whose selection is known (in the history window) is
+   *     reclaimed unless it is that record's retained winner/fallback slot
+   *     (`discardedAt` unset) or the selection is running right now;
+   *   - a directory with no record at all is reported, never removed: it may
+   *     be a retained manual winner whose record aged out of the window, and
+   *     deleting an operator's live worktree is the one failure worse than a
+   *     leak. Manual and autopilot winners keep their own lifecycles.
+   *  Concurrent calls share one pass. Never rejects. */
+  reclaimOrphanWorkspaces(): Promise<OrphanReclaim> {
+    if (this.reclaiming) return this.reclaiming
+    const run = async (): Promise<OrphanReclaim> => {
+      const summary: OrphanReclaim = { reclaimed: 0, unknown: 0, failed: 0 }
+      const manager = this.deps.testing?.workspaces
+        ?? (this.workspaceManager ??= new IsolatedWorkspaceManager(this.deps.workspaceRoot ?? defaultWorkspaceRoot()))
+      if (!manager.listManaged) return summary
+      let dirs: Array<{ selectionId: string; index: number; dir: string }>
+      try { dirs = await manager.listManaged() } catch (error) { this.diagnostics.warn('workspaces.list', error); return summary }
+      const unknownIds = new Set<string>()
+      for (const entry of dirs) {
+        if (this.disposed) break
+        if (this.active?.selectionId === entry.selectionId) continue
+        const record = this.selections.find((s) => s.selectionId === entry.selectionId)
+        if (!record) { unknownIds.add(entry.selectionId); continue }
+        if (record.status === 'running') continue
+        const slot = record.winner ?? record.fallback
+        if (slot && slot.index === entry.index && slot.discardedAt === undefined) continue
+        // Prefer the workspace path the record knows (the candidate cwd may be
+        // a sub-directory of the worktree root, and the session-store key was
+        // derived from it); fall back to the directory itself when the record
+        // points elsewhere (ledger copied from another machine).
+        const known = (record.candidates ?? []).find((candidate) => candidate.index === entry.index)?.workspace
+        const inside = known ? path.relative(entry.dir, known) : '..'
+        const target = known && inside !== '' && !inside.startsWith('..') && !path.isAbsolute(inside) ? known : entry.dir
+        try {
+          await manager.remove(target)
+          await manager.purgeSessionRecord?.(target)
+          summary.reclaimed += 1
+        } catch (error) {
+          summary.failed += 1
+          this.diagnostics.warn('workspaces.reclaim', error, { selectionId: entry.selectionId, candidate: entry.index })
+        }
+      }
+      summary.unknown = unknownIds.size
+      if (summary.reclaimed > 0) this.diagnostics.count('workspaces.reclaimed', summary.reclaimed)
+      if (summary.unknown > 0) {
+        this.diagnostics.warn('workspaces.unknown', summary.unknown + ' candidate workspace director' + (summary.unknown === 1 ? 'y has' : 'ies have') + ' no record in the history window; left in place for the operator', { selectionIds: [...unknownIds].slice(0, 5).join(',') })
+      }
+      return summary
+    }
+    this.reclaiming = run().finally(() => { this.reclaiming = null })
+    return this.reclaiming
   }
 
   async dispose(): Promise<void> {
@@ -843,12 +1045,14 @@ export class SelectionHost {
     if (active?.run) {
       try { await active.run } catch { /* the terminal record contains the failure */ }
     }
-    const handles = [...this.winners.entries()]
-    await Promise.all(handles.map(async ([id, handle]) => {
-      try { await handle.dispose(); this.winners.delete(id) } catch { /* isolated for shutdown */ }
+    // Shutdown disposal joins the same per-selection chain as release/discard,
+    // so a discard that is mid-flight when the host goes down cannot dispose
+    // the same handle twice or observe a half-removed worktree.
+    await Promise.all([...this.winners.keys()].map(async (id) => {
+      try { await this.serializeWinnerOp(id, () => this.releaseWinnerNow(id)) } catch (error) { this.diagnostics.warn('winner.release', error, { selectionId: id, phase: 'dispose' }) }
     }))
     if (this.bridgeSingleton) {
-      try { await this.bridgeSingleton.dispose() } catch { /* isolated */ }
+      try { await this.bridgeSingleton.dispose() } catch (error) { this.diagnostics.warn('sidecar.dispose', error) }
       this.bridgeSingleton = null
     }
     this.listeners.clear()

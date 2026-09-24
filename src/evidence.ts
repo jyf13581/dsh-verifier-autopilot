@@ -5,9 +5,10 @@
  */
 
 import { PLUGIN_NAME } from './constants.js'
+import { read, type EventRecord } from './payload.js'
 import type { AggregateResult } from './verifier.js'
 
-export type EventRecord = { type: string; seq?: number; time?: number; data?: any }
+export type { EventRecord }
 
 export function flatten(value: unknown): string {
   if (typeof value === 'string') return value
@@ -32,7 +33,10 @@ const TRACE_NOISE_EVENTS = new Set([
 ])
 
 function eventText(event: EventRecord): string {
-  const data = event.data ?? {}
+  // Payload shapes differ across DSH versions and persisted logs, so every
+  // read below is a tolerant `read()`; a non-object payload falls back to its
+  // flattened form rather than an empty line.
+  const data: unknown = event.data ?? {}
   const fallback = (): string => flatten(data)
   if (event.type === 'turn/start' || event.type === 'turn/end') return ''
   if (TRACE_NOISE_EVENTS.has(event.type)) return ''
@@ -43,12 +47,16 @@ function eventText(event: EventRecord): string {
     // copy costs kilobytes of the clamped [E*] window. Direct human messages
     // (incl. legacy source-less ones) still render as the task/submission.
     if (!isDirectUserMessage(event)) return ''
-    return 'USER: ' + (flatten(data.content ?? data.message?.content ?? data.message) || fallback())
+    return 'USER: ' + (flatten(read(data, 'content') ?? read(data, 'message', 'content') ?? read(data, 'message')) || fallback())
   }
-  if (event.type === 'assistant/message') return 'ASSISTANT: ' + (flatten(data.message?.content ?? data.content ?? data.message) || fallback())
-  if (event.type === 'tool/call') return 'TOOL CALL ' + String(data.name ?? data.tool?.name ?? '') + ': ' + (flatten(data.arguments ?? data.input ?? data.tool?.arguments) || fallback())
-  if (event.type === 'tool/result') return 'TOOL RESULT: ' + (flatten(data.message?.content ?? data.message ?? data.result ?? data.output ?? data.content) || fallback()) + (data.error ? ' ERROR: ' + String(data.error.code ?? data.error.name ?? 'tool error') : '')
-  return event.type.toUpperCase() + ': ' + (flatten(data.content ?? data.message ?? data.result ?? data.output) || fallback())
+  if (event.type === 'assistant/message') return 'ASSISTANT: ' + (flatten(read(data, 'message', 'content') ?? read(data, 'content') ?? read(data, 'message')) || fallback())
+  if (event.type === 'tool/call') return 'TOOL CALL ' + String(read(data, 'name') ?? read(data, 'tool', 'name') ?? '') + ': ' + (flatten(read(data, 'arguments') ?? read(data, 'input') ?? read(data, 'tool', 'arguments')) || fallback())
+  if (event.type === 'tool/result') {
+    const error = read(data, 'error')
+    return 'TOOL RESULT: ' + (flatten(read(data, 'message', 'content') ?? read(data, 'message') ?? read(data, 'result') ?? read(data, 'output') ?? read(data, 'content')) || fallback())
+      + (error ? ' ERROR: ' + String(read(error, 'code') ?? read(error, 'name') ?? 'tool error') : '')
+  }
+  return event.type.toUpperCase() + ': ' + (flatten(read(data, 'content') ?? read(data, 'message') ?? read(data, 'result') ?? read(data, 'output')) || fallback())
 }
 
 export function renderEventTexts(events: readonly EventRecord[]): string[] {
@@ -64,13 +72,13 @@ const FEEDBACK_PREFIX = '[Verifier feedback]'
 
 function isVerifierFeedback(event: EventRecord): boolean {
   if (event.type !== 'user/message') return false
-  const source = event.data?.source
-  if (source && typeof source === 'object' && source.kind === 'plugin') {
-    return source.plugin === PLUGIN_SOURCE_NAME
+  const source = read(event.data, 'source')
+  if (read(source, 'kind') === 'plugin') {
+    return read(source, 'plugin') === PLUGIN_SOURCE_NAME
   }
   // user-kind sources and legacy source-less events predate the structured
   // identity: recognize them by their text prefix.
-  return flatten(event.data?.content).trimStart().startsWith(FEEDBACK_PREFIX)
+  return flatten(read(event.data, 'content')).trimStart().startsWith(FEEDBACK_PREFIX)
 }
 
 /** Only direct human messages should define the task under review. Runtime context,
@@ -78,8 +86,8 @@ function isVerifierFeedback(event: EventRecord): boolean {
  * but are evidence around the task rather than the task itself. */
 function isDirectUserMessage(event: EventRecord): boolean {
   if (event.type !== 'user/message' || isVerifierFeedback(event)) return false
-  const source = event.data?.source
-  if (source && typeof source === 'object' && typeof source.kind === 'string') return source.kind === 'user'
+  const kind = read(event.data, 'source', 'kind')
+  if (typeof kind === 'string') return kind === 'user'
   // Older persisted events have no source metadata; retain their prior behavior.
   return true
 }
@@ -245,9 +253,9 @@ export function feedbackSentCount(events: readonly EventRecord[]): number {
 export function turnBounds(events: readonly EventRecord[]): { start: EventRecord; end: EventRecord; turn: number } | undefined {
   const end = [...events].reverse().find(event => event.type === 'turn/end')
   if (!end) return undefined
-  const turn = Number(end.data?.turn)
+  const turn = Number(read(end.data, 'turn'))
   if (!Number.isFinite(turn)) return undefined
-  const start = [...events].reverse().find(event => event.type === 'turn/start' && Number(event.data?.turn) === turn)
+  const start = [...events].reverse().find(event => event.type === 'turn/start' && Number(read(event.data, 'turn')) === turn)
   return start ? { start, end, turn } : undefined
 }
 
@@ -309,9 +317,9 @@ function evidenceKindOf(event: EventRecord): EvidenceKind {
 export function traceFor(events: readonly EventRecord[], bounds: { start: EventRecord; end: EventRecord; turn?: number }): { problem: string; hasCurrentDirectTask: boolean; hasAnyDirectTask: boolean; trace: string; evidenceIds: number[]; visibleEvidenceIds: number[]; verdictLineIds: number[]; evidenceKinds: Record<string, EvidenceKind>; stats: { eventCount: number; renderedEventCount: number; toolEventCount: number; traceChars: number; evidenceSignalCount: number; passSignalCount: number; evidenceSummaryChars: number } } {
   const startSeq = bounds.start.seq ?? 0
   const endSeq = bounds.end.seq ?? Number.MAX_SAFE_INTEGER
-  const turn = Number(bounds.start.data?.turn ?? bounds.end.data?.turn)
+  const turn = Number(read(bounds.start.data, 'turn') ?? read(bounds.end.data, 'turn'))
   const belongsToTurn = (event: EventRecord): boolean => {
-    const eventTurn = Number(event.data?.turn)
+    const eventTurn = Number(read(event.data, 'turn'))
     const eventSeq = event.seq ?? 0
     // A matching turn field alone is not enough: events appended after turn/end
     // must not cross the completed-turn seq seal (late same-turn injection).
@@ -321,7 +329,7 @@ export function traceFor(events: readonly EventRecord[], bounds: { start: EventR
   const current = events.filter(belongsToTurn)
   const before = events.filter(event => {
     if (!isDirectUserMessage(event)) return false
-    const eventTurn = Number(event.data?.turn)
+    const eventTurn = Number(read(event.data, 'turn'))
     if (Number.isFinite(turn) && Number.isFinite(eventTurn)) return eventTurn < turn
     return (event.seq ?? 0) < startSeq
   })
@@ -331,7 +339,8 @@ export function traceFor(events: readonly EventRecord[], bounds: { start: EventR
   const taskEvent = currentTask ?? before[before.length - 1]
   // Without any direct task the run must not invent one: verifyAgent skips
   // such turns ('no-direct-task') instead of scoring against a placeholder.
-  const problem = flatten(taskEvent?.data?.content ?? taskEvent?.data?.message?.content ?? taskEvent?.data?.message ?? '')
+  const task: unknown = taskEvent?.data
+  const problem = flatten(read(task, 'content') ?? read(task, 'message', 'content') ?? read(task, 'message') ?? '')
   // Number every rendered line so findings can cite exact trajectory evidence.
   // Ids are positions in this turn's rendered order and stay attached to their
   // line through compaction and truncation. Verifier-feedback marker lines are

@@ -1,5 +1,6 @@
 import type { AutopilotMode, CandidateModelStrategy } from '../config.js'
 import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
+import { read } from '../payload.js'
 import type { SelectionRecord } from './candidates.js'
 import { boundText, type TrajectoryEvent } from './trajectory.js'
 
@@ -181,16 +182,16 @@ function textOf(value: unknown): string {
 }
 
 function conversationLine(event: TrajectoryEvent): { role: 'USER' | 'ASSISTANT'; text: string } | null {
-  const data = (event.data ?? {}) as Record<string, unknown>
+  const data: unknown = event.data ?? {}
   if (event.type === 'user/message') {
-    const source = (data.source ?? {}) as { kind?: string }
-    if (source.kind && source.kind !== 'user') return null
-    const text = textOf(data.content).trim()
+    const sourceKind = read(data, 'source', 'kind')
+    if (sourceKind && sourceKind !== 'user') return null
+    const text = textOf(read(data, 'content')).trim()
     return text ? { role: 'USER', text } : null
   }
   if (event.type === 'assistant/message') {
-    const message = (data.message ?? data) as Record<string, unknown>
-    const text = textOf(message.content).trim()
+    const message = read(data, 'message') ?? data
+    const text = textOf(read(message, 'content')).trim()
     return text ? { role: 'ASSISTANT', text } : null
   }
   return null

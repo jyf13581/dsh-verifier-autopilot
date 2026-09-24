@@ -10,6 +10,7 @@ import type { Config } from './config.js'
 import type { AggregateResult } from './verifier.js'
 import type { BridgeSelectRequest } from './selection/bridge.js'
 import type { ObjectiveCheck, SelectionRecord } from './selection/candidates.js'
+import type { DiagnosticsSnapshot } from './diagnostics.js'
 
 export const API_PREFIX = `/${PLUGIN_NAME}/api` as const
 export { SETTINGS_NAMESPACE_ID }
@@ -58,6 +59,8 @@ export interface StateResponse {
   agents: number
   records: VerificationRecord[]
   selection: SelectionSnapshot
+  /** Recent best-effort degradations and counters (bounded, redacted). */
+  diagnostics: DiagnosticsSnapshot
 }
 
 export interface SelectionsListResponse {

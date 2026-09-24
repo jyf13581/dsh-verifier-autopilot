@@ -5,12 +5,11 @@
  * and renders tool evidence with the [E*] line ids a finding can cite.
  */
 
-export interface TrajectoryEvent {
-  type: string
-  seq?: number
-  time?: number
-  data?: Record<string, unknown>
-}
+import { read, type EventRecord } from '../payload.js'
+
+/** Same declared shape as the legacy verifier path: one session event whose
+ *  payload is read tolerantly, never asserted. */
+export type TrajectoryEvent = EventRecord
 
 export interface TrajectoryRender {
   text: string
@@ -102,34 +101,34 @@ export function renderTrajectory(
       cursor += 1
       lines.push('[E' + String(cursor).padStart(2, '0') + '] ' + line)
     }
-    const data = (ev.data ?? {}) as Record<string, unknown>
+    const data: unknown = ev.data ?? {}
     if (ev.type === 'user/message') {
-      const src = (data.source ?? {}) as Record<string, unknown>
-      const text = asText(data.content ?? data.message)
+      const sourceKind = read(data, 'source', 'kind')
+      const text = asText(read(data, 'content') ?? read(data, 'message'))
       if (!text.trim()) continue
-      if (src.kind && src.kind !== 'user') {
-        push('NOTICE(' + String(src.kind) + '): ' + summarize(text, 400).text)
+      if (sourceKind && sourceKind !== 'user') {
+        push('NOTICE(' + String(sourceKind) + '): ' + summarize(text, 400).text)
       } else {
         push('USER: ' + summarize(text, cellCap).text)
       }
       continue
     }
     if (ev.type === 'assistant/message') {
-      const text = asText((data.message as Record<string, unknown> | undefined)?.content)
+      const text = asText(read(data, 'message', 'content'))
       if (text.trim()) push('ASSISTANT: ' + summarize(text, cellCap).text)
       continue
     }
     if (ev.type === 'tool/call') {
       toolCalls += 1
-      if (!isMetaToolName(data.name)) execToolCalls += 1
-      const s = summarize(data.arguments, cellCap)
+      const name = read(data, 'name')
+      if (!isMetaToolName(name)) execToolCalls += 1
+      const s = summarize(read(data, 'arguments'), cellCap)
       if (s.truncated) truncatedCells += 1
-      push('TOOL CALL ' + String(data.name ?? 'unknown') + ': ' + s.text)
+      push('TOOL CALL ' + String(name ?? 'unknown') + ': ' + s.text)
       continue
     }
     if (ev.type === 'tool/result') {
-      const msg = data.message as Record<string, unknown> | undefined
-      const content = msg?.content ?? data.content ?? data
+      const content = read(data, 'message', 'content') ?? read(data, 'content') ?? data
       const s = summarize(content, cellCap)
       if (s.truncated) truncatedCells += 1
       push('TOOL RESULT: ' + s.text)

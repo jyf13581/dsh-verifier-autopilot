@@ -21,6 +21,10 @@ export interface LedgerReadOptions<T extends object> {
   validate(record: unknown): record is T
   idOf?: (record: T) => string
   normalize?: (record: T) => T
+  /** Observes every skipped row (torn line, unparseable JSON, unknown ledger
+   *  version, failed validation). The skip itself stays unconditional: the
+   *  hook exists so callers can make the loss visible, not veto it. */
+  onSkippedRow?: (line: number, error: unknown) => void
 }
 
 function encodeRecord<T extends object>(record: T): string {
@@ -41,15 +45,20 @@ export function readJsonlLedger<T extends object>(file: string, options: LedgerR
 
   const records: T[] = []
   const byId = options.idOf ? new Map<string, T>() : undefined
+  const skipped = (line: number, error: unknown): void => {
+    try { options.onSkippedRow?.(line, error) } catch { /* an observer never breaks startup */ }
+  }
+  let lineNo = 0
   for (const line of raw.split(String.fromCharCode(10))) {
+    lineNo += 1
     const text = line.trim()
     if (!text) continue
     try {
       const record = decodeRecord(JSON.parse(text), options.validate)
-      if (!record) continue
+      if (!record) { skipped(lineNo, new Error('row rejected (unknown version or failed validation)')); continue }
       if (byId && options.idOf) byId.set(options.idOf(record), record)
       else records.push(record)
-    } catch { /* a torn/corrupt row never breaks host startup */ }
+    } catch (error) { skipped(lineNo, error) /* a torn/corrupt row never breaks host startup */ }
   }
 
   const chronological = byId ? [...byId.values()] : records

@@ -7,38 +7,50 @@
  * and this file is typechecked + smoke-tested against the live host.
  */
 
-import { cp, lstat, mkdir, readlink, rm, rmdir } from 'node:fs/promises'
+import { cp, lstat, mkdir, readdir, readlink, rm, rmdir } from 'node:fs/promises'
 import { statSync } from 'node:fs'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
-import type { CandidateFactory, CandidateSpec, SelectionAgentHandle, WorkspaceManager } from './candidates.js'
+import type { CandidateFactory, CandidateSpec, DiffStatLite, SelectionAgentHandle, WorkspaceManager } from './candidates.js'
 import type { TrajectoryEvent } from './trajectory.js'
+import { runProcess } from './proc.js'
+import { isAgentScope, type AgentCreate } from '../dsh-context.js'
 
 interface LiveAgentLike {
   id: string
   ctx: unknown
-  session: { events: readonly TrajectoryEvent[] }
+  session: { events: readonly TrajectoryEvent[]; header?: { delegationDepth?: number } }
 }
 
 interface LiveContext {
-  agents: {
-    create(options: Record<string, unknown>): Promise<{ agent: unknown; dispose(): Promise<void> }>
-  }
+  agents: { create: AgentCreate }
 }
 
-function exec(cmd: string, args: string[], cwd?: string, timeoutMs = 30000): Promise<{ code: number; out: string }> {
-  return new Promise((resolve) => {
-    let out = ''
-    const child = spawn(cmd, args, { cwd, windowsHide: true })
-    const take = (b: Buffer | string) => { out = (out + String(b)).slice(-2000) }
-    child.stdout?.on('data', take)
-    child.stderr?.on('data', take)
-    const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } }, timeoutMs)
-    child.on('error', () => { clearTimeout(timer); resolve({ code: -1, out }) })
-    child.on('exit', (code) => { clearTimeout(timer); resolve({ code: code ?? -1, out }) })
-  })
+/** Evidence listings (numstat, status, patches) legitimately exceed the
+ *  2000-char diagnostic tail; they keep the head so truncation cuts the end. */
+const EVIDENCE_CAP = 262144
+
+interface ExecOptions {
+  cwd?: string
+  timeoutMs?: number
+  cap?: number
+  keep?: 'head' | 'tail'
+  env?: NodeJS.ProcessEnv
+}
+
+/** Bounded process call. The default shape (2000-char tail) is the
+ *  diagnostic one: when git fails, the reason is at the end. `code` is -1 for
+ *  anything that did not produce an honest exit code (spawn failure, timeout). */
+async function exec(cmd: string, args: string[], options: ExecOptions = {}): Promise<{ code: number; out: string }> {
+  const result = await runProcess(cmd, args, options)
+  return { code: result.code ?? -1, out: result.out }
+}
+
+/** Evidence-shaped call: large head-kept output. */
+function execWide(cmd: string, args: string[], cwd?: string, env?: NodeJS.ProcessEnv): Promise<{ code: number; out: string }> {
+  return exec(cmd, args, { cwd, cap: EVIDENCE_CAP, keep: 'head', env })
 }
 
 async function existingAncestor(input: string): Promise<string | undefined> {
@@ -239,12 +251,11 @@ function makeChildSetup(
   route: { provider?: string; model?: string },
 ) {
   return (agentCtx: unknown) => {
-    type AssembleCtx = {
-      get(name: string): unknown
-      on(name: string, handler: (...args: never[]) => unknown): unknown
-      agent?: { session: { append(type: string, data: Record<string, unknown>): void } }
-    }
-    const aCtx = agentCtx as unknown as AssembleCtx
+    // DSH hands the child's scoped context in untyped; the seam is checked
+    // once here. Without hooks and service lookup none of the setup below can
+    // apply, and the child would run with whatever defaults DSH gives it.
+    if (!isAgentScope(agentCtx)) return
+    const aCtx = agentCtx
     if (parent) {
       try {
         const presets = aCtx.get('agentPresets') as { composeFrom?: (child: unknown, parentCtx: unknown) => void } | undefined
@@ -273,21 +284,21 @@ function makeChildSetup(
     }
     const selection: { current?: { provider?: string; model?: string }; assembled?: { provider?: string; model?: string } } = { current: selected, assembled: undefined }
     try {
-      aCtx.on('system-prompt/assemble' as never, (async (_assembly: unknown, _context: unknown, next: () => Promise<{ variables?: Record<string, unknown> }>) => {
+      aCtx.on('system-prompt/assemble', async (_assembly: unknown, _context: unknown, next: () => Promise<{ variables?: Record<string, unknown> }>) => {
         const cur = selection.current
         const assembled = await next()
         selection.assembled = cur
         if (!cur) return assembled
         return { ...assembled, variables: { ...assembled.variables, provider: cur.provider, model: cur.model } }
-      }) as never)
-      aCtx.on('agent/request' as never, (async (_payload: unknown, next: () => Promise<Record<string, unknown>>) => {
+      })
+      aCtx.on('agent/request', async (_payload: unknown, next: () => Promise<Record<string, unknown>>) => {
         const resolved = await next()
         const sel = selection.assembled
         if (!sel) return resolved
         const rest = { ...resolved }
         delete rest.reasoningEffort
         return { ...rest, ...(sel.provider !== undefined ? { provider: sel.provider } : {}), ...(sel.model !== undefined ? { model: sel.model } : {}) }
-      }) as never)
+      })
     } catch { /* prompt/request waterfalls absent in embedded contexts */ }
   }
 }
@@ -307,8 +318,7 @@ export function makeLiveCandidateFactory(args: {
   } catch { /* explicit sandbox override, if any, remains authoritative */ }
   return {
     async create(spec: CandidateSpec): Promise<SelectionAgentHandle> {
-      const header = parent ? ((parent.session as { header?: { delegationDepth?: number } }).header ?? {}) : {}
-      const parentDepth = Number(header.delegationDepth ?? 0)
+      const parentDepth = Number(parent?.session.header?.delegationDepth ?? 0)
       const depth = Number.isSafeInteger(parentDepth) && parentDepth > 0 ? parentDepth + 1 : 1
       // A candidate that joins no preset resolves its tools against the empty
       // global layer (agent-presets logs exactly this: "published without
@@ -393,6 +403,12 @@ export class WorkspacePrepareError extends Error {
   }
 }
 
+/** The only directory shapes the manager will ever create or remove:
+ *  `<root>/sel-<id>/c<index>`. Both ends of the lifecycle (prepare/remove and
+ *  listManaged) share these so enumeration can never widen removal. */
+const MANAGED_SELECTION_DIR = /^sel-[A-Za-z0-9][A-Za-z0-9-]{0,100}$/
+const MANAGED_CANDIDATE_DIR = /^c(\d+)$/
+
 export class IsolatedWorkspaceManager implements WorkspaceManager {
   private readonly root: string
   private readonly storeRoot: string
@@ -407,7 +423,7 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
     const relative = path.relative(this.root, absolute)
     const parts = relative.split(/[\\/]/).filter(Boolean)
     if (!relative || path.isAbsolute(relative) || parts.includes('..') || parts.length < 2
-      || !/^sel-[A-Za-z0-9][A-Za-z0-9-]{0,100}$/.test(parts[0]) || !/^c\d+$/.test(parts[1])) {
+      || !MANAGED_SELECTION_DIR.test(parts[0]) || !MANAGED_CANDIDATE_DIR.test(parts[1])) {
       throw new Error('workspace-path-outside-managed-root')
     }
     return absolute
@@ -437,10 +453,10 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
   }
 
   private async removeLease(lease: WorktreeLease): Promise<void> {
-    const gone = await exec('git', ['-C', lease.sourceRoot, 'worktree', 'remove', '--force', lease.worktreeRoot], undefined, 60000)
+    const gone = await exec('git', ['-C', lease.sourceRoot, 'worktree', 'remove', '--force', lease.worktreeRoot], { timeoutMs: 60000 })
     if (gone.code !== 0) {
       await rm(lease.worktreeRoot, { recursive: true, force: true })
-      const pruned = await exec('git', ['-C', lease.sourceRoot, 'worktree', 'prune', '--expire', 'now'], undefined, 60000)
+      const pruned = await exec('git', ['-C', lease.sourceRoot, 'worktree', 'prune', '--expire', 'now'], { timeoutMs: 60000 })
       if (pruned.code !== 0) throw new Error('workspace-worktree-prune-failed: ' + pruned.out)
     }
     this.worktrees.delete(lease.candidateCwd)
@@ -462,7 +478,7 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
         const sourceCwd = path.resolve(sel.sourceCwd)
         const relativeCwd = path.relative(sourceRoot, sourceCwd)
         if (path.isAbsolute(relativeCwd) || relativeCwd.split(/[\\/]/).includes('..')) throw new Error('source-cwd-outside-git-root')
-        const add = await exec('git', ['-C', sourceRoot, 'worktree', 'add', '--detach', worktreeRoot, 'HEAD'], undefined, 60000)
+        const add = await exec('git', ['-C', sourceRoot, 'worktree', 'add', '--detach', worktreeRoot, 'HEAD'], { timeoutMs: 60000 })
         if (add.code !== 0) throw new Error('workspace-worktree-add-failed: ' + add.out)
         const candidateCwd = path.join(worktreeRoot, relativeCwd)
         const lease = { candidateCwd, worktreeRoot, sourceRoot }
@@ -493,34 +509,35 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
       try { await rmdir(path.dirname(managed)) } catch { /* selection root not empty */ }
     }
   }
+
+  /** Enumerate the `<root>/<selectionId>/c<i>` directories on disk. Only names
+   *  that `managedPath` would accept are reported, so nothing an operator
+   *  dropped into the root by hand can ever be handed to remove(). */
+  async listManaged(): Promise<Array<{ selectionId: string; index: number; dir: string }>> {
+    const found: Array<{ selectionId: string; index: number; dir: string }> = []
+    let selections: string[]
+    try { selections = await readdir(this.root) } catch { return found }
+    for (const selectionId of selections) {
+      if (!MANAGED_SELECTION_DIR.test(selectionId)) continue
+      let candidates: string[]
+      try { candidates = await readdir(path.join(this.root, selectionId)) } catch { continue }
+      for (const name of candidates) {
+        const match = MANAGED_CANDIDATE_DIR.exec(name)
+        if (!match) continue
+        found.push({ selectionId, index: Number(match[1]), dir: path.join(this.root, selectionId, name) })
+      }
+    }
+    return found
+  }
 }
 
-/** Larger-output variant of exec() for evidence collection (numstat / status
- *  listings legitimately exceed the 2000-char diagnostic tail). */
-function execWide(cmd: string, args: string[], cwd?: string, timeoutMs = 30000, cap = 262144): Promise<{ code: number; out: string }> {
-  return new Promise((resolve) => {
-    let out = ''
-    const child = spawn(cmd, args, { cwd, windowsHide: true })
-    const take = (b: Buffer | string) => { out = (out + String(b)).slice(0, cap) }
-    child.stdout?.on('data', take)
-    child.stderr?.on('data', take)
-    const timer = setTimeout(() => { try { child.kill() } catch { /* gone */ } }, timeoutMs)
-    child.on('error', () => { clearTimeout(timer); resolve({ code: -1, out }) })
-    child.on('exit', (code) => { clearTimeout(timer); resolve({ code: code ?? -1, out }) })
-  })
-}
-
-export interface DiffStatLite {
-  /** Tracked files whose worktree bytes differ from HEAD. */
-  files: number
-  insertions: number
-  deletions: number
-  /** Untracked (non-ignored) files — candidate NEW artifacts live here. */
-  untracked: number
-  /** Stable hash of the diff surface: numstat lines + untracked name:size.
-   *  Two candidates with equal fingerprints produced the same diff shape. */
-  fingerprint: string
-}
+/** The evidence shape is owned by the runner contract (candidates.ts); this
+ *  adapter produces it and re-exports the type so the two can never drift.
+ *  files = tracked files whose worktree bytes differ from HEAD; untracked =
+ *  non-ignored new files (candidate NEW artifacts live here); fingerprint =
+ *  stable hash of numstat lines + untracked name:size, so equal fingerprints
+ *  mean the same diff shape. */
+export type { DiffStatLite }
 
 /** Objective work evidence for one candidate workspace (ruling K.5 / J.4).
  *  Returns null when the workspace is not a git worktree (manual blank
@@ -567,7 +584,9 @@ export async function gitDiffStat(cwd: string): Promise<DiffStatLite | null> {
 
 export interface DiffFull {
   /** git diff HEAD patch text, capped; untracked new files are included via
-   *  `git add -N` intent-to-add (safe: runs in a disposable worktree). */
+   *  `git add -N` intent-to-add recorded in a THROWAWAY copy of the index, so
+   *  the candidate's real index is never touched (the retained winner's
+   *  worktree is handed to the finalizer exactly as the candidate left it). */
   patch: string
   truncated: boolean
   /** Untracked (non-ignored) file names — the typical brand-new deliverable. */
@@ -577,17 +596,29 @@ export interface DiffFull {
 /** Full diff evidence for the audit pack (ruling I.5): what the candidate
  *  actually changed, captured BEFORE the workspace can be reclaimed. */
 export async function gitDiffFull(cwd: string, patchCap = 262144): Promise<DiffFull | null> {
+  let scratchIndex: string | undefined
   try {
     const head = await execWide('git', ['-C', cwd, 'rev-parse', '--verify', 'HEAD'], cwd)
     if (head.code !== 0) return null
-    await execWide('git', ['-C', cwd, 'add', '-N', '.'], cwd)
-    const diff = await execWide('git', ['-C', cwd, 'diff', 'HEAD', '--', '.'], cwd, 30000, patchCap)
+    // Evidence collection must not mutate the evidence: stage intent-to-add
+    // entries into a private copy of the index (GIT_INDEX_FILE) so untracked
+    // files show up in the patch while `git status`/`git diff --cached` in the
+    // candidate worktree stay exactly as the candidate left them.
+    const indexPath = await execWide('git', ['-C', cwd, 'rev-parse', '--git-path', 'index'], cwd)
+    if (indexPath.code !== 0 || !indexPath.out.trim()) return null
+    scratchIndex = path.join(os.tmpdir(), 'dsh-va-index-' + randomUUID())
+    try { await cp(path.resolve(cwd, indexPath.out.trim()), scratchIndex) } catch { /* no index yet: git starts from an empty one */ }
+    const scratchEnv = { ...process.env, GIT_INDEX_FILE: scratchIndex }
+    await execWide('git', ['-C', cwd, 'add', '-N', '.'], cwd, scratchEnv)
+    const diff = await exec('git', ['-C', cwd, 'diff', 'HEAD', '--', '.'], { cwd, cap: patchCap, keep: 'head', env: scratchEnv })
     if (diff.code !== 0) return null
     const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard'], cwd)
     const untrackedFiles = others.code === 0 ? others.out.split(/\r?\n/).filter(Boolean) : []
     return { patch: diff.out, truncated: diff.out.length >= patchCap, untrackedFiles }
   } catch {
     return null
+  } finally {
+    if (scratchIndex) await rm(scratchIndex, { force: true }).catch(() => undefined)
   }
 }
 

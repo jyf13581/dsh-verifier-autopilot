@@ -13,7 +13,7 @@ import {
   type AggregateResult,
 } from './verifier.js'
 import { VerificationCoordinator, type ScheduleEntry, type RunContext } from './coordinator.js'
-import { Config, cleanConfig, validateConfigPatch } from './config.js'
+import { Config, validateConfigPatch } from './config.js'
 import {
   PLUGIN_SOURCE_NAME, auditAggregateCitations, auditFindingCitation,
   feedbackSentCount, flatten, traceFor, turnBounds, turnGateDecision,
@@ -22,6 +22,8 @@ import {
 import { appendJsonlLedger, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from './ledger.js'
 import type { StateResponse, VerificationRecord, WebRoute } from './protocol.js'
 import { resolveKey, type Credentials } from './util.js'
+import { diagnostics as defaultDiagnostics, type Diagnostics } from './diagnostics.js'
+import { isHookSource, requireHookSource, type AgentCreate, type HookSource } from './dsh-context.js'
 import { SelectionHost } from './selection/host.js'
 import { runChecks } from './selection/checks.js'
 import { evaluateDelivery } from './selection/candidates.js'
@@ -32,7 +34,11 @@ import { createModelProber, type ModelProber } from './selection/probe.js'
 export type { Credentials } from './util.js'
 export type Agent = { id: string; session: { events: readonly EventRecord[]; header?: { cwd?: string; parentSession?: string } }; ctx: Context; followup: (message: UserMessage) => void | Promise<void> }
 export type { WebRoute } from './protocol.js'
-export type HostContext = Context & { webServer: { register(route: WebRoute): () => void }; credentials?: Credentials; agents?: { list(): Agent[]; get(id: string): Agent | undefined }; llm?: { listModels(provider: string): Promise<Array<{ id: string; provider?: string }>> } }
+/** What the plugin needs from DSH's agent registry: enumeration and lookup
+ *  of live agents (legacy verification) plus child creation (best-of-N
+ *  candidates). Declared here, once, in the plugin's own terms. */
+export type AgentsService = { list(): Agent[]; get(id: string): Agent | undefined; create: AgentCreate }
+export type HostContext = Context & { webServer: { register(route: WebRoute): () => void }; credentials?: Credentials; agents?: AgentsService; llm?: { listModels(provider: string): Promise<Array<{ id: string; provider?: string }>> } }
 
 /** Phase 2 durability: finished records append to a JSONL trail so history
  *  survives hot reloads and stays queryable per session/turn. The trail is
@@ -57,14 +63,18 @@ function isRecordState(value: unknown): value is RecordState {
     && typeof (value as Partial<RecordState>).status === 'string')
 }
 
-function loadPersistedRecords(file: string): RecordState[] {
+function loadPersistedRecords(file: string, diagnostics: Diagnostics): RecordState[] {
+  let skippedRows = 0
   const loaded = readJsonlLedger(file, {
     limit: VERIFICATION_HISTORY_LIMIT,
     validate: isRecordState,
     normalize: normalizeLoadedRecord,
+    onSkippedRow: () => { skippedRows += 1 },
   })
+  if (skippedRows > 0) diagnostics.warn('records.corrupt_rows', skippedRows + ' unreadable row(s) skipped while loading the verification ledger', { file, rows: skippedRows })
   if (ledgerExceeds(file, RECORDS_FILE_MAX_BYTES)) {
-    try { compactJsonlLedger(file, loaded) } catch { /* best-effort compaction */ }
+    diagnostics.count('records.compact')
+    try { compactJsonlLedger(file, loaded) } catch (error) { diagnostics.warn('records.compact', error, { file }) }
   }
   return loaded
 }
@@ -106,6 +116,18 @@ function awaitFollowupWithFence(operation: Promise<void>, signal: AbortSignal, t
   })
 }
 
+/** Resolve with `work`, or reject as soon as `signal` aborts — whichever comes
+ *  first. The underlying work is not cancelled (it is advisory and self-bounded);
+ *  only the caller stops waiting for it. */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason ?? new Error('aborted'))
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason ?? new Error('aborted'))
+    signal.addEventListener('abort', onAbort, { once: true })
+    work.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+  })
+}
+
 export class VerifierHost {
   private config: Config
   private readonly agents = new Map<string, Agent>()
@@ -120,12 +142,22 @@ export class VerifierHost {
   /** null disables persistence (tests/embedded use); the injected Host enables it */
   private readonly recordsFile: string | null
   private readonly feedbackTimeoutMs: number
+  /** Degradation sink shared with the selection host, runner, and sidecar
+   *  bridge. Every "best-effort" branch reports here instead of vanishing;
+   *  the snapshot rides along in `/state` and the SSE stream. */
+  private readonly diagnostics: Diagnostics
+  private readonly unsubscribeDiagnostics: () => void
   /** Best-of-N selection host (manual trigger plus first-step autopilot). */
   readonly selections: SelectionHost
   /** Autopilot winners live only until the source turn reaches idle. */
   private readonly autopilotCleanup = new Map<string, Set<string>>()
   /** Background selections are cancelled when their source session disappears. */
   private readonly autopilotActive = new Map<string, Set<string>>()
+  /** One retained-winner cleanup pass per source session at a time. idle,
+   *  agent/disposed, and dispose() all trigger the pass; without this fence
+   *  two passes raced the same post-audit (running the configured test command
+   *  twice in the user's repository) and the same worktree removal. */
+  private readonly autopilotCleanupInFlight = new Map<string, { promise: Promise<void>; rerun: boolean }>()
 
   /** Candidate-model liveness prober, memoized per (baseURL, key) pair so
    *  config churn never keeps a stale credential around. */
@@ -138,10 +170,14 @@ export class VerifierHost {
     return this.proberState.instance
   }
 
-  constructor(private readonly ctx: HostContext, config: Config, options: { recordsFile?: string | null; feedbackTimeoutMs?: number; selectionsFile?: string | null; selectionsTesting?: ConstructorParameters<typeof SelectionHost>[0]['testing'] } = {}) {
+  constructor(private readonly ctx: HostContext, config: Config, options: { recordsFile?: string | null; feedbackTimeoutMs?: number; selectionsFile?: string | null; selectionsTesting?: ConstructorParameters<typeof SelectionHost>[0]['testing']; diagnostics?: Diagnostics } = {}) {
     // Own the mutable reference: settings callers and embedded consumers must
     // not be able to alter live behavior by retaining the constructor object.
     this.config = { ...config }
+    this.diagnostics = options.diagnostics ?? defaultDiagnostics
+    // A new warning is a state change the panel should see without waiting
+    // for its next poll. Counters do not notify: they are cheap and frequent.
+    this.unsubscribeDiagnostics = this.diagnostics.subscribe(() => { if (!this.disposed) this.emit() })
     this.recordsFile = options.recordsFile === undefined ? null : options.recordsFile
     this.feedbackTimeoutMs = Number.isFinite(options.feedbackTimeoutMs)
       ? Math.max(1, Math.floor(options.feedbackTimeoutMs as number))
@@ -150,8 +186,8 @@ export class VerifierHost {
       run: (entry, runContext) => this.executeEntry(entry, runContext),
     })
     this.selections = new SelectionHost({
-      agents: this.ctx.agents as never,
-      liveAgents: this.ctx.agents as never,
+      agents: this.ctx.agents,
+      liveAgents: this.ctx.agents,
       defaultRoute: () => {
         try {
           return (this.ctx.get('agentDefaultModel') as { currentSelection?: () => { provider?: string; model?: string } } | undefined)?.currentSelection?.()
@@ -169,6 +205,7 @@ export class VerifierHost {
       selectionsFile: options.selectionsFile === undefined ? null : options.selectionsFile,
       testing: options.selectionsTesting,
       notify: (record) => this.notifySelectionSettlement(record),
+      diagnostics: this.diagnostics,
     })
   }
 
@@ -213,38 +250,49 @@ export class VerifierHost {
     try {
       const catalogModels = await this.ctx.llm?.listModels(this.config.selectionProvider)
       if (catalogModels) availableModels = [...new Set([...preferredModels, ...catalogModels.map((model) => model.id)])]
-    } catch {
+    } catch (error) {
       // A provider catalog is discovery metadata, not an allowlist. Keep the
       // operator-supplied model IDs and let the real probe decide liveness.
       catalogAvailable = false
+      this.diagnostics.warn('autopilot.catalog', error, { provider: this.config.selectionProvider })
     }
     payload.signal.throwIfAborted()
     // Liveness before planning (ruling P-C): the catalog lists models that may
     // be dead for days. Probe every configured model, including custom IDs that
     // a provider catalog does not advertise, and drop only confirmed failures.
+    // The probes run concurrently and the wait is abort-aware: this code sits
+    // on the source turn's critical path, so the pool costs one probe timeout
+    // at worst, never one per configured model, and a cancelled turn stops
+    // waiting immediately (the prober still caches the late verdicts).
     let probeEvidence: Record<string, boolean> | undefined
     if (this.config.selectionProbeEnabled) {
       try {
         const probeKey = await resolveKey(this.ctx.credentials, this.config.apiKeyEnv)
         if (probeKey) {
           const prober = this.proberFor(this.config.baseURL, probeKey)
-          const alive: string[] = []
-          const dead: string[] = []
-          for (const model of preferredModels) {
-            (await prober.probe(model) ? alive : dead).push(model)
-          }
+          const verdicts = await untilAborted(Promise.all(preferredModels.map((model) => prober.probe(model))), payload.signal)
+          const alive = preferredModels.filter((_, index) => verdicts[index])
+          const dead = preferredModels.filter((_, index) => !verdicts[index])
+          if (dead.length > 0) this.diagnostics.count('probe.dead', dead.length)
           if (alive.length > 0 || dead.length === 0) {
             const deadSet = new Set(dead)
             availableModels = [...alive, ...availableModels.filter((m) => !deadSet.has(m) && !alive.includes(m))]
             if (dead.length > 0 || !catalogAvailable) probeEvidence = Object.fromEntries(dead.map((m) => [m, false]).concat(alive.map((m) => [m, true])))
           } else if (dead.length > 0) {
             // All configured models are dead: never roll the whole pool onto a
-            // corpse or silently weaken the selection gates.
+            // corpse or silently weaken the selection gates. Skipping autopilot
+            // is the correct decision, and it must be a visible one.
+            this.diagnostics.warn('autopilot.pool_dead', 'every preferred candidate model failed the liveness probe; autopilot skipped this turn', { models: preferredModels.join(',') })
             return decision
           }
-        }
-      } catch { /* probing is advisory only when the provider key is unavailable */ }
+        } else this.diagnostics.count('probe.skipped_no_key')
+      } catch (error) {
+        // Probing is advisory: a missing key or a failing prober degrades to
+        // "unprobed", never to a blocked turn. A cancelled turn is not a fault.
+        if (!payload.signal.aborted) this.diagnostics.warn('autopilot.probe', error)
+      }
     }
+    payload.signal.throwIfAborted()
     const plan = planAutopilotTask(task, availableModels, policy)
     if (!plan.admitted || !plan.depth || !plan.candidateCount || !plan.nEvaluations || !plan.candidateOptions || !plan.candidateInstructions || !plan.criteria) return decision
 
@@ -318,24 +366,50 @@ export class VerifierHost {
         void Promise.resolve(agent.followup(createUserMessage({
           source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
           content: [{ type: 'text', text: buildAutopilotRelay(record) }],
-        }))).catch(() => undefined)
-      }).catch(() => {
+        }))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId }))
+      }).catch((error: unknown) => {
         const current = this.autopilotActive.get(sourceId)
         current?.delete(selectionId as string)
         if (current && current.size === 0) this.autopilotActive.delete(sourceId)
         payload.signal.removeEventListener('abort', cancel)
+        this.diagnostics.warn('autopilot.wait', error, { selectionId })
       })
       return decision
-    } catch {
+    } catch (error) {
       // The selection admission itself is the only synchronous failure point.
       // Once admitted, its terminal outcome is handled by the background waiter.
       payload.signal.removeEventListener('abort', cancel)
       payload.signal.throwIfAborted()
+      this.diagnostics.warn('autopilot.admission', error, { sourceSessionId: String(agent.id) })
       return decision
     }
   }
 
-  private async cleanupAutopilotWinners(sourceSessionId: string): Promise<void> {
+  private cleanupAutopilotWinners(sourceSessionId: string): Promise<void> {
+    const inFlight = this.autopilotCleanupInFlight.get(sourceSessionId)
+    if (inFlight) {
+      // A trigger that lands mid-pass may carry new evidence (a relay just
+      // queued another retained slot): run exactly one more pass afterwards
+      // instead of a concurrent one, and let the caller await that too.
+      inFlight.rerun = true
+      return inFlight.promise
+    }
+    const entry = { rerun: false, promise: Promise.resolve() }
+    entry.promise = (async () => {
+      try {
+        do {
+          entry.rerun = false
+          await this.cleanupAutopilotWinnersOnce(sourceSessionId)
+        } while (entry.rerun)
+      } finally {
+        this.autopilotCleanupInFlight.delete(sourceSessionId)
+      }
+    })()
+    this.autopilotCleanupInFlight.set(sourceSessionId, entry)
+    return entry.promise
+  }
+
+  private async cleanupAutopilotWinnersOnce(sourceSessionId: string): Promise<void> {
     const pending = this.autopilotCleanup.get(sourceSessionId)
     if (!pending) return
     for (const selectionId of [...pending]) {
@@ -359,7 +433,9 @@ export class VerifierHost {
               } else {
                 const before = rec.sourceHeadAtStart ?? null
                 const headChanged = before !== null && state.head !== null ? state.head !== before : null
-                const testCommand = this.config.selectionPostAuditTestCommand.trim()
+                // An absent/non-string command means "no test configured", never
+                // an audit failure (embedded hosts may pass a partial config).
+                const testCommand = typeof this.config.selectionPostAuditTestCommand === 'string' ? this.config.selectionPostAuditTestCommand.trim() : ''
                 let testsExit: number | null = null
                 let testsRan = false
                 let postAuditError: string | undefined
@@ -390,8 +466,9 @@ export class VerifierHost {
                   note: verdict.note + (postAuditError ? ' [test runner error: ' + postAuditError + ']' : ''),
                 }
               }
-            } catch {
+            } catch (error) {
               rec.delivery = { audited: false, delivered: 'unknown', note: 'audit raised' }
+              this.diagnostics.warn('autopilot.audit', error, { selectionId })
             }
           }
           rec.timing = { ...(rec.timing ?? {}), auditedAt: Date.now() }
@@ -400,7 +477,10 @@ export class VerifierHost {
         const after = this.selections.getSelection(selectionId)
         const slotAfter = after ? (after.winner ?? after.fallback) : undefined
         if (removed || !slotAfter || slotAfter.discardedAt !== undefined) pending.delete(selectionId)
-      } catch { /* keep it queued for the next idle/dispose retry */ }
+      } catch (error) {
+        // Keep it queued for the next idle/dispose retry — visibly.
+        this.diagnostics.warn('autopilot.cleanup', error, { selectionId })
+      }
     }
     if (pending.size === 0) this.autopilotCleanup.delete(sourceSessionId)
   }
@@ -424,12 +504,13 @@ export class VerifierHost {
         + (record.margin !== undefined ? '（margin ' + record.margin.toFixed(4) + ' / 阈值 ' + (record.marginThreshold ?? 'n/a') + (record.marginProvisional ? '，临时' : '') + '）' : '')
         + '。loser/淘汰候选已回收（会话与工作区均已删除）。保留对象的工作区位于 ' + slot.workspace + '，面板里可"丢弃 winner"彻底清理。此消息为结算通知，无需回复。'
       : '[Selection 结算] ' + record.selectionId + ' 结束：status=' + record.status + (record.outcome ? '，outcome=' + record.outcome : '') + (record.error ? '（' + record.error + '）' : '') + '，候选已全部回收。此消息为结算通知，无需回复。'
+    const failed = (error: unknown): void => this.diagnostics.warn('selection.notice', error, { selectionId: record.selectionId })
     try {
       void Promise.resolve(agent.followup(createUserMessage({
         source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/selection', form: 'notice', summary: boundContextSummary('选择结算：' + record.selectionId) },
         content: [{ type: 'text', text }],
-      }))).catch(() => undefined)
-    } catch { /* notice failures are silent by design */ }
+      }))).catch(failed)
+    } catch (error) { failed(error) /* a notice never disturbs accounting; it is still reported */ }
   }
 
   start(): void {
@@ -437,12 +518,16 @@ export class VerifierHost {
     this.started = true
     this.loadHistory()
     for (const agent of this.ctx.agents?.list() ?? []) this.attach(agent)
-    const events = this.ctx as unknown as { on: (name: string, handler: (...args: any[]) => any, options?: { prepend?: boolean }) => (() => void) | void }
-    const created = events.on('agent/created', payload => this.attach(payload?.agent))
+    const events = requireHookSource(this.ctx, 'host context')
+    const created = events.on('agent/created', (payload: { agent?: Agent } | undefined) => this.attach(payload?.agent))
     if (typeof created === 'function') this.disposers.push(created)
-    const disposed = events.on('agent/disposed', payload => this.detach(payload?.agent))
+    const disposed = events.on('agent/disposed', (payload: { agent?: { id?: string } } | undefined) => this.detach(payload?.agent))
     if (typeof disposed === 'function') this.disposers.push(disposed)
     this.recoverAutopilotRelays()
+    // Storage hygiene runs off the critical path: candidate directories a
+    // previous process left behind are reclaimed (or reported) in the
+    // background; the result lands in diagnostics, never in start().
+    void this.selections.reclaimOrphanWorkspaces()
   }
 
   /** Reload recovery (live incident sel-ac04cfd7, 2026-09-09): a plugin hot
@@ -467,16 +552,18 @@ export class VerifierHost {
       this.autopilotCleanup.set(sourceId, pending)
       record.timing = { ...(record.timing ?? {}), relayedAt: Date.now() }
       this.selections.pubRecord(record)
+      this.diagnostics.count('autopilot.relay_recovered')
       void Promise.resolve(agent.followup(createUserMessage({
         source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
         content: [{ type: 'text', text: buildAutopilotRelay(record) }],
-      }))).catch(() => undefined)
+      }))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId: record.selectionId, recovered: true }))
     }
   }
 
   async dispose(): Promise<void> {
     if (this.disposed) return
     this.disposed = true
+    this.unsubscribeDiagnostics()
     this.coordinator.dispose()
     for (const dispose of this.disposers.splice(0)) { try { dispose() } catch { /* isolated */ } }
     for (const unsubscribe of this.agentListeners.values()) { try { unsubscribe() } catch { /* isolated */ } }
@@ -515,7 +602,9 @@ export class VerifierHost {
    *  operations: listener exceptions are contained here. */
   private emit(): void {
     for (const listener of [...this.listeners]) {
-      try { listener() } catch { /* subscriber exceptions are isolated */ }
+      // Counted, never warned: a warning re-enters emit() through the
+      // diagnostics subscription, so a throwing listener would loop forever.
+      try { listener() } catch { this.diagnostics.count('host.subscriber_error') }
     }
   }
 
@@ -524,13 +613,25 @@ export class VerifierHost {
     // Candidate children (parentSession set) belong to the best-of-N selection
     // path: legacy auto verification + feedback followups there would contaminate
     // the trajectories select() compares. Manual /verify stays available.
-    if ((agent.session as { header?: { parentSession?: string } }).header?.parentSession) return
+    if (agent.session.header?.parentSession) return
     const id = String(agent.id)
     if (this.agents.has(id)) return
+    // An agent whose scoped context has no hook surface can never report
+    // idle or reach pre-step through us; registering it would only create a
+    // session the scheduler can never run. Report and skip.
+    if (!isHookSource(agent.ctx)) {
+      this.diagnostics.warn('agent.attach', 'agent context exposes no on(); status and pre-step hooks were not installed', { agent: id })
+      return
+    }
     this.agents.set(id, agent)
-    const scoped = agent.ctx as unknown as { on: (name: string, handler: (...args: any[]) => any, options?: { prepend?: boolean }) => (() => void) | void }
-    const status = scoped.on('agent/status', payload => this.handleStatus(agent, payload))
-    const preStep = scoped.on('agent/pre-step', (payload, next) => this.handleAutopilotPreStep(agent, payload, next), { prepend: true })
+    // Widen to the plugin's hook view: the cordis Context type only knows the
+    // events declared at its own link time, not DSH's agent events.
+    const scoped: HookSource = agent.ctx
+    const status = scoped.on('agent/status', (payload: { status?: string } | undefined) => this.handleStatus(agent, payload))
+    const preStep = scoped.on('agent/pre-step', (
+      payload: { messages: UserMessage[]; turn: number; step: number; signal: AbortSignal },
+      next: () => Promise<{ kind: 'reject' } | { kind: 'enter'; messages: UserMessage[] }>,
+    ) => this.handleAutopilotPreStep(agent, payload, next), { prepend: true })
     this.agentListeners.set(id, () => {
       if (typeof status === 'function') status()
       if (typeof preStep === 'function') preStep()
@@ -653,6 +754,7 @@ export class VerifierHost {
               else record.feedbackSent = true
             } catch (error) {
               record.feedbackError = error instanceof Error ? error.message.slice(0, 240) : String(error).slice(0, 240)
+              this.diagnostics.count('verifier.feedback_failed')
             }
           }
         }
@@ -684,12 +786,15 @@ export class VerifierHost {
   }
 
   snapshot(): StateResponse {
-    return { config: cleanConfig(this.config), agents: this.agents.size, records: this.records.slice(0, 20), selection: this.selections.snapshot() }
+    return { config: { ...this.config }, agents: this.agents.size, records: this.records.slice(0, 20), selection: this.selections.snapshot(), diagnostics: this.diagnostics.snapshot() }
   }
+
+  /** The degradation ledger behind `/state`, for tests and embedded hosts. */
+  getDiagnostics(): Diagnostics { return this.diagnostics }
 
   private loadHistory(): void {
     if (!this.recordsFile) return
-    const loaded = loadPersistedRecords(this.recordsFile)
+    const loaded = loadPersistedRecords(this.recordsFile, this.diagnostics)
     if (loaded.length > 0) this.records.unshift(...loaded)
     this.records.splice(VERIFICATION_HISTORY_LIMIT)
   }
@@ -697,7 +802,7 @@ export class VerifierHost {
   private persist(record: RecordState): void {
     if (!this.recordsFile) return
     try { appendJsonlLedger(this.recordsFile, record) }
-    catch { /* observability must never break verification */ }
+    catch (error) { this.diagnostics.warn('records.append', error, { file: this.recordsFile, recordId: record.id }) }
   }
 
   /** Newest-first history view with optional filters for the /records endpoint. */

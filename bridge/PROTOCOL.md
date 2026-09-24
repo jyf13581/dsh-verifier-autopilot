@@ -2,6 +2,15 @@
 
 This document describes the JSON Lines protocol used by the llm_verifier_sidecar.py sidecar.
 
+## Canonical fixtures
+
+`bridge/protocol-fixtures.json` holds one canonical frame per request and
+response type, one failure frame per error code, malformed results the bridge
+must reject, and the offline conformance cases the sidecar must satisfy. It is
+consumed by `bridge/self_test.py`, the TypeScript bridge tests, and the stub
+sidecar used by those tests; a change to this document is made there as well,
+and the tests check that the two agree (error codes, request keys, result keys).
+
 ## Overview
 
 The sidecar is a long-lived process that reads JSON Lines from stdin and writes JSON Lines to stdout.
