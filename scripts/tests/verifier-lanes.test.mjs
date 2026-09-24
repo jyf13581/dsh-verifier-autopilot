@@ -84,6 +84,18 @@ test("phase0: permanent 4xx provider answers are not retried", async () => {
   } finally { mock.restore() }
 })
 
+test("phase0: a rejected request whose error body is not an object still reports the HTTP status", async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: false, status: 400, json: async () => ({ error: "nope" }) })
+  try {
+    const result = await verifyRoute(testConfig, testCredentials, "prompt", 1)
+    assert.equal(result.ok, false)
+    assert.equal(result.errorCode, "http_rejected")
+    assert.equal(result.error, "HTTP 400", "a string `error` has no message field: fall back to the status")
+    assert.equal(result.retried, undefined)
+  } finally { globalThis.fetch = original }
+})
+
 test("phase0: 429 rate limits stay transient and retry once", async () => {
   const mock = mockFetchSequence([429, successBody])
   try {

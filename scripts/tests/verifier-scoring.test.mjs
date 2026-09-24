@@ -117,6 +117,36 @@ test("scores embedded only in reasoning_content are recovered with its logprobs"
   } finally { restore() }
 })
 
+test("malformed logprob entries degrade to a classified lane failure, never a thrown TypeError", async () => {
+  // Provider bodies are read through payload.ts: a null/scalar position keeps
+  // its index slot with an empty token and distribution, so the lane reports
+  // the scoring problem (missing_score_logprobs, non-retriable) instead of
+  // crashing into the catch-all `request_failed` path that would retry it.
+  const content = "<score_A> K </score_A>" + LF + "<score_B> M </score_B>"
+  const restore = mockFetch({ choices: [{ finish_reason: "stop", message: { role: "assistant", content }, logprobs: { content: [null, "K", 7, { token: "<score_A>", top_logprobs: null }, { top_logprobs: [null, { token: "K" }] }] } }] })
+  try {
+    const result = await verifyRoute(testConfig, testCredentials, "prompt", 2)
+    assert.equal(result.ok, false)
+    assert.equal(result.errorCode, "missing_score_logprobs")
+    assert.equal(result.logprobs, true, "positions were present, just unusable")
+    const fallback = await verifyRoute(Object.assign({}, testConfig, { allowLabelFallback: true }), testCredentials, "prompt", 2)
+    assert.equal(fallback.ok, true)
+    assert.equal(fallback.scoreSource, "label", "label fallback still reads the explicit letters")
+  } finally { restore() }
+})
+
+test("bodies without an array of choices are incomplete responses, not throws", async () => {
+  for (const body of [{}, { choices: null }, { choices: "K" }, { choices: [null] }, { choices: [{ message: "plain", logprobs: 3 }] }]) {
+    const restore = mockFetch(body)
+    try {
+      const result = await verifyRoute(testConfig, testCredentials, "prompt", 3)
+      assert.equal(result.ok, false, JSON.stringify(body))
+      assert.equal(result.errorCode, "incomplete_response", JSON.stringify(body))
+      assert.equal(result.logprobs, false)
+    } finally { restore() }
+  }
+})
+
 test("allowLabelFallback accepts explicit letters with degraded scoreSource", async () => {
   const restore = mockFetch({ choices: [{ finish_reason: "stop", message: { role: "assistant", content: "<score_A> K </score_A>" + LF + "<score_B> M </score_B>" } }] })
   try {

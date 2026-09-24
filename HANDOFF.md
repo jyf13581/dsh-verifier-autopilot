@@ -153,7 +153,7 @@
 - src/client/index.ts：Verifier 与 Candidate selection 面板。
 - bridge/llm_verifier_sidecar.py：上游 llm_verifier 的 select/progress/preflight 适配和 usage。
 - bridge/PROTOCOL.md：sidecar wire contract。
-- scripts/tests/*.test.mjs：离线回归按领域拆成 15 个文件（evidence / verifier-scoring / verifier-lanes / host / api / config / repair-v2 / bridge / selection-runner / selection-host / autopilot / workspaces / storage / process-checks / diagnostics），共享夹具在 scripts/tests/helpers/；`npm test` = `node --test "scripts/tests/*.test.mjs"`，每个文件独立进程，可单独运行。sidecar 协议帧的唯一来源是 bridge/protocol-fixtures.json（self_test.py、stub sidecar、bridge 测试三方共用）。
+- scripts/tests/*.test.mjs：离线回归按领域拆成 16 个文件（evidence / verifier-scoring / verifier-lanes / host / api / config / repair-v2 / bridge / selection-runner / selection-host / autopilot / workspaces / storage / process-checks / diagnostics / payload），共享夹具在 scripts/tests/helpers/；`npm test` = `node --test "scripts/tests/*.test.mjs"`，每个文件独立进程，可单独运行。sidecar 协议帧的唯一来源是 bridge/protocol-fixtures.json（self_test.py、stub sidecar、bridge 测试三方共用）。
 
 ## 2. 当前生产契约
 

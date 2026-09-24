@@ -7,7 +7,7 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
-import { compactTrace, auditFindingCitation, traceFor, renderEventTexts, turnGateDecision, isBareContinuationPrompt, auditAggregateCitations, feedbackSentCount } from "../../lib/index.js"
+import { compactTrace, auditFindingCitation, traceFor, turnBounds, renderEventTexts, turnGateDecision, isBareContinuationPrompt, auditAggregateCitations, feedbackSentCount } from "../../lib/index.js"
 import { buildVerifierPrompt } from "../../lib/verifier.js"
 import { LF } from "./helpers/harness.mjs"
 
@@ -514,6 +514,57 @@ test("structured payloads fall back through flattening to JSON", () => {
   assert.ok(callLine !== undefined && callLine.includes("ls -la") && callLine.includes("{"), "object arguments serialize via JSON fallback")
   assert.ok(rendered.some(line => line === "TOOL RESULT: hello world"))
   assert.ok(rendered.some(line => line === "TOOL RESULT: abcd"))
+})
+
+test("non-object event payloads render through the flatten fallback and never throw", () => {
+  // Persisted logs and foreign event emitters do not guarantee an object
+  // payload. Every read is tolerant: a scalar/array/null payload reads as
+  // "no such field" and the line falls back to the flattened payload.
+  const rendered = renderEventTexts([
+    { type: "user/message", data: "hello" },
+    { type: "user/message", data: { source: "user", content: "string source is not a kind" } },
+    { type: "user/message", data: { source: ["plugin"], content: "array source is not a kind" } },
+    { type: "assistant/message", data: null },
+    { type: "assistant/message", data: { message: "plain reply" } },
+    { type: "tool/call", data: 42 },
+    { type: "tool/call", data: { name: "pwsh", tool: "not-an-object", arguments: ["ls"] } },
+    { type: "tool/result", data: [1, 2] },
+    { type: "tool/result", data: { output: "ran", error: "boom" } },
+    { type: "tool/result", data: { output: "ran", error: { code: "E_X" } } },
+    { type: "custom/event", data: "raw" },
+  ])
+  assert.deepEqual(rendered, [
+    "USER: hello",
+    "USER: string source is not a kind",
+    "USER: array source is not a kind",
+    "ASSISTANT: {}",
+    "ASSISTANT: plain reply",
+    "TOOL CALL : 42",
+    "TOOL CALL pwsh: ls",
+    "TOOL RESULT: 12",
+    "TOOL RESULT: ran ERROR: tool error",
+    "TOOL RESULT: ran ERROR: E_X",
+    "CUSTOM/EVENT: raw",
+  ])
+})
+
+test("turnBounds and traceFor tolerate scalar payloads on turn markers and tasks", () => {
+  assert.equal(turnBounds([{ type: "turn/start", seq: 1, data: 1 }, { type: "turn/end", seq: 2, data: "done" }]), undefined, "a turn/end without a numeric turn field yields no bounds")
+  const events = [
+    { type: "turn/start", seq: 1, data: { turn: 1 } },
+    { type: "user/message", seq: 2, data: "hi" },
+    { type: "assistant/message", seq: 3, data: null },
+    { type: "tool/result", seq: 4, data: { turn: "1", message: "ok" } },
+    { type: "turn/end", seq: 5, data: { turn: 1 } },
+  ]
+  const bounds = turnBounds(events)
+  assert.equal(bounds?.turn, 1)
+  const result = traceFor(events, bounds)
+  assert.equal(result.hasCurrentDirectTask, true, "a source-less user message is still a direct task")
+  assert.equal(result.problem, "", "a scalar payload carries no content field: the problem stays empty rather than inventing one")
+  assert.ok(result.trace.includes("USER: hi"), "the scalar payload renders through the fallback: " + result.trace)
+  assert.ok(result.trace.includes("TOOL RESULT: ok"), result.trace)
+  assert.equal(feedbackSentCount(events), 0)
 })
 
 test("phase0: a late event tagged with the finished turn cannot sneak past the completed-turn seq seal", () => {

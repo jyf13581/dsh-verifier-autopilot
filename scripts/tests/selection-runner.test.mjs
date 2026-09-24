@@ -375,6 +375,22 @@ test("winner gate: verifier outage with full objective pass degrades to verifier
   assert.equal(record.winner, undefined, "a broken verifier must never fabricate a winner (sel-ac011a39)")
 })
 
+test("selection: a turn-error whose message is not a string still fails the candidate cleanly", async () => {
+  const errorEvents = [
+    { type: "user/message", seq: 0, data: { content: [{ type: "text", text: "task" }], source: { kind: "user" } } },
+    { type: "turn/start", seq: 1, data: { turn: 1 } },
+    { type: "turn/end", seq: 4, data: { turn: 1, reason: { kind: "error", error: { message: { code: 42 } } } } },
+  ]
+  const factory = makeFakeFactory({ scripts: { 2: { events: errorEvents } } })
+  const bridge = fakeBridge()
+  const runner = new SelectionRunner({ factory, workspaces: realWorkspaces, bridge })
+  const { record } = await runner.run(selInput({}))
+  assert.equal(record.candidates[2].status, "failed")
+  assert.equal(record.candidates[2].error, "turn-error", "a non-string message is omitted, not sliced")
+  assert.equal(record.status, "completed")
+  assert.equal(bridge.calls.length, 1, "the two healthy rollouts are still compared")
+})
+
 test("selection: a candidate whose turn ends in error is failed, never sent to the verifier", async () => {
   const errorEvents = [
     { type: "user/message", seq: 0, data: { content: [{ type: "text", text: "task" }], source: { kind: "user" } } },
@@ -460,6 +476,29 @@ test("trajectory: fromSeq drops the seed prefix from the rendered evidence", () 
   const r = renderTrajectory(events, { fromSeq: 2 })
   assert.ok(!r.text.includes("seeded history"), "seed events stay out of the candidate trajectory")
   assert.ok(r.text.includes("own task"))
+})
+
+test("trajectory: scalar and null payloads read as absent fields, never throw", () => {
+  const r = renderTrajectory([
+    { type: "user/message", seq: 1, data: "hi" },
+    { type: "user/message", seq: 2, data: { source: "plugin", content: "string source is not a kind" } },
+    { type: "assistant/message", seq: 3, data: { message: "plain" } },
+    { type: "tool/call", seq: 4, data: null },
+    { type: "tool/call", seq: 5, data: { name: 7, arguments: "ls" } },
+    { type: "tool/result", seq: 6, data: "ok" },
+    { type: "tool/result", seq: 7, data: { message: "no content field" } },
+    { type: "turn/end", seq: 8, data: 1 },
+  ])
+  assert.equal(r.eventCount, 8)
+  assert.deepEqual(r.text.split(String.fromCharCode(10)), [
+    "[E01] USER: string source is not a kind",
+    "[E02] TOOL CALL unknown: ",
+    "[E03] TOOL CALL 7: ls",
+    "[E04] TOOL RESULT: ok",
+    '[E05] TOOL RESULT: {"message":"no content field"}',
+  ])
+  assert.equal(r.toolCalls, 2)
+  assert.equal(r.execToolCalls, 2)
 })
 
 test("selrunner: progressGuard abandons a stalled hopeless candidate early, others proceed", async () => {

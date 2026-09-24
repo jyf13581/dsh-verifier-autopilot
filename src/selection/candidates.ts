@@ -19,6 +19,7 @@ import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnost
 import { rmdir } from 'node:fs/promises'
 import path from 'node:path'
 import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
+import { read, readString } from '../payload.js'
 import { boundCandidateHandoff, renderTrajectory, type TrajectoryEvent } from './trajectory.js'
 import { runChecks, type CheckResult, type ObjectiveCheck } from './checks.js'
 export type { CheckResult, ObjectiveCheck } from './checks.js'
@@ -686,10 +687,10 @@ export class SelectionRunner {
             // failed candidate, not a finished one — never feed it to the
             // verifier as if it were a real rollout.
             const tail = agent.session.events.slice(preRunCount)
-            const bad = tail.filter((ev) => ev.type === 'turn/end' && ((ev.data ?? {}) as { reason?: { kind?: string } }).reason?.kind === 'error')
+            const bad = tail.filter((ev) => ev.type === 'turn/end' && read(ev.data, 'reason', 'kind') === 'error')
             if (bad.length > 0) {
               cand.status = 'failed'
-              const reason = ((bad[bad.length - 1].data ?? {}) as { reason?: { error?: { message?: string } } }).reason?.error?.message
+              const reason = readString(bad[bad.length - 1].data, 'reason', 'error', 'message')
               cand.error = 'turn-error' + (reason ? ': ' + reason.slice(0, 160) : '')
             } else {
               cand.status = 'finished'

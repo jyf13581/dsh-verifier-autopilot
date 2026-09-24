@@ -36,6 +36,7 @@ import { retryTransientBridge, type RetrySleep } from './retry.js'
 import { appendJsonlLedger, atomicWriteFile, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from '../ledger.js'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 import type { AgentCreate } from '../dsh-context.js'
+import { read } from '../payload.js'
 import type { SelectionSnapshot, SelectionStartRequest } from '../protocol.js'
 
 /** Source-session lookup for manual runs: the seed cut, the problem text, and
@@ -244,9 +245,9 @@ export function problemFromEvents(events: readonly TrajectoryEvent[]): string | 
   for (let i = events.length - 1; i >= 0; i -= 1) {
     const ev = events[i]
     if (ev.type !== 'user/message') continue
-    const src = ((ev.data ?? {}) as { source?: { kind?: string } }).source ?? {}
-    if (src.kind && src.kind !== 'user') continue
-    const text = messageText((ev.data ?? {})['content'])
+    const sourceKind = read(ev.data, 'source', 'kind')
+    if (sourceKind && sourceKind !== 'user') continue
+    const text = messageText(read(ev.data, 'content'))
     if (text.trim()) return text.slice(0, 8000)
   }
   return undefined

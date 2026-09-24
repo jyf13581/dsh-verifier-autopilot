@@ -1,4 +1,5 @@
 import type { Config } from './config.js'
+import { read, readArray, readString } from './payload.js'
 import { normalizeBaseUrl, redactSecrets, resolveKey, type Credentials } from './util.js'
 
 export { normalizeBaseUrl, redactSecrets, resolveKey } from './util.js'
@@ -242,19 +243,21 @@ async function verifyRouteOnce(config: Config, credentials: Credentials | undefi
       }),
       signal: composeRequestSignal(config, options),
     })
-    const body = await response.json().catch(() => ({})) as Record<string, any>
+    // The provider body is untyped JSON: every field below is read tolerantly
+    // (payload.ts), so a shape surprise degrades to a classified lane failure
+    // instead of a TypeError swallowed by the catch-all.
+    const body: unknown = await response.json().catch(() => ({}))
     if (!response.ok) {
       // Retry taxonomy: only transient transport conditions (server faults,
       // rate limits, request timeouts) may retry. Permanent client failures —
       // bad model name, rejected auth, malformed request — never retry.
       const transient = response.status >= 500 || response.status === 429 || response.status === 408
-      return { route, ok: false, httpStatus: response.status, errorCode: transient ? 'provider_error' : 'http_rejected', error: String(body.error?.message ?? 'HTTP ' + response.status).slice(0, 240), durationMs: Date.now() - started }
+      return { route, ok: false, httpStatus: response.status, errorCode: transient ? 'provider_error' : 'http_rejected', error: String(read(body, 'error', 'message') ?? 'HTTP ' + response.status).slice(0, 240), durationMs: Date.now() - started }
     }
-    const choice = body.choices?.[0]
-    const message = choice?.message ?? {}
-    const content = typeof message.content === 'string' ? message.content : ''
-    const reasoning = typeof message.reasoning_content === 'string' ? message.reasoning_content : ''
-    const finishReason = String(choice?.finish_reason ?? '')
+    const choice: unknown = readArray(body, 'choices')[0]
+    const content = readString(choice, 'message', 'content') ?? ''
+    const reasoning = readString(choice, 'message', 'reasoning_content') ?? ''
+    const finishReason = String(read(choice, 'finish_reason') ?? '')
     const hasScorePair = (value: string): boolean => /<score_A>\s*[A-T]\s*<\/score_A>/i.test(value) && /<score_B>\s*[A-T]\s*<\/score_B>/i.test(value)
     // Pick the source containing the complete score pair FIRST, then read the
     // token positions from that same source. Mixing a content-first position
@@ -264,21 +267,21 @@ async function verifyRouteOnce(config: Config, credentials: Credentials | undefi
     const reasoningHasPair = hasScorePair(reasoning)
     const text = contentHasPair ? content : reasoningHasPair ? reasoning : content || reasoning
     const source: RouteResult['reasoningSource'] = contentHasPair ? 'content' : reasoningHasPair ? 'reasoning_content' : content ? 'content' : reasoning ? 'reasoning_content' : 'none'
-    const lp = choice?.logprobs ?? {}
-    const rawPositions = source === 'content'
-      ? (Array.isArray(lp.content) && lp.content.length > 0 ? lp.content : [])
+    const rawPositions: unknown[] = source === 'content'
+      ? readArray(choice, 'logprobs', 'content')
       : source === 'reasoning_content'
-        ? (Array.isArray(lp.reasoning_content) && lp.reasoning_content.length > 0 ? lp.reasoning_content : [])
+        ? readArray(choice, 'logprobs', 'reasoning_content')
         : []
     if (finishReason !== 'stop') return { route, ok: false, httpStatus: response.status, content: text.slice(-1200), reasoningSource: source, logprobs: rawPositions.length > 0, finishReason, errorCode: 'incomplete_response', error: 'verifier response did not stop normally', durationMs: Date.now() - started }
     const completeA = /<score_A>\s*[A-T]\s*<\/score_A>/i.test(text)
     const completeB = /<score_B>\s*[A-T]\s*<\/score_B>/i.test(text)
     if (!completeA || !completeB) return { route, ok: false, httpStatus: response.status, content: text.slice(-1200), reasoningSource: source, logprobs: rawPositions.length > 0, tagA: completeA, tagB: completeB, finishReason, errorCode: 'malformed_score_tags', error: 'score tags were not complete and paired', durationMs: Date.now() - started }
     const positions = rawPositions
-    const tokens = positions.map((position: any) => String(position.token ?? ''))
-    const distributions = positions.map((position: any) => Array.isArray(position.top_logprobs)
-      ? position.top_logprobs.map((item: any) => ({ token: String(item.token ?? ''), logprob: Number(item.logprob) }))
-      : [])
+    // Index-aligned with `positions`: a malformed entry still occupies its slot
+    // (empty token, empty distribution) so scoreFrom's tag lookup stays aligned.
+    const tokens = positions.map(position => String(read(position, 'token') ?? ''))
+    const distributions = positions.map(position => readArray(position, 'top_logprobs')
+      .map(item => ({ token: String(read(item, 'token') ?? ''), logprob: Number(read(item, 'logprob')) })))
     const a = scoreFrom(text, tokens, distributions, '<score_A>')
     const b = scoreFrom(text, tokens, distributions, '<score_B>')
     if (!a.found || !b.found) return { route, ok: false, httpStatus: response.status, content: text.slice(-1200), reasoningSource: source, logprobs: positions.length > 0, tagA: a.found, tagB: b.found, finishReason, errorCode: 'missing_score_tags', error: 'score tags were not found', durationMs: Date.now() - started }

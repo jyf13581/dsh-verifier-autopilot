@@ -41,6 +41,8 @@ test("selhost: problemFromEvents takes the latest direct user task, skipping plu
   ]
   assert.equal(problemFromEvents(events), "latest task")
   assert.equal(problemFromEvents([{ type: "user/message", seq: 1, data: { source: { kind: "plugin" }, content: "x" } }]), undefined)
+  assert.equal(problemFromEvents([{ type: "user/message", seq: 1, data: "scalar" }, { type: "user/message", seq: 2, data: null }]), undefined, "scalar payloads carry no content and never throw")
+  assert.equal(problemFromEvents([{ type: "user/message", seq: 1, data: { source: "plugin", content: "kept" } }]), "kept", "a string source has no kind and does not demote the message")
 })
 
 test("selhost: manual /select releases live winner while retaining workspace and session", async () => {

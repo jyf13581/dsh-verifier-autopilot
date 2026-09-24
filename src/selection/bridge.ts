@@ -10,6 +10,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
+import { isRecord } from '../payload.js'
 
 /** Error codes the sidecar may put in a failure frame (bridge/PROTOCOL.md
  *  "Error Codes"). The protocol fixtures test keeps this list and the
@@ -164,10 +165,6 @@ export interface BridgeProgressResult {
 // inside a mapping, never a half-typed object handed to the runner. Verdict-
 // bearing fields (index, scores, ranking, comparisons, criteria) are strict;
 // usage is telemetry and degrades to zeros rather than failing a verdict.
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
 
 function protocolError(what: string): BridgeError {
   return new BridgeError('bridge_protocol', 'sidecar result malformed: ' + what, false)

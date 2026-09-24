@@ -38,14 +38,15 @@ implementation code.
 | `src/ledger.ts` | Shared versioned JSONL reading/appending/compaction and same-directory atomic replacement. |
 | `src/diagnostics.ts` | Bounded, redacted degradation ledger (warnings ring + counters). Every layer reports its best-effort failures here; the snapshot rides in `/state`. Leaf: imports only `util`. |
 | `src/dsh-context.ts` | Runtime-checked views of the DSH/cordis contexts the plugin is handed: the hook surface (`on`), an agent's scoped context (`get`, session append), and the one `create` call into the agent registry. Type predicates, no casts. Leaf: imports nothing. |
+| `src/payload.ts` | Checked readers for schemaless JSON (`read`, `readArray`, `readString`, `isRecord`) and the one declared session-event shape (`EventRecord`, `data?: unknown`) that evidence, coordinator, and selection trajectories share. Every read is total and returns `unknown`; no payload field is ever reached through `any`. Leaf: imports nothing. |
 
 ### Legacy verifier path
 
 | Module | Responsibility |
 | --- | --- |
 | `src/host.ts` | Runtime lifecycle, session subscriptions, scheduling, state snapshots, feedback delivery, persistence, and ownership of `SelectionHost`. |
-| `src/coordinator.ts` | Per-session ordering, deduplication, cancellation, and verification scheduling. |
-| `src/evidence.ts` | Pure event rendering, task attribution, turn gates, trace compaction, and citation audits. |
+| `src/coordinator.ts` | Per-session ordering, deduplication, cancellation, and verification scheduling. `ScheduledEvent` is the shared `EventRecord`; the coordinator never reads payloads. |
+| `src/evidence.ts` | Pure event rendering, task attribution, turn gates, trace compaction, and citation audits. Reads event payloads only through `payload.ts`, tolerant of every persisted shape. |
 | `src/verifier.ts` | Verifier prompts, lane calls, score parsing, aggregation, and feedback decisions. It compatibility-re-exports boundary helpers now owned by `src/util.ts`. |
 | `src/api.ts` | HTTP/SSE transport only: routing, body parsing, rate limits, response serialization, and delegation to Host methods. |
 
@@ -104,9 +105,10 @@ Follow these rules:
 3. **`protocol.ts` must not import Host, API, or browser runtime modules.** Its
    domain imports are type-only so the browser cannot pull Node code into the
    bundle.
-4. **`constants.ts`, `util.ts`, `ledger.ts`, and `evidence.ts` remain
-   dependency-light.** They are reusable boundaries, not alternate composition
-   roots.
+4. **`constants.ts`, `util.ts`, `ledger.ts`, `payload.ts`, and `evidence.ts`
+   remain dependency-light.** They are reusable boundaries, not alternate
+   composition roots (`evidence.ts` imports only `constants` and the payload
+   readers at runtime).
 5. **Selection implementation must not depend on legacy-verifier scheduling or
    feedback internals.** Integration happens through `VerifierHost` ownership,
    shared utilities/persistence, and typed snapshots.
@@ -148,29 +150,39 @@ Follow these rules:
     tracked file list from stdin and returns raw bytes for shell-free diffs).
 
 11. **Type seams are declared once and checked at runtime, never cast.**
-    Three kinds of value enter the plugin without a compile-time type: DSH
+    Four kinds of value enter the plugin without a compile-time type: DSH
     contexts and agents (DSH augments the cordis event map and brands its
     identifiers at link time, which this build does not see), sidecar frames
-    (JSON Lines from a Python process), and provider bodies (`fetch().json()`).
-    Each has exactly one narrowing point: `dsh-context.ts` type predicates
+    (JSON Lines from a Python process), provider bodies (`fetch().json()`),
+    and session event payloads (persisted logs span schema versions:
+    source-less user messages, `message` vs `content` bodies). Each has
+    exactly one narrowing point: `dsh-context.ts` type predicates
     (`isHookSource`, `isAgentScope`, `requireHookSource`) for contexts,
     `bridge.ts` frame parsers (`parseHealthResult`, `parseSelectResult`,
     `parseProgressResult`, `parseErrorFrame`) for the sidecar — a shape the
     protocol does not allow is a `bridge_protocol` error, never a `TypeError`
-    inside a mapping — and `validateConfigPatch()` for configuration, which
+    inside a mapping — `validateConfigPatch()` for configuration, which
     builds an untyped record against the schema-derived field table and takes
-    the `Config` type in one documented place. A cast through `never`, `any`,
-    or `unknown` (`x as never`, `x as any`, `x as unknown as T`) re-opens a
-    seam at an arbitrary call site with no check behind it; the architecture
-    gate rejects every occurrence in `src/`. Narrow with a predicate or a
-    parser, or widen the declared interface (as `HostContext.agents.create`
-    and `SelectionsAgentProvider` were) so the structural types actually meet.
+    the `Config` type in one documented place, and the `payload.ts` readers
+    for event `data` and provider bodies, which are `unknown` from the first
+    line and stay `unknown` until a call site says what it expects (a
+    malformed logprob entry is `missing_score_logprobs`, not a `TypeError`
+    retried as `request_failed`). A cast through `never` or `unknown`
+    (`x as never`, `x as unknown as T`) re-opens a seam at an arbitrary call
+    site with no check behind it, and an explicit `any` anywhere — a cast, a
+    type argument such as `Record<string, any>`, a parameter or property
+    annotation — turns every later read into an unchecked one; the
+    architecture gate rejects every occurrence of either in `src/`. Narrow
+    with a predicate, a parser, or a reader, or widen the declared interface
+    (as `HostContext.agents.create` and `SelectionsAgentProvider` were) so the
+    structural types actually meet.
 
 A cycle is a design signal. Move a shared shape to `protocol.ts`, a generic
 boundary helper to `util.ts`, or a persistence primitive to `ledger.ts` rather
 than introducing a reciprocal import. `npm run check:architecture` parses the
 TypeScript module graph, rejects runtime **and type-only** cycles, enforces
-these layer restrictions, and rejects blind casts (rule 11) in CI.
+these layer restrictions, and rejects blind casts and explicit `any` (rule 11)
+in CI.
 
 ## 4. Evidence boundary: verification is not selection
 
@@ -444,7 +456,7 @@ What each gate covers:
 
 - `check:architecture`: parses project imports, enforces allowed layer
   directions, rejects runtime or type-only module cycles, and rejects blind
-  casts (`as never`, `as any`, `as unknown as`) anywhere in `src/`.
+  casts (`as never`, `as unknown as`) and explicit `any` anywhere in `src/`.
 - `typecheck`: strict Host and client TypeScript checking without emit.
 - `build:host`: emits Node modules, source maps, and declarations to `lib/`.
 - `build:client`: bundles `src/client/index.ts` as the DSH browser module in
@@ -482,6 +494,7 @@ scripts/tests/
   storage.test.mjs           settlement ledger, running rows, artifact GC
   process-checks.test.mjs    bounded process runner, check shell chain, portability
   diagnostics.test.mjs       degradation sink, redaction, /events, leaf boundary
+  payload.test.mjs           checked JSON readers: total reads, array/string narrowing
   helpers/                   harness (timing, rejection collector), provider (mocked
                              verifier), host (fake DSH context), selection (fake
                              factories/bridges, real workspaces), sidecar, git
@@ -533,6 +546,7 @@ must remain untracked.
 | Objective check | `src/selection/checks.ts` | Request validation and audit output |
 | Sidecar protocol | `bridge/protocol-fixtures.json` + `bridge/PROTOCOL.md` first, then `src/selection/bridge.ts` + `bridge/llm_verifier_sidecar.py` | `bridge/self_test.py`, `scripts/tests/bridge.test.mjs`, the stub sidecar |
 | DSH context shape (hooks, agent registry, scoped services) | `src/dsh-context.ts` | `HostContext` in `host.ts`, live adapter in `selection/live.ts` |
+| Reading a new field from event payloads or provider bodies | the call site, via `src/payload.ts` readers | `EventRecord` in `payload.ts` only if the envelope changes; tolerance tests in the reading domain |
 | History format/compaction | `src/ledger.ts` | Both Hosts, migration/reload tests |
 | Credential/URL/redaction behavior | `src/util.ts` | Compatibility export and boundary tests |
 | Browser presentation only | `src/client/index.ts` | Client build; no server-domain import |

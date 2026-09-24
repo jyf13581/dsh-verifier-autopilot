@@ -19,7 +19,11 @@
  *   and pending entries so stale callbacks cannot start anything new.
  */
 
-export interface ScheduledEvent { type: string; seq?: number; time?: number; data?: any }
+import type { EventRecord } from './payload.js'
+
+/** The session event shape the coordinator keys turns on; the coordinator
+ *  never reads `data` itself. */
+export type ScheduledEvent = EventRecord
 
 export type TurnBounds = { start: ScheduledEvent; end: ScheduledEvent; turn: number }
 
