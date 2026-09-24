@@ -105,9 +105,18 @@ export function isHarnessError(outputTail: string): boolean {
   return HARNESS_ERROR_PATTERNS.some((pattern) => pattern.test(outputTail))
 }
 
+/** Words that are grammar, not programs, in sh or PowerShell. PowerShell's
+ *  flow keywords (`exit`, `return`, `throw`…) are NOT resolvable by
+ *  Get-Command, so without this list an ordinary `exit 3` check would be
+ *  excused as a harness error under pwsh (caught by CI, which runs pwsh). */
 const SHELL_KEYWORDS = new Set([
-  'if', 'then', 'else', 'elif', 'fi', 'for', 'foreach', 'while', 'until', 'do', 'done', 'case', 'esac',
-  'function', 'try', 'catch', 'finally', 'switch', 'param', 'begin', 'process', 'end', '!', '{', '}', '(', ')',
+  // sh
+  'if', 'then', 'else', 'elif', 'fi', 'for', 'while', 'until', 'do', 'done', 'case', 'esac', 'in', 'function',
+  'exit', 'return', 'break', 'continue', 'exec', 'eval', 'set', 'unset', 'export', 'readonly', 'local', 'trap', 'time',
+  // PowerShell
+  'elseif', 'foreach', 'switch', 'try', 'catch', 'finally', 'throw', 'param', 'begin', 'process', 'end', 'dynamicparam',
+  'filter', 'workflow', 'class', 'enum', 'using', 'data', 'hidden', 'static', 'configuration', 'parallel', 'sequence', 'inlinescript',
+  '!', '{', '}', '(', ')',
 ])
 
 /** The operator-named program a check starts with, when that is a plain
@@ -124,7 +133,9 @@ export function leadingCommandWord(command: string): string | null {
   if (quoted) word = quoted[2]
   word = word.replace(/[;|&]+$/, '')
   if (!word || SHELL_KEYWORDS.has(word.toLowerCase())) return null
-  if (/[\\/$`(){}\[\]<>*?'"]/.test(word) || word.startsWith('.') || word.startsWith('-')) return null
+  if (/[\\/$`(){}\[\]<>*?'"@%,]/.test(word) || word.startsWith('.') || word.startsWith('-')) return null
+  // Ranges and numbers (`1..400`, `42`) are PowerShell expressions, not programs.
+  if (word.includes('..') || /^[\d.]+$/.test(word)) return null
   return word
 }
 

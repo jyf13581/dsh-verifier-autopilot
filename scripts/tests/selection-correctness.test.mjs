@@ -104,6 +104,14 @@ test("R2 2.2: leadingCommandWord only names plain programs", () => {
     ["if true; then x; fi", null],
     ["(cd a && make)", null],
     ["-flag", null],
+    ["exit 3", null],
+    ["return", null],
+    ["throw 'x'", null],
+    ["1..400 | ForEach-Object { 'noise' }", null],
+    ["42", null],
+    ["@(1,2) | Measure-Object", null],
+    ["7z x a.zip", "7z"],
+    ["Write-Output hi", "Write-Output"],
     ["", null],
   ]
   for (const [input, expected] of cases) assert.equal(leadingCommandWord(input), expected, JSON.stringify(input))
