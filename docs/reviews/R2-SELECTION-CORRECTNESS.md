@@ -4,7 +4,7 @@
 - 计划：`docs/REVIEW-PLAN-2026-09-24.md` §R2
 - 回归测试：`scripts/tests/selection-correctness.test.mjs`（11 个测试；每条发现至少对应一条断言，检查类测试同时适配 sh 和 pwsh 两种方言）
 - 门禁：`check:architecture`、`typecheck`、`build:host`、`build:client` 全绿；`npm test` **271/271**（R1 之后 260，新增 11；原有 260 条一条未改）；`bridge/self_test.py` 13 PASS / 1 SKIP；`git diff --check` 干净
-- CI：新增 `scripts/tests/reporters/github-annotations.mjs`，失败的测试会以 check annotation 的形式出现在 PR 上（本轮第一次推送时 push 触发的 CI 失败了一次，而同一 SHA 的 pull_request 触发的 CI 通过。沙箱访问不到 Actions 日志的 blob 存储，看不到失败原因，所以补了这个 reporter，见 §6）
+- CI：新增 `scripts/tests/reporters/github-annotations.mjs`：失败的测试会以 `::error` 形式出现，测试自己输出的诊断会以 `::notice` 形式出现，都显示在 PR 的 check annotation 里。沙箱访问不到 Actions 日志的 blob 存储，第一次推送后 push 触发的 CI 失败了，原因看不到，所以补了这个 reporter。它第一次运行就给出了原因：`exit 3` 在 pwsh 下被误判为 harness error（`exit` 在 PowerShell 里是语言关键字，`Get-Command` 查不到），`1..400` 这类范围表达式被当成了程序名。两处都已在 `cbab106` 修复，并补了测试
 
 ## 1. 目标与方法
 
@@ -92,7 +92,7 @@ settled record 的完整分支，按代码执行顺序排列（`requiresWork = t
 
 | 项 | 说明 | 建议 | 归属 |
 |---|---|---|---|
-| 首次推送时有一次无法解释的 CI 失败 | `e90103d` 的 push 触发 CI 失败，同一 SHA 的 pull_request 触发 CI 通过；无法读取日志。本地用人为放慢的 shell（每次启动多 0.8 s）连续跑两遍全量测试，都通过。之后又修了两个本轮代码里的小问题：查找探测不响应 abort；输出较长时 `harness:` 前缀会被截掉 | 之后的失败会以 annotation 的形式出现在 PR 上；如果复现，R4 的并发与计时审查中处理 | R4 |
+| CI 在 pwsh 和 sh 之间不确定 | 同一个 SHA（`e90103d`）的 push 触发 CI 失败，pull_request 触发 CI 通过。失败的原因是 pwsh 专有的 bug（上面已修）；通过的那次说明当时解析出的检查 shell 不是 pwsh，最可能的原因是冷启动的 pwsh 超过了 15 s 的探测超时，于是退回 sh。也就是说 CI 每次跑的方言并不固定。现在 notice 会写出 `check shell under test: …` | R6：在 CI 里固定方言，或者 sh 和 pwsh 各跑一遍 | R6 |
 | PowerShell 钩子只在 CI 上验证 | 沙箱里没有 pwsh，而且下载 pwsh 的出口被拦截。ubuntu-latest 预装 pwsh 7，本轮测试在 CI 上跑的就是 pwsh 方言（测试日志里有 `check shell under test: …` 这一行诊断）。**Windows PowerShell 5.1 没有 CI 覆盖** | R6 增加 Windows CI job | R6 |
 | 检查多一次进程启动 | 每条不同的检查命令多跑一次解析探测（跨候选、跨 run 缓存）；失败的检查再多跑一次查找探测。pwsh 冷启动约 0.3 到 1 s | 可以接受；如需优化，可在 shell 解析时预热 | 书面接受 |
 | 包装可被命令“逃逸” | 形如 `fi; rm x; if true; then` 的命令会在解析探测时于 tmpdir 下执行中间那段。命令来自操作员，而且本来就会在工作区执行，所以不构成信任边界问题 | 在 README 中注明检查命令必须是单一、自包含的命令 | 书面接受 |

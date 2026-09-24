@@ -1,5 +1,5 @@
 // node:test reporter that turns each failing test into a GitHub Actions
-// `::error` annotation. Annotations are served by the checks API and shown on
+// `::error` annotation (and each test-authored diagnostic into a `::notice`). Annotations are served by the checks API and shown on
 // the PR, so a failure is readable even where raw job logs are not (log blob
 // storage is often unreachable from sandboxes and API clients). CI runs it next
 // to the spec reporter; locally `npm test` is unchanged.
@@ -9,6 +9,12 @@ const escapeProp = (s) => escapeData(s).replace(/:/g, "%3A").replace(/,/g, "%2C"
 
 export default async function* githubAnnotations(source) {
   for await (const event of source) {
+    // Test-authored diagnostics (e.g. which check shell this runner resolved)
+    // become notices; the runner's own summary diagnostics stay in the log.
+    if (event.type === "test:diagnostic" && typeof event.data?.file === "string") {
+      yield "::notice title=test diagnostic::" + escapeData(event.data.message) + "\n"
+      continue
+    }
     if (event.type !== "test:fail") continue
     const data = event.data ?? {}
     const error = data.details?.error
