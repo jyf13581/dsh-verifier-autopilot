@@ -37,6 +37,10 @@ export interface DiffStatLite {
   deletions: number
   untracked: number
   fingerprint: string
+  /** Source work-in-progress mirrored into the workspace at start and left
+   *  untouched; excluded from files/untracked (review R3 3.7). Absent when
+   *  no start baseline exists. */
+  inherited?: number
 }
 
 export interface CandidateRecord {
@@ -51,7 +55,8 @@ export interface CandidateRecord {
   toolCalls?: number
   /** Execution-class tool calls (meta/discovery tools excluded, ruling K.4-1). */
   execToolCalls?: number
-  /** Worktree diff vs source HEAD; null when the workspace is not git. */
+  /** Candidate's own worktree changes (vs its start baseline, else HEAD);
+   *  null when the workspace is not git. */
   diffStat?: DiffStatLite | null
   /** Objective-evidence tier: pass = caller checks all ok; none = no checks,
    *  checks invalid, or never ran. A candidate eliminated by a genuine check
@@ -141,8 +146,27 @@ export interface SelectionRecord {
    * winner/fallback cleanup time. `delivered` is granted only when the audit
    * observed integration evidence; un-audited stays `unknown` forever.
    */
+  /** Source state when the relay was sent (review R3 3.3): the audit's
+   *  baseline. `concurrent` = captured alongside a recovery relay rather than
+   *  strictly before it. */
+  sourceAtRelay?: {
+    at: number
+    head: string | null
+    worktreeFingerprint: string | null
+    /** Retained-candidate files already byte-identical in the source. */
+    adoptedPaths: string[] | null
+    candidateFiles: number | null
+    concurrent?: boolean
+    error?: string
+  }
   delivery?: {
     audited: boolean
+    /** relay-adoption = attributable (R3); start-baseline = legacy. */
+    basis?: 'relay-adoption' | 'start-baseline'
+    changedSinceRelay?: boolean | null
+    /** Retained-candidate files that appeared in the source after the relay. */
+    adoptedFiles?: string[]
+    candidateFiles?: number | null
     headBefore?: string | null
     headAfter?: string | null
     headChanged?: boolean | null
@@ -336,15 +360,39 @@ export function evaluateDelivery(input: {
   dirtyEntries: number | null
   testsConfigured: boolean
   testsExit?: number | null
-}): { delivered: 'yes' | 'no' | 'unknown'; note: string } {
-  if (!input.audited) return { delivered: 'unknown', note: 'audit did not run' }
-  const integrated = input.headChanged === true || (input.dirtyEntries !== null && (input.dirtyEntries ?? 0) > 0)
-  if (!integrated) return { delivered: 'no', note: 'no HEAD advance and clean worktree at audit time' }
-  if (!input.testsConfigured) {
-    return { delivered: 'unknown', note: 'integration evidence observed; no test command configured (selectionPostAuditTestCommand) so verification is unresolved' }
+  /** Relay-time attribution (review R3 3.3). When present, integration means
+   *  "files the retained candidate changed now exist byte-for-byte in the
+   *  source and did not before the relay". Absent = legacy start-baseline
+   *  semantics, which cannot separate the relay from the source turn's own
+   *  concurrent work or from edits the user already had uncommitted. */
+  attribution?: { changedSinceRelay: boolean | null; adoptedNew: number | null; candidateFiles: number | null }
+}): { delivered: 'yes' | 'no' | 'unknown'; note: string; basis: 'relay-adoption' | 'start-baseline' } {
+  const tested = (integratedNote: string, basis: 'relay-adoption' | 'start-baseline') => {
+    if (!input.testsConfigured) {
+      return { delivered: 'unknown' as const, basis, note: integratedNote + '; no test command configured (selectionPostAuditTestCommand) so verification is unresolved' }
+    }
+    if (input.testsExit === 0) return { delivered: 'yes' as const, basis, note: integratedNote + ' and the configured test command exited 0' }
+    return { delivered: 'no' as const, basis, note: integratedNote + ' but the configured test command failed (exit ' + (input.testsExit ?? 'n/a') + ')' }
   }
-  if (input.testsExit === 0) return { delivered: 'yes', note: 'HEAD/advanced worktree integrated and the configured test command exited 0' }
-  return { delivered: 'no', note: 'integration evidence present but the configured test command failed (exit ' + (input.testsExit ?? 'n/a') + ')' }
+  const a = input.attribution
+  if (a) {
+    if (!input.audited) return { delivered: 'unknown', basis: 'relay-adoption', note: 'audit did not run' }
+    if (a.adoptedNew !== null && a.adoptedNew > 0) {
+      return tested(a.adoptedNew + ' of ' + (a.candidateFiles ?? '?') + " retained-candidate files appeared in the source after the relay", 'relay-adoption')
+    }
+    if (a.changedSinceRelay === false) return { delivered: 'no', basis: 'relay-adoption', note: 'source unchanged since the relay' }
+    return {
+      delivered: 'unknown',
+      basis: 'relay-adoption',
+      note: a.adoptedNew === null
+        ? 'adoption could not be measured; source change since relay: ' + String(a.changedSinceRelay)
+        : 'source changed after the relay but none of the ' + (a.candidateFiles ?? 0) + ' retained-candidate files appear in it (re-implemented or unrelated work; not attributable)',
+    }
+  }
+  if (!input.audited) return { delivered: 'unknown', basis: 'start-baseline', note: 'audit did not run' }
+  const integrated = input.headChanged === true || (input.dirtyEntries !== null && (input.dirtyEntries ?? 0) > 0)
+  if (!integrated) return { delivered: 'no', basis: 'start-baseline', note: 'no HEAD advance and clean worktree at audit time' }
+  return tested('HEAD advanced or worktree dirty since selection start (start-time baseline: not attributable to the relay)', 'start-baseline')
 }
 
 /** Ruling I.1: provisional margin gate. 2026-09-08 calibration round 1 (C0,
@@ -378,7 +426,10 @@ function deterministicPreface(cand: CandidateRecord, taskKind: string | undefine
   lines.push('Execution-class tool calls: ' + String(cand.execToolCalls ?? 0) + ' (catalog/meta and read-only tools excluded; raw tool-call count ' + (cand.toolCalls ?? cand.execToolCalls ?? 0) + ')')
   const d = cand.diffStat
   lines.push(d
-    ? 'Worktree diff vs source HEAD: ' + d.files + ' files changed (+' + d.insertions + ' / -' + d.deletions + '), ' + d.untracked + ' untracked files'
+    ? (d.inherited === undefined
+      ? 'Worktree diff vs source HEAD: ' + d.files + ' files changed (+' + d.insertions + ' / -' + d.deletions + '), ' + d.untracked + ' untracked files'
+      : 'Worktree changes made by this candidate: ' + d.files + ' files changed (+' + d.insertions + ' / -' + d.deletions + ' vs HEAD), ' + d.untracked + ' new files'
+        + (d.inherited > 0 ? '; ' + d.inherited + ' uncommitted source edits were inherited at start and are NOT counted' : ''))
     : 'Worktree diff: unavailable (non-git or unreadable workspace)')
   if (cand.checks && cand.checks.length > 0) {
     for (const c of cand.checks) {

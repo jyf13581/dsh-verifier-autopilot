@@ -271,7 +271,15 @@ test("autopilot pre-step: final accepted direct messages, step=1, and source idl
     const record = host.selections.listSelections()[0]
     assert.equal(record.trigger, "autopilot")
     await waitFor(() => host.selections.getSelection(record.selectionId).status !== "running")
+    // The relay follows the relay-time audit snapshot (review R3 3.3), so it
+    // lands a few git calls after settlement rather than in the same tick.
+    await waitFor(() => source.followups.some((message) => message.source.form === "relay"))
     assert.equal(source.followups.at(-1).source.form, "relay", "winner is relayed after background settlement")
+    assert.ok(host.selections.getSelection(record.selectionId).sourceAtRelay, "the audit baseline was captured before the relay")
+    // Regression (review R3): waitFor used to resolve on the placeholder that
+    // finishRun then replaced, so relayedAt never reached the stored record and
+    // a reload re-delivered the same relay.
+    assert.ok(host.selections.getSelection(record.selectionId).timing?.relayedAt, "relayedAt lands on the stored record")
     assert.deepEqual(host.selections.snapshot().retainedWinners, [record.selectionId])
     assert.ok(existsSync(record.winner.workspace), "winner survives while the source finalizer runs")
     fireIdle(source)

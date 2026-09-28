@@ -845,7 +845,13 @@ export class SelectionHost {
   async waitFor(selectionId: string, signal?: AbortSignal): Promise<SelectionRecord> {
     const current = this.getSelection(selectionId)
     if (!current) throw new SelectionApiError(404, 'selection-not-found', 'selection not found: ' + selectionId)
-    if (current.status !== 'running') return current
+    // The runner's terminal onUpdate copies status onto the placeholder before
+    // finishRun swaps in the final record object. Resolving on the placeholder
+    // hands callers a detached object whose later mutations pubRecord drops
+    // (review R3: relayedAt was never persisted), so a record only counts as
+    // settled once its run has left `active`.
+    const settled = (record: SelectionRecord) => record.status !== 'running' && this.active?.selectionId !== selectionId
+    if (settled(current)) return current
     if (signal?.aborted) throw new SelectionApiError(499, 'selection-wait-aborted', 'selection wait aborted')
     return await new Promise<SelectionRecord>((resolve, reject) => {
       let unsubscribe = () => {}
@@ -856,7 +862,7 @@ export class SelectionHost {
       const check = () => {
         const record = this.getSelection(selectionId)
         if (!record) { cleanup(); reject(new SelectionApiError(404, 'selection-not-found', 'selection not found: ' + selectionId)); return }
-        if (record.status !== 'running') { cleanup(); resolve(record) }
+        if (settled(record)) { cleanup(); resolve(record) }
       }
       const onAbort = () => { cleanup(); reject(new SelectionApiError(499, 'selection-wait-aborted', 'selection wait aborted')) }
       unsubscribe = this.subscribe(check)

@@ -26,9 +26,9 @@ import { diagnostics as defaultDiagnostics, type Diagnostics } from './diagnosti
 import { isHookSource, requireHookSource, type AgentCreate, type HookSource } from './dsh-context.js'
 import { SelectionHost } from './selection/host.js'
 import { runChecks } from './selection/checks.js'
-import { evaluateDelivery } from './selection/candidates.js'
+import { evaluateDelivery, type SelectionRecord } from './selection/candidates.js'
 import { buildAutopilotContext, buildAutopilotRelay, planAutopilotTask } from './selection/autopilot.js'
-import { gitRepoState, resolveAutopilotSourceCwd } from './selection/live.js'
+import { adoptionOf, gitDiffStat, gitRepoState, resolveAutopilotSourceCwd } from './selection/live.js'
 import { createModelProber, type ModelProber } from './selection/probe.js'
 
 export type { Credentials } from './util.js'
@@ -343,7 +343,7 @@ export class VerifierHost {
       // Detach all slow work from the pre-step promise. The source task enters
       // immediately; only a completed winner is relayed later, when the source
       // agent is still alive. Failures are observable in the selection ledger.
-      void this.selections.waitFor(selectionId).then((record) => {
+      void this.selections.waitFor(selectionId).then(async (record) => {
         const current = this.autopilotActive.get(sourceId)
         current?.delete(selectionId as string)
         if (current && current.size === 0) this.autopilotActive.delete(sourceId)
@@ -355,6 +355,10 @@ export class VerifierHost {
         if (this.ctx.agents?.get(sourceId) !== agent) return
         const retained = record.winner ?? record.fallback
         if (retained) {
+          // The audit baseline is the source as it is NOW, before the relay
+          // can influence it (review R3 3.3). Re-check liveness afterwards.
+          await this.snapshotSourceAtRelay(record)
+          if (this.disposed || this.ctx.agents?.get(sourceId) !== agent) return
           const pending = this.autopilotCleanup.get(sourceId) ?? new Set<string>()
           pending.add(selectionId as string)
           this.autopilotCleanup.set(sourceId, pending)
@@ -409,6 +413,30 @@ export class VerifierHost {
     return entry.promise
   }
 
+  /** Review R3 3.3: capture what the delivery audit is compared against —
+   *  source HEAD, a content fingerprint of its worktree, and which of the
+   *  retained candidate's own files the source already contains. */
+  private async snapshotSourceAtRelay(record: SelectionRecord, concurrent = false): Promise<void> {
+    const cwd = typeof record.configSnapshot?.sourceCwd === 'string' ? record.configSnapshot.sourceCwd as string : undefined
+    const slot = record.winner ?? record.fallback
+    if (!cwd || !slot || record.sourceAtRelay) return
+    const at = Date.now()
+    try {
+      const [state, stat, adoption] = await Promise.all([gitRepoState(cwd), gitDiffStat(cwd), adoptionOf(slot.workspace, cwd)])
+      record.sourceAtRelay = {
+        at,
+        head: state?.head ?? null,
+        worktreeFingerprint: stat?.fingerprint ?? null,
+        adoptedPaths: adoption ? adoption.adopted : null,
+        candidateFiles: adoption ? adoption.total : null,
+        ...(concurrent ? { concurrent: true } : {}),
+      }
+    } catch (error) {
+      record.sourceAtRelay = { at, head: null, worktreeFingerprint: null, adoptedPaths: null, candidateFiles: null, error: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200) }
+      this.diagnostics.warn('autopilot.relay_snapshot', error, { selectionId: record.selectionId })
+    }
+  }
+
   private async cleanupAutopilotWinnersOnce(sourceSessionId: string): Promise<void> {
     const pending = this.autopilotCleanup.get(sourceSessionId)
     if (!pending) return
@@ -436,13 +464,30 @@ export class VerifierHost {
               } else {
                 const before = rec.sourceHeadAtStart ?? null
                 const headChanged = before !== null && state.head !== null ? state.head !== before : null
+                // Attributable integration (review R3 3.3): compare against the
+                // relay-time snapshot and look for the candidate's own bytes.
+                const relay = rec.sourceAtRelay && !rec.sourceAtRelay.error ? rec.sourceAtRelay : undefined
+                let attribution: { changedSinceRelay: boolean | null; adoptedNew: number | null; candidateFiles: number | null } | undefined
+                let adoptedFiles: string[] | undefined
+                if (relay) {
+                  const [nowStat, adoption] = await Promise.all([gitDiffStat(cwd), adoptionOf(slot.workspace, cwd)])
+                  const changedSinceRelay = relay.head === null || state.head === null || relay.worktreeFingerprint === null || !nowStat
+                    ? null
+                    : state.head !== relay.head || nowStat.fingerprint !== relay.worktreeFingerprint
+                  if (adoption && relay.adoptedPaths) {
+                    const already = new Set(relay.adoptedPaths)
+                    adoptedFiles = adoption.adopted.filter((file) => !already.has(file))
+                  }
+                  attribution = { changedSinceRelay, adoptedNew: adoptedFiles ? adoptedFiles.length : null, candidateFiles: adoption ? adoption.total : relay.candidateFiles }
+                }
                 // An absent/non-string command means "no test configured", never
                 // an audit failure (embedded hosts may pass a partial config).
                 const testCommand = typeof this.config.selectionPostAuditTestCommand === 'string' ? this.config.selectionPostAuditTestCommand.trim() : ''
                 let testsExit: number | null = null
                 let testsRan = false
                 let postAuditError: string | undefined
-                if (testCommand && (headChanged === true || state.dirtyEntries > 0)) {
+                const mayBeIntegrated = attribution ? (attribution.adoptedNew ?? 0) > 0 : headChanged === true || state.dirtyEntries > 0
+                if (testCommand && mayBeIntegrated) {
                   try {
                     const results = await runChecks(cwd, [{ name: 'post-audit', command: testCommand, timeoutMs: 120000 }], { secretEnvNames: [this.config.apiKeyEnv] })
                     testsExit = results[0]?.exitCode ?? null
@@ -457,9 +502,12 @@ export class VerifierHost {
                   dirtyEntries: state.dirtyEntries,
                   testsConfigured: testCommand.length > 0,
                   testsExit: testsRan ? testsExit : null,
+                  ...(attribution ? { attribution } : {}),
                 })
                 rec.delivery = {
                   audited: true,
+                  basis: verdict.basis,
+                  ...(attribution ? { changedSinceRelay: attribution.changedSinceRelay, adoptedFiles: (adoptedFiles ?? []).slice(0, 50), candidateFiles: attribution.candidateFiles } : {}),
                   headBefore: before,
                   headAfter: state.head,
                   headChanged,
@@ -553,6 +601,9 @@ export class VerifierHost {
       const pending = this.autopilotCleanup.get(sourceId) ?? new Set<string>()
       pending.add(record.selectionId)
       this.autopilotCleanup.set(sourceId, pending)
+      // start() is synchronous, so the recovery relay cannot wait for the
+      // audit baseline; it is captured concurrently and marked as such.
+      void this.snapshotSourceAtRelay(record, true).then(() => this.selections.pubRecord(record))
       record.timing = { ...(record.timing ?? {}), relayedAt: Date.now() }
       this.selections.pubRecord(record)
       this.diagnostics.count('autopilot.relay_recovered')

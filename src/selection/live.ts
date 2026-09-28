@@ -7,7 +7,7 @@
  * and this file is typechecked + smoke-tested against the live host.
  */
 
-import { cp, lstat, mkdir, readdir, readlink, rm, rmdir } from 'node:fs/promises'
+import { cp, lstat, mkdir, readdir, readFile, readlink, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
@@ -486,6 +486,9 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
         try {
           await mirrorGitWorkingState(sourceRoot, worktreeRoot)
           await mkdir(candidateCwd, { recursive: true })
+          // After the mirror, before the candidate runs: what it inherited.
+          // Best effort — without a baseline, evidence falls back to HEAD.
+          try { await captureWorkspaceBaseline(worktreeRoot) } catch { /* evidence degrades to HEAD-relative */ }
           return candidateCwd
         } catch (error) {
           let cleanupError = ''
@@ -533,8 +536,9 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
 
 /** The evidence shape is owned by the runner contract (candidates.ts); this
  *  adapter produces it and re-exports the type so the two can never drift.
- *  files = tracked files whose worktree bytes differ from HEAD; untracked =
- *  non-ignored new files (candidate NEW artifacts live here); fingerprint =
+ *  files/untracked = paths the CANDIDATE changed relative to what it started
+ *  with (the mirrored source state, review R3 3.7; HEAD when no baseline);
+ *  inherited = source edits carried in untouched; fingerprint =
  *  stable hash of every changed or new path together with its CONTENT digest,
  *  so equal fingerprints mean byte-identical deliverables (review R2 2.1: the
  *  previous numstat+size hash collided for any two edits with equal line
@@ -576,36 +580,154 @@ async function contentDigest(file: string, budget: { left: number }): Promise<st
   try { return mode + (await hashFile(file)) } catch { return mode + 'unreadable:' + info.size }
 }
 
+interface WorkspaceEntry {
+  /** Repository-root-relative path, exactly as git reports it. */
+  path: string
+  digest: string
+  tracked: boolean
+}
+
+/** Private per-worktree file (lives in the worktree's own git dir, so the
+ *  candidate's `git status` never shows it and `worktree remove` deletes it). */
+const BASELINE_FILE = 'dsh-va-baseline.json'
+
+async function gitRoot(cwd: string): Promise<string | null> {
+  const top = await execWide('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], cwd)
+  return top.code === 0 && top.out.trim() ? path.resolve(top.out.trim()) : null
+}
+
+/** Every tracked path whose worktree bytes differ from HEAD plus every
+ *  non-ignored untracked path, ROOT-relative, with content digests. Both git
+ *  listings run at the root: `diff --name-only` is root-relative while
+ *  `ls-files --others` is cwd-relative, and mixing the two from a subdirectory
+ *  cwd hashed the wrong files (review R3, found in the R2 fingerprint). */
+async function workspaceEntries(root: string): Promise<WorkspaceEntry[] | null> {
+  const changed = await execWide('git', ['-C', root, 'diff', '--no-renames', '--name-only', '-z', 'HEAD'], root)
+  if (changed.code !== 0) return null
+  const others = await execWide('git', ['-C', root, 'ls-files', '--others', '--exclude-standard', '-z'], root)
+  const tracked = new Set(nulList(changed.out))
+  const untracked = others.code === 0 ? nulList(others.out) : []
+  const paths = [...new Set([...tracked, ...untracked])].sort().slice(0, FINGERPRINT_MAX_PATHS)
+  const budget = { left: FINGERPRINT_CONTENT_BUDGET }
+  const entries: WorkspaceEntry[] = []
+  for (const rel of paths) entries.push({ path: rel, digest: await contentDigest(path.join(root, rel), budget), tracked: tracked.has(rel) })
+  return entries
+}
+
+async function baselinePath(root: string): Promise<string | null> {
+  const dir = await execWide('git', ['-C', root, 'rev-parse', '--absolute-git-dir'], root)
+  return dir.code === 0 && dir.out.trim() ? path.join(dir.out.trim(), BASELINE_FILE) : null
+}
+
+/** Record what the candidate STARTED with: `prepare()` mirrors the source's
+ *  uncommitted edits into the worktree without committing them, so `git diff
+ *  HEAD` alone attributes the user's work-in-progress to every candidate
+ *  (review R3 3.7: a candidate that did nothing passed the has-work gate in
+ *  any dirty repository). Returns the number of inherited paths, or null when
+ *  the workspace is not a git worktree. */
+export async function captureWorkspaceBaseline(cwd: string): Promise<number | null> {
+  const root = await gitRoot(cwd)
+  if (!root) return null
+  const entries = await workspaceEntries(root)
+  const file = await baselinePath(root)
+  if (!entries || !file) return null
+  await writeFile(file, JSON.stringify({ version: 1, entries: Object.fromEntries(entries.map((e) => [e.path, e.digest])) }))
+  return entries.length
+}
+
+async function readBaseline(root: string): Promise<Map<string, string> | null> {
+  const file = await baselinePath(root)
+  if (!file) return null
+  try {
+    const parsed = JSON.parse(await readFile(file, 'utf8')) as { version?: number; entries?: Record<string, string> }
+    if (parsed.version !== 1 || !parsed.entries || typeof parsed.entries !== 'object') return null
+    return new Map(Object.entries(parsed.entries).filter((pair): pair is [string, string] => typeof pair[1] === 'string'))
+  } catch {
+    return null
+  }
+}
+
+export interface OwnChanges {
+  root: string
+  /** False when no start baseline exists (manual workspaces, legacy
+   *  worktrees): every change relative to HEAD then counts as the candidate's. */
+  hasBaseline: boolean
+  /** Full current deliverable (inherited + own). */
+  entries: WorkspaceEntry[]
+  /** Paths whose content differs from what the candidate started with.
+   *  digest 'head' = the candidate restored an inherited path to HEAD. */
+  own: WorkspaceEntry[]
+  /** Inherited source edits the candidate left untouched. */
+  inherited: number
+}
+
+export async function candidateOwnChanges(cwd: string): Promise<OwnChanges | null> {
+  const root = await gitRoot(cwd)
+  if (!root) return null
+  const head = await execWide('git', ['-C', root, 'rev-parse', '--verify', 'HEAD'], root)
+  if (head.code !== 0) return null
+  const entries = await workspaceEntries(root)
+  if (!entries) return null
+  const baseline = await readBaseline(root)
+  if (!baseline) return { root, hasBaseline: false, entries, own: entries, inherited: 0 }
+  const current = new Set(entries.map((e) => e.path))
+  const own = entries.filter((e) => baseline.get(e.path) !== e.digest)
+  for (const inheritedPath of baseline.keys()) {
+    if (!current.has(inheritedPath)) own.push({ path: inheritedPath, digest: 'head', tracked: true })
+  }
+  return { root, hasBaseline: true, entries, own, inherited: entries.length - entries.filter((e) => baseline.get(e.path) !== e.digest).length }
+}
+
 /** Objective work evidence for one candidate workspace (ruling K.5 / J.4).
  *  Returns null when the workspace is not a git worktree (manual blank
  *  workspaces) — the caller then relies on tool-call evidence alone. */
 export async function gitDiffStat(cwd: string): Promise<DiffStatLite | null> {
   try {
-    const head = await execWide('git', ['-C', cwd, 'rev-parse', '--verify', 'HEAD'], cwd)
-    if (head.code !== 0) return null
-    const numstat = await execWide('git', ['-C', cwd, 'diff', '--numstat', 'HEAD'], cwd)
-    if (numstat.code !== 0) return null
-    let files = 0
+    const changes = await candidateOwnChanges(cwd)
+    if (!changes) return null
+    const ownTracked = new Set(changes.own.filter((e) => e.tracked).map((e) => e.path))
     let insertions = 0
     let deletions = 0
-    for (const line of numstat.out.split(/\r?\n/)) {
-      const parts = line.split('\t')
-      if (parts.length < 3) continue
-      files += 1
-      insertions += parts[0] === '-' ? 0 : Number(parts[0]) || 0
-      deletions += parts[1] === '-' ? 0 : Number(parts[1]) || 0
+    const numstat = await execWide('git', ['-C', changes.root, 'diff', '--no-renames', '--numstat', '-z', 'HEAD'], changes.root)
+    if (numstat.code === 0) {
+      for (const record of nulList(numstat.out)) {
+        const parts = record.replace(/^\n+/, '').split('\t')
+        if (parts.length < 3 || !ownTracked.has(parts.slice(2).join('\t'))) continue
+        insertions += parts[0] === '-' ? 0 : Number(parts[0]) || 0
+        deletions += parts[1] === '-' ? 0 : Number(parts[1]) || 0
+      }
     }
-    const changed = await execWide('git', ['-C', cwd, 'diff', '--name-only', '-z', 'HEAD'], cwd)
-    if (changed.code !== 0) return null
-    const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard', '-z'], cwd)
-    const untracked = others.code === 0 ? nulList(others.out) : []
-    const paths = [...new Set([...nulList(changed.out), ...untracked])].sort().slice(0, FINGERPRINT_MAX_PATHS)
-    const budget = { left: FINGERPRINT_CONTENT_BUDGET }
     const hash = createHash('sha256')
-    for (const rel of paths) {
-      hash.update(rel).update(String.fromCharCode(0)).update(await contentDigest(path.join(cwd, rel), budget)).update('\n')
+    for (const entry of changes.entries) hash.update(entry.path).update(String.fromCharCode(0)).update(entry.digest).update('\n')
+    return {
+      files: ownTracked.size,
+      insertions,
+      deletions,
+      untracked: changes.own.filter((e) => !e.tracked).length,
+      fingerprint: hash.digest('hex').slice(0, 16),
+      ...(changes.hasBaseline ? { inherited: changes.inherited } : {}),
     }
-    return { files, insertions, deletions, untracked: untracked.length, fingerprint: hash.digest('hex').slice(0, 16) }
+  } catch {
+    return null
+  }
+}
+
+/** Which of the candidate's OWN changes now exist byte-for-byte in the source
+ *  worktree (review R3 3.3). This is the attributable integration signal: a
+ *  HEAD move or a dirty tree says the source changed, not that it took
+ *  anything from the relayed candidate. */
+export async function adoptionOf(candidateCwd: string, sourceCwd: string): Promise<{ total: number; adopted: string[] } | null> {
+  try {
+    const changes = await candidateOwnChanges(candidateCwd)
+    const sourceRoot = await gitRoot(sourceCwd)
+    if (!changes || !sourceRoot) return null
+    const comparable = changes.own.filter((e) => e.digest !== 'head' && e.digest !== 'other' && !e.digest.includes('size:'))
+    const budget = { left: FINGERPRINT_CONTENT_BUDGET }
+    const adopted: string[] = []
+    for (const entry of comparable) {
+      if (await contentDigest(path.join(sourceRoot, entry.path), budget) === entry.digest) adopted.push(entry.path)
+    }
+    return { total: comparable.length, adopted }
   } catch {
     return null
   }
