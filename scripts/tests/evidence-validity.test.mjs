@@ -1,0 +1,218 @@
+// Review R3 (evidence and metric validity): candidate work evidence must not
+// include the user's inherited uncommitted edits, and the delivery audit must
+// attribute integration to the relayed winner instead of to any change in the
+// source repository. See docs/reviews/R3-EVIDENCE-VALIDITY.md.
+
+import test from "node:test"
+import assert from "node:assert/strict"
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, copyFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import path from "node:path"
+import { VerifierHost } from "../../lib/index.js"
+import { IsolatedWorkspaceManager, gitDiffStat, adoptionOf } from "../../lib/selection/live.js"
+import { evaluateDelivery } from "../../lib/selection/candidates.js"
+import { makeGitRepo, runGit } from "./helpers/git.mjs"
+import { completedTurnEvents, fakeAgent, fakeContext, fireIdle, hostOverrides } from "./helpers/host.mjs"
+import { fakeBridge, makeFakeFactory, realWorkspaces } from "./helpers/selection.mjs"
+import { waitFor } from "./helpers/harness.mjs"
+
+/** A source repository the user is in the middle of editing: one modified
+ *  tracked file and one new untracked file, neither committed. */
+function dirtySource(base) {
+  const repo = makeGitRepo(base, "source")
+  writeFileSync(path.join(repo, "tracked.txt"), "tracked-base\nuser work in progress\n")
+  writeFileSync(path.join(repo, "notes.md"), "user notes\n")
+  return repo
+}
+
+async function withCandidate(fn, { subdir = null } = {}) {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r3-"))
+  const manager = new IsolatedWorkspaceManager(path.join(base, "ws"))
+  let cwd = null
+  try {
+    const repo = dirtySource(base)
+    const sourceCwd = subdir ? path.join(repo, subdir) : repo
+    cwd = await manager.prepare({ selectionId: "sel-r3evid", index: 0, sourceCwd, strictSnapshot: true })
+    await fn({ repo, sourceCwd, cwd, root: subdir ? path.dirname(cwd) : cwd })
+  } finally {
+    if (cwd) await manager.remove(subdir ? path.dirname(cwd) : cwd).catch(() => {})
+    rmSync(base, { recursive: true, force: true })
+  }
+}
+
+test("R3 3.7: a candidate that did nothing in a dirty repository shows no work of its own", async () => {
+  await withCandidate(async ({ cwd }) => {
+    const stat = await gitDiffStat(cwd)
+    assert.deepEqual({ files: stat.files, insertions: stat.insertions, deletions: stat.deletions, untracked: stat.untracked, inherited: stat.inherited },
+      { files: 0, insertions: 0, deletions: 0, untracked: 0, inherited: 2 },
+      "the user's two uncommitted paths are inherited, not candidate work (old code: files 1, untracked 1)")
+  })
+})
+
+test("R3 3.7: the candidate's own edits, further edits to inherited files, and reverts are all counted", async () => {
+  await withCandidate(async ({ cwd }) => {
+    writeFileSync(path.join(cwd, "src", "entry.ts"), "export const value = 2\n")
+    let stat = await gitDiffStat(cwd)
+    assert.equal(stat.files, 1)
+    assert.equal(stat.insertions, 1)
+    assert.equal(stat.deletions, 1)
+    assert.equal(stat.inherited, 2)
+    writeFileSync(path.join(cwd, "tracked.txt"), "tracked-base\nuser work in progress\ncandidate addition\n")
+    stat = await gitDiffStat(cwd)
+    assert.equal(stat.files, 2, "touching an inherited file makes it the candidate's change")
+    assert.equal(stat.inherited, 1)
+    runGit(cwd, "checkout", "--", "tracked.txt")
+    stat = await gitDiffStat(cwd)
+    assert.equal(stat.files, 2, "reverting the user's inherited edit is a change the candidate made")
+    writeFileSync(path.join(cwd, "fresh.txt"), "new\n")
+    assert.equal((await gitDiffStat(cwd)).untracked, 1)
+  })
+})
+
+test("R3: a subdirectory cwd reports root-relative paths and a content-sensitive fingerprint", async () => {
+  await withCandidate(async ({ cwd }) => {
+    assert.equal(path.basename(cwd), "src", "fixture: the candidate cwd mirrors the source subdirectory")
+    const idle = await gitDiffStat(cwd)
+    assert.equal(idle.files + idle.untracked, 0)
+    writeFileSync(path.join(cwd, "entry.ts"), "export const value = 2\n")
+    const a = await gitDiffStat(cwd)
+    writeFileSync(path.join(cwd, "entry.ts"), "export const value = 3\n")
+    const b = await gitDiffStat(cwd)
+    assert.equal(a.files, 1, "a diff name under src/ is resolved against the repository root")
+    assert.notEqual(a.fingerprint, b.fingerprint, "same size, different bytes: the fingerprint hashes the right file")
+    writeFileSync(path.join(cwd, "extra.ts"), "x\n")
+    assert.equal((await gitDiffStat(cwd)).untracked, 1)
+  }, { subdir: "src" })
+})
+
+test("R3 3.3: adoptionOf counts only candidate-owned files present byte-for-byte in the source", async () => {
+  await withCandidate(async ({ cwd, repo }) => {
+    writeFileSync(path.join(cwd, "pass.txt"), "ready\n")
+    writeFileSync(path.join(cwd, "src", "entry.ts"), "export const value = 42\n")
+    let adoption = await adoptionOf(cwd, repo)
+    assert.deepEqual(adoption, { total: 2, adopted: [] }, "inherited user edits already in the source are not adoption")
+    copyFileSync(path.join(cwd, "pass.txt"), path.join(repo, "pass.txt"))
+    writeFileSync(path.join(repo, "src", "entry.ts"), "export const value = 43\n")
+    adoption = await adoptionOf(cwd, repo)
+    assert.deepEqual(adoption, { total: 2, adopted: ["pass.txt"] }, "a different edit to the same file is not the candidate's content")
+  })
+})
+
+test("R3 3.3: evaluateDelivery attributes integration to relay-time adoption, never to bare source change", () => {
+  const base = { audited: true, headChanged: true, dirtyEntries: 3, testsConfigured: true, testsExit: 0 }
+  const adopted = evaluateDelivery({ ...base, attribution: { changedSinceRelay: true, adoptedNew: 2, candidateFiles: 3 } })
+  assert.equal(adopted.delivered, "yes")
+  assert.equal(adopted.basis, "relay-adoption")
+  assert.equal(evaluateDelivery({ ...base, testsConfigured: false, attribution: { changedSinceRelay: true, adoptedNew: 1, candidateFiles: 1 } }).delivered, "unknown", "adoption without tests stays unresolved")
+  assert.equal(evaluateDelivery({ ...base, testsExit: 1, attribution: { changedSinceRelay: true, adoptedNew: 1, candidateFiles: 1 } }).delivered, "no")
+  const unrelated = evaluateDelivery({ ...base, attribution: { changedSinceRelay: true, adoptedNew: 0, candidateFiles: 2 } })
+  assert.equal(unrelated.delivered, "unknown", "the source changed, but not with the winner's content: " + unrelated.note)
+  assert.equal(evaluateDelivery({ ...base, attribution: { changedSinceRelay: false, adoptedNew: 0, candidateFiles: 2 } }).delivered, "no")
+  assert.equal(evaluateDelivery({ ...base, attribution: { changedSinceRelay: null, adoptedNew: null, candidateFiles: null } }).delivered, "unknown")
+  assert.equal(evaluateDelivery({ ...base, audited: false, attribution: { changedSinceRelay: true, adoptedNew: 1, candidateFiles: 1 } }).delivered, "unknown")
+  const legacy = evaluateDelivery(base)
+  assert.equal(legacy.basis, "start-baseline", "records without a relay snapshot keep the old semantics, labelled")
+  assert.equal(legacy.delivered, "yes")
+  assert.match(legacy.note, /not attributable to the relay/)
+})
+
+/** Drive one autopilot selection end to end over real git worktrees and
+ *  return the settled record after the source goes idle. `afterRelay` runs
+ *  once the relay has been delivered, standing in for the source turn. */
+async function autopilotDelivery({ afterRelay }) {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r3-e2e-"))
+  const manager = new IsolatedWorkspaceManager(path.join(base, "ws"))
+  try {
+    const repo = dirtySource(base)
+    const ledger = path.join(base, "selections.jsonl")
+    const ctx = fakeContext()
+    ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+    ctx.llm = { async listModels() { return [{ id: "kimi-k3" }] } }
+    // Two distinct deliverables (identical ones are deduplicated, review R2).
+    const factory = makeFakeFactory({ passAt: [0, 1] })
+    const create = factory.create.bind(factory)
+    factory.create = async (spec) => {
+      const handle = await create(spec)
+      if (path.basename(spec.cwd) === "c1") writeFileSync(path.join(spec.cwd, "pass.txt"), "ready (second approach)")
+      return handle
+    }
+    // `node --version` resolves as a program under both sh and pwsh.
+    const host = new VerifierHost(ctx, hostOverrides({ enabled: false, selectionPostAuditTestCommand: "node --version" }), {
+      selectionsFile: ledger,
+      selectionsTesting: { factory, workspaces: manager, bridge: fakeBridge() },
+    })
+    const source = ctx.spawnAgent(fakeAgent("sess-r3-e2e", completedTurnEvents(1)))
+    source.session.header = { cwd: repo }
+    host.start()
+    const preStep = source.handlers.get("agent/pre-step")[0]
+    const direct = { id: "u1", role: "user", content: [{ type: "text", text: "Refactor src/entry.ts and run the lifecycle tests" }], source: { kind: "user" } }
+    await preStep({ messages: [direct], turn: 3, step: 1, signal: new AbortController().signal }, async () => ({ kind: "enter", messages: [direct] }))
+    const { selectionId } = host.selections.listSelections()[0]
+    await waitFor(() => host.selections.getSelection(selectionId).status !== "running")
+    await waitFor(() => source.followups.some((message) => message.source.form === "relay"))
+    const settled = host.selections.getSelection(selectionId)
+    assert.ok(settled.winner, "fixture: the selection produced a retained winner: " + JSON.stringify(settled.outcome))
+    await afterRelay({ repo, winner: settled.winner.workspace })
+    fireIdle(source)
+    await waitFor(() => host.selections.getSelection(selectionId).winner.discardedAt)
+    const record = host.selections.getSelection(selectionId)
+    const ledgerText = readFileSync(ledger, "utf8")
+    await host.dispose()
+    return { record, ledgerText }
+  } finally { rmSync(base, { recursive: true, force: true }) }
+}
+
+test("R3 3.3 e2e: a dirty source that integrated nothing is audited 'no' (old code: 'yes')", async () => {
+  const { record, ledgerText } = await autopilotDelivery({ afterRelay: async () => {} })
+  assert.ok(record.sourceAtRelay, "the relay-time snapshot exists")
+  assert.deepEqual(record.sourceAtRelay.adoptedPaths, [])
+  assert.equal(record.delivery.basis, "relay-adoption")
+  assert.equal(record.delivery.delivered, "no", JSON.stringify(record.delivery))
+  assert.equal(record.delivery.postAuditTestExit, undefined, "tests are not run in the user's repo without attributable integration")
+  assert.ok(ledgerText.includes("relayedAt") && ledgerText.includes("sourceAtRelay"), "relay mark and snapshot reach the ledger")
+})
+
+test("R3 3.3 e2e: unrelated concurrent source work is 'unknown', adoption of the winner's bytes is 'yes'", async () => {
+  const unrelated = await autopilotDelivery({ afterRelay: async ({ repo }) => { writeFileSync(path.join(repo, "other.txt"), "source turn's own work\n") } })
+  assert.equal(unrelated.record.delivery.changedSinceRelay, true)
+  assert.equal(unrelated.record.delivery.delivered, "unknown", JSON.stringify(unrelated.record.delivery))
+  const adopted = await autopilotDelivery({ afterRelay: async ({ repo, winner }) => { copyFileSync(path.join(winner, "pass.txt"), path.join(repo, "pass.txt")) } })
+  assert.deepEqual(adopted.record.delivery.adoptedFiles, ["pass.txt"])
+  assert.equal(adopted.record.delivery.candidateFiles, 1, "only pass.txt is the winner's own; the user's WIP is inherited")
+  assert.equal(adopted.record.delivery.postAuditTestExit, 0)
+  assert.equal(adopted.record.delivery.delivered, "yes", JSON.stringify(adopted.record.delivery))
+})
+
+test("R3 (found): the relay mark reaches the final ledger row, so a crash before idle does not re-deliver the relay", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r3-reload-"))
+  try {
+    const repo = makeGitRepo(base, "source")
+    const ledger = path.join(base, "selections.jsonl")
+    const ctx = fakeContext()
+    ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+    ctx.llm = { async listModels() { return [{ id: "kimi-k3" }] } }
+    const testing = () => ({ factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge: fakeBridge() })
+    const host1 = new VerifierHost(ctx, hostOverrides({ enabled: false }), { selectionsFile: ledger, selectionsTesting: testing() })
+    const source = ctx.spawnAgent(fakeAgent("sess-r3-reload", completedTurnEvents(1)))
+    source.session.header = { cwd: repo }
+    host1.start()
+    const preStep = source.handlers.get("agent/pre-step")[0]
+    const direct = { id: "u1", role: "user", content: [{ type: "text", text: "Refactor src/entry.ts and run the lifecycle tests" }], source: { kind: "user" } }
+    await preStep({ messages: [direct], turn: 3, step: 1, signal: new AbortController().signal }, async () => ({ kind: "enter", messages: [direct] }))
+    const { selectionId } = host1.selections.listSelections()[0]
+    await waitFor(() => host1.selections.getSelection(selectionId).status !== "running")
+    await waitFor(() => source.followups.some((message) => message.source.form === "relay"))
+    // The final ledger row must carry the relay mark: the runner's record
+    // replaced the placeholder that received it (old code: absent).
+    const rows = readFileSync(ledger, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line))
+    assert.ok(rows.at(-1).timing?.relayedAt, "last ledger row carries relayedAt")
+    // The process dies before the source goes idle (no graceful dispose, so
+    // no audit/discard); the next host loads the ledger and runs recovery.
+    const host2 = new VerifierHost(ctx, hostOverrides({ enabled: false }), { selectionsFile: ledger, selectionsTesting: testing() })
+    host2.start()
+    const relays = source.followups.filter((message) => message.source.form === "relay").length
+    assert.equal(relays, 1, "the source agent received the same relay " + relays + " times")
+    await host2.dispose()
+    await host1.dispose()
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
