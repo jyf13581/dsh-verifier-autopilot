@@ -296,6 +296,9 @@ test("R3 3.6: eval drivers carry no machine-specific paths or duplicated thresho
     const text = readFileSync(new URL(file, root), "utf8")
     if (/[A-Z]:[\\/]+Users[\\/]/i.test(text)) offenders.push(file + ": user-profile path")
     if (/THRESHOLD\s*=\s*0\.\d/.test(text)) offenders.push(file + ": hardcoded margin threshold")
+    for (const line of text.split("\n")) {
+      if (/https?:\/\/(127\.0\.0\.1|localhost)[:/]/.test(line) && !line.includes("process.env") && !/^\s*(\/\/|#|\*)/.test(line)) offenders.push(file + ": fixed local endpoint: " + line.trim().slice(0, 80))
+    }
   }
   assert.deepEqual(offenders, [])
 })
