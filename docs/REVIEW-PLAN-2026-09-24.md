@@ -12,7 +12,7 @@
 |---|---|---|---|
 | R1 信任边界与执行安全 | ✅ 已完成（1.1 沙箱和 1.9 默认中转待负责人决策） | `docs/reviews/R1-TRUST-BOUNDARY.md` | `scripts/tests/trust-boundary.test.mjs` |
 | R2 选择判定链正确性 | ✅ 已完成（2.1–2.5、2.7 已修复；2.6 维持 K.5 语义并写入决策表；新发现的部分重复去重问题 2.1c 已修复） | `docs/reviews/R2-SELECTION-CORRECTNESS.md` | `scripts/tests/selection-correctness.test.mjs` |
-| R3 证据与度量有效性 | ⏳ | | |
+| R3 证据与度量有效性 | ✅ 已完成（3.3 按 relay 快照做字节级采纳归因；3.1 采用条件注册表加 `flag`/`abstain` 策略，默认改为强制 abstain 待负责人决策；新发现的 3.7 继承脏状态、3.7b 子目录指纹、3.8 relay 重复发送已修复；σγ 需要跑一轮 C3 实测） | `docs/reviews/R3-EVIDENCE-VALIDITY.md` | `scripts/tests/evidence-validity.test.mjs` |
 | R4 并发、生命周期与资源回收 | ⏳ | | |
 | R5 持久化、审计包、脱敏与协议 | ⏳ | | |
 | R6 架构与构建/发布链 | ⏳ | | |
@@ -155,6 +155,7 @@ HTTP 控制面: /state /config /select /selections/* /verify /probe /eval /event
 | 5.3 | ledger 追加没有 fsync，掉电语义没有写清；超过 4MiB 时 `persist()` 走压缩分支，需要确认当前记录一定被包含在内 | `ledger.ts`、`selection/host.ts persist` |
 | 5.4 | sidecar 协议没有版本协商（health 不带 protocol 版本）；`"logprob" in str(exc)` 这种子串映射很脆弱；`n_evaluations ?? 4` 这个兜底和 Host 默认值（1）不一致 | `bridge.ts select`、`llm_verifier_sidecar.py _map_exception` |
 | 5.5 | `/state` 和 SSE 会把 `configSnapshot.sourceCwd` 等本机绝对路径、完整配置广播给任何本地读取方 | `protocol.ts`、`api.ts /state` |
+| 5.6 | （R3 转入）审计包的 `gitDiffFull` 补丁仍然相对 HEAD，会把从源仓库继承来的用户在制改动一起打包；判定已经改为只看候选自身的变更（R3 3.7），但审计包展示和脱敏范围还没跟上 | `live.ts gitDiffFull`、`candidates.ts` 审计包 |
 
 方法：枚举所有出口（网络、磁盘、源会话、`/state`），每个出口核对是否脱敏；对 ledger loader 做模糊测试（截断行、重复 id、未来版本）；逐字段对照协议 fixture。
 
