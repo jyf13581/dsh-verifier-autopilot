@@ -1,4 +1,5 @@
 import type { AutopilotMode, CandidateModelStrategy } from '../config.js'
+import { describeMismatch } from './calibration.js'
 import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
 import { read } from '../payload.js'
 import type { SelectionRecord } from './candidates.js'
@@ -239,6 +240,16 @@ export function buildAutopilotContext(
   return boundText(sections.join('\n'), maxChars + currentTask.length + 800)
 }
 
+/** Review R3 3.1: say exactly what the gate is evidence for. The threshold
+ *  was measured under one condition; clearing it elsewhere is a relative
+ *  preference with an unmeasured false-winner rate. */
+function winnerQualifier(record: SelectionRecord): string {
+  const cal = record.marginCalibration
+  if (!cal) return '(verifier preference exceeded the margin threshold; calibration status not recorded; relative score, not a calibrated probability)'
+  if (cal.status === 'calibrated') return '(verifier preference cleared the provisional margin gate calibrated for this condition; relative score, not a calibrated probability)'
+  return '(verifier preference exceeded the margin threshold, but that threshold was NOT calibrated for this condition (differs in: ' + describeMismatch(cal) + '), so its false-winner rate is unknown; treat it as a weak relative preference and verify independently)'
+}
+
 export function selectionSeparation(record: SelectionRecord): { label: 'single-survivor' | 'unresolved' | 'leaning' | 'clear'; margin: number | null } {
   const ranking = record.ranking ?? []
   if (ranking.length < 2) return { label: 'single-survivor', margin: null }
@@ -275,10 +286,12 @@ export function buildAutopilotRelay(record: SelectionRecord): string {
     'Separation: ' + separation.label + (separation.margin === null ? '' : ' (relative-score margin ' + separation.margin.toFixed(4) + ')'),
   ]
   if (record.margin !== undefined) {
+    const cal = record.marginCalibration
     lines.push('Margin gate: margin=' + record.margin.toFixed(6)
       + ' threshold=' + (record.marginThreshold ?? 'n/a')
       + (record.marginProvisional ? ' (provisional calibration)' : '')
-      + ' condition=' + (record.marginCondition ?? 'n/a'))
+      + ' condition=' + (record.marginCondition ?? 'n/a')
+      + (cal ? ' calibration=' + cal.status + (cal.status === 'uncalibrated' ? ' [differs in: ' + describeMismatch(cal) + ']' : '') : ''))
   }
   if (record.noSearchSpace) lines.push('Flag: no-search-space (all survivor diffs identical; deduped before the verifier)')
   if (!record.noSearchSpace && record.dedupedCandidates?.length) lines.push('Flag: deduped ' + record.dedupedCandidates.map((i) => 'c' + i).join(', ') + ' (byte-identical to a kept survivor; not ranked separately)')
@@ -312,7 +325,7 @@ export function buildAutopilotRelay(record: SelectionRecord): string {
     case 'ranked_winner':
       lines.push(
         'Winner: c' + record.winner!.index + ' at ' + record.winner!.workspace,
-        '(verifier preference cleared the margin gate; relative score, not a calibrated probability)',
+        winnerQualifier(record),
         '',
         '[FINALIZER CONTRACT]',
         FINALIZER_CONTRACT,
@@ -344,7 +357,9 @@ export function buildAutopilotRelay(record: SelectionRecord): string {
       break
     case 'abstain':
       lines.push(
-        'Abstain: the verifier top-2 margin stayed inside the provisional noise band, so NO winner exists.',
+        record.marginCalibration?.forcedAbstain
+          ? 'Abstain: the verifier preferred one candidate, but the margin gate has no calibrated noise band for this condition (' + describeMismatch(record.marginCalibration) + ') and the operator policy is abstain, so NO winner exists.'
+          : 'Abstain: the verifier top-2 margin stayed inside the provisional noise band, so NO winner exists.',
         'The finalist excerpts below are equal-strength evidence, not a preference. Continue the original task directly; treat both as unverified drafts.',
       )
       appendFinalists()

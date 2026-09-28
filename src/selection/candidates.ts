@@ -14,6 +14,7 @@
  *   survivor-subset index.
  */
 
+import { describeMismatch, lookupMarginCalibration, type MarginCalibration, type UncalibratedMarginPolicy } from './calibration.js'
 import { randomUUID } from 'node:crypto'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 import { rmdir } from 'node:fs/promises'
@@ -131,6 +132,12 @@ export interface SelectionRecord {
   margin?: number
   marginThreshold?: number
   marginCondition?: string
+  /** Review R3 3.1: whether the gate's noise band was measured for this
+   *  exact condition (see selection/calibration.ts). */
+  marginCalibration?: MarginCalibration
+  /** Review R3 3.4: usage.calls != nComparisons x criteria x evaluations on a
+   *  successful ranking (scheduler/counter regression or tie-swallowing). */
+  verifierCallsAnomaly?: { expected: number; observed: number | null }
   /** Threshold remains provisional until the graduation invoice clears (I.4). */
   marginProvisional?: boolean
   /** At least one candidate's checks were shell-level failures (B-10). */
@@ -305,6 +312,9 @@ export interface SelectionRunInput {
   /** Provisional top-2 margin gate; below it the outcome is abstain, not a
    *  verifier winner (ruling I.1/I.4). Recorded per run with its condition. */
   marginThreshold?: number
+  /** What the gate does when this run's condition has no calibrated noise
+   *  band (review R3 3.1). Default 'flag'. */
+  uncalibratedMarginPolicy?: UncalibratedMarginPolicy
   /** Extra fields merged into the record at creation (config snapshot, source
    *  attribution). Runner-controlled keys always win. */
   recordSeed?: Partial<SelectionRecord>
@@ -395,12 +405,13 @@ export function evaluateDelivery(input: {
   return tested('HEAD advanced or worktree dirty since selection start (start-time baseline: not attributable to the relay)', 'start-baseline')
 }
 
-/** Ruling I.1: provisional margin gate. 2026-09-08 calibration round 1 (C0,
- *  24 reps × 2 seeds, minimax-m3@low, eval/calibration/run.mjs): identical-
- *  candidate noise q95 = 0.0123, max = 0.0135, positional bias ≈ 0, no 0.5
- *  pinning; oracle-separated pairs land at margin 0.31..0.46 with 12/12
- *  correct signs. 0.03 = 2.2× the observed noise ceiling. Stays provisional
- *  until the multi-fixture replication (≥5 fixtures) confirms stability. */
+/** Ruling I.1: provisional margin gate. Evidence: invoice rounds 2-5
+ *  (kimi-k3@low, N=2, C=1, K=1, P=0, synthetic short fixtures), 240 C0
+ *  self-comparison frames, max noise 0.01377, so 0.03 is 2.17x the observed
+ *  ceiling (the round-1 minimax-m3 numbers were voided). Only that condition
+ *  is calibrated; every other run is labelled via selection/calibration.ts
+ *  (review R3 3.1). Stays provisional until docs/MARGIN-GRADUATION-INVOICE.md
+ *  clears. */
 export const PROVISIONAL_MARGIN_THRESHOLD = DEFAULT_SELECTION_MARGIN_THRESHOLD
 
 function clampCandidateCount(n: number): number {
@@ -981,6 +992,14 @@ export class SelectionRunner {
               const criteriaCount = Array.isArray(input.criteria) ? input.criteria.length : Object.keys(input.criteria ?? {}).length
               record.criteriaCount = criteriaCount
               record.expectedVerifierCalls = selectResult.nComparisons * criteriaCount * nEvaluations
+              // The identity is exact on this path: on_error='raise' means every
+              // scheduled call succeeded, and USAGE counts successful responses
+              // only (429 retries happen inside one counted call).
+              const observedCalls = typeof selectResult.usage?.calls === 'number' ? selectResult.usage.calls : null
+              if (observedCalls !== record.expectedVerifierCalls) {
+                record.verifierCallsAnomaly = { expected: record.expectedVerifierCalls, observed: observedCalls }
+                diag.count('verifier.calls_identity_violated')
+              }
               // Margin gate (ruling I.1/I.4, B-8): a verifier preference inside
               // the provisional calibrated noise band — exact ties included — abstains.
               // Evidence base (rounds 1-5, two model families): the measured
@@ -997,9 +1016,24 @@ export class SelectionRunner {
               record.marginThreshold = threshold
               record.marginProvisional = true
               record.marginCondition = input.verifier.model + '@' + (input.verifier.effort ?? 'default')
+              const calibration = lookupMarginCalibration({
+                verifier: record.marginCondition,
+                survivors: survivors.length,
+                criteria: criteriaCount,
+                evaluations: nEvaluations,
+                pivots,
+                // Runner inputs are always preface + real trajectory; the
+                // calibration harness feeds the sidecar synthetic fixtures.
+                inputs: 'production-trajectory',
+              }, input.uncalibratedMarginPolicy ?? 'flag', threshold)
+              record.marginCalibration = calibration
               if (margin < threshold) {
                 record.outcome = 'abstain'
                 record.note = 'top-2 margin ' + margin.toFixed(6) + ' inside provisional noise band < ' + threshold + ' (' + record.marginCondition + ')'
+              } else if (calibration.status === 'uncalibrated' && calibration.policy === 'abstain') {
+                calibration.forcedAbstain = true
+                record.outcome = 'abstain'
+                record.note = 'top-2 margin ' + margin.toFixed(6) + ' cleared ' + threshold + ' but the gate is not calibrated for this condition (' + describeMismatch(calibration) + '); policy abstain'
               } else {
                 record.outcome = 'ranked_winner'
                 record.winnerBasis = 'verifier'

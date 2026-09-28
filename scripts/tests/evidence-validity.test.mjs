@@ -10,10 +10,12 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import { VerifierHost } from "../../lib/index.js"
 import { IsolatedWorkspaceManager, gitDiffStat, adoptionOf } from "../../lib/selection/live.js"
-import { evaluateDelivery } from "../../lib/selection/candidates.js"
+import { evaluateDelivery, SelectionRunner } from "../../lib/selection/candidates.js"
+import { lookupMarginCalibration, CALIBRATED_CONDITIONS } from "../../lib/selection/calibration.js"
+import { buildAutopilotRelay } from "../../lib/selection/autopilot.js"
 import { makeGitRepo, runGit } from "./helpers/git.mjs"
 import { completedTurnEvents, fakeAgent, fakeContext, fireIdle, hostOverrides } from "./helpers/host.mjs"
-import { fakeBridge, makeFakeFactory, realWorkspaces } from "./helpers/selection.mjs"
+import { fakeBridge, makeFakeFactory, realWorkspaces, selInput } from "./helpers/selection.mjs"
 import { waitFor } from "./helpers/harness.mjs"
 
 /** A source repository the user is in the middle of editing: one modified
@@ -215,4 +217,67 @@ test("R3 (found): the relay mark reaches the final ledger row, so a crash before
     await host2.dispose()
     await host1.dispose()
   } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+test("R3 3.1: only the measured condition is calibrated; the shipped default is not", () => {
+  const measured = { verifier: "kimi-k3@low", survivors: 2, criteria: 1, evaluations: 1, pivots: 0, inputs: "synthetic-short" }
+  assert.equal(lookupMarginCalibration(measured, "flag", 0.03).status, "calibrated")
+  assert.deepEqual(lookupMarginCalibration(measured, "flag", 0.05).thresholdMismatch, { registry: 0.03, used: 0.05 })
+  // Shipped autopilot default: nemotron verifier, 3 criteria, real trajectories.
+  const shipped = lookupMarginCalibration({ verifier: "nvidia/nemotron-3-super-120b-a12b@low", survivors: 2, criteria: 3, evaluations: 1, pivots: 0, inputs: "production-trajectory" }, "flag", 0.03)
+  assert.equal(shipped.status, "uncalibrated")
+  assert.deepEqual(shipped.mismatches.map((m) => m.split("=")[0]), ["verifier", "criteria", "inputs"])
+  assert.equal(lookupMarginCalibration({ ...measured, survivors: 3 }, "flag", 0.03).status, "uncalibrated", "N=3 has a different null distribution")
+  assert.equal(CALIBRATED_CONDITIONS.length, 1)
+})
+
+/** Two distinct deliverables and a decisive verifier (margin 0.5). */
+function decisiveRun(over = {}, bridgeImpl) {
+  const stat = (fingerprint) => ({ files: 1, insertions: 1, deletions: 0, untracked: 0, fingerprint })
+  const runner = new SelectionRunner({
+    factory: makeFakeFactory({}),
+    workspaces: realWorkspaces,
+    bridge: fakeBridge(bridgeImpl),
+    diffStat: async (cwd) => stat(path.basename(cwd) + "-fp"),
+  })
+  return runner.run(selInput({ candidateCount: 2, taskKind: "code-change", nEvaluations: 1, pivots: 0, verifier: { model: "kimi-k3", effort: "low", baseUrl: "http://127.0.0.1:9/v1", apiKey: "dummy" }, ...over }))
+}
+
+test("R3 3.1: policy 'flag' keeps the winner but labels it; the relay stops claiming a calibrated gate", async () => {
+  const { record } = await decisiveRun()
+  assert.equal(record.outcome, "ranked_winner")
+  assert.equal(record.marginCalibration.status, "uncalibrated")
+  assert.deepEqual(record.marginCalibration.mismatches.map((m) => m.split("=")[0]), ["inputs"], "every dimension but the input regime matches the calibrated run")
+  const relay = buildAutopilotRelay(record)
+  assert.match(relay, /NOT calibrated for this condition \(differs in: inputs=production-trajectory\)/)
+  assert.match(relay, /calibration=uncalibrated/)
+  assert.doesNotMatch(relay, /cleared the margin gate/)
+})
+
+test("R3 3.1: policy 'abstain' refuses to name a winner in an uncalibrated condition", async () => {
+  const { record } = await decisiveRun({ uncalibratedMarginPolicy: "abstain" })
+  assert.equal(record.outcome, "abstain")
+  assert.equal(record.winner, undefined)
+  assert.equal(record.marginCalibration.forcedAbstain, true)
+  assert.ok(record.margin >= record.marginThreshold, "the margin itself cleared the threshold")
+  assert.match(buildAutopilotRelay(record), /no calibrated noise band for this condition \(inputs=production-trajectory\) and the operator policy is abstain/)
+})
+
+test("R3 3.4: usage.calls must equal nComparisons x criteria x evaluations on a successful ranking", async () => {
+  const exact = (req) => ({ index: 0, bestPreview: "", scores: [0.9, 0.4], ranking: [0, 1], nComparisons: 2, criteria: ["c1"], usage: { calls: 2, input_tokens: 1, cached_input_tokens: 0, uncached_input_tokens: 1, output_tokens: 1, reasoning_tokens: 0, cache_hit_rate: 0 } })
+  const ok = await decisiveRun({}, exact)
+  assert.equal(ok.record.expectedVerifierCalls, 2)
+  assert.equal(ok.record.verifierCallsAnomaly, undefined)
+  const off = await decisiveRun({}, (req) => ({ ...exact(req), usage: { ...exact(req).usage, calls: 5 } }))
+  assert.deepEqual(off.record.verifierCallsAnomaly, { expected: 2, observed: 5 })
+  assert.equal(off.record.outcome, "ranked_winner", "the anomaly is surfaced, not turned into a different outcome")
+})
+
+test("R3 3.1: selectionUncalibratedMarginPolicy is a validated setting defaulting to 'flag'", async () => {
+  const host = new VerifierHost(fakeContext(), hostOverrides({ enabled: false }))
+  assert.equal(host.getConfig().selectionUncalibratedMarginPolicy ?? "flag", "flag")
+  assert.throws(() => host.setConfig({ selectionUncalibratedMarginPolicy: "never" }), /config-selection-uncalibrated-margin-policy-invalid/)
+  host.setConfig({ selectionUncalibratedMarginPolicy: "abstain" })
+  assert.equal(host.getConfig().selectionUncalibratedMarginPolicy, "abstain")
+  await host.dispose()
 })

@@ -64,6 +64,11 @@ export interface Config {
   /** Calibrated-but-provisional top-2 margin gate for the winner state machine
    *  (ruling I.1/I.4); records retain the exact threshold used. */
   selectionMarginThreshold: number
+  /** Review R3 3.1: what the margin gate does when the run's condition
+   *  (verifier, N, criteria, evaluations, pivots, inputs) has no calibrated
+   *  noise band. 'flag' (default) keeps the gate and labels the result
+   *  uncalibrated; 'abstain' refuses to name a verifier winner. */
+  selectionUncalibratedMarginPolicy: 'flag' | 'abstain'
   /** Probe candidate models for liveness before planning (default true):
    *  catalog membership is not availability (ruling 6.4 kimi-k3 window). */
   selectionProbeEnabled: boolean
@@ -131,10 +136,13 @@ export const Config = z.object({
   selectionPivots: z.number().step(1).min(0).max(5).default(0),
   selectionCandidateTimeoutMs: z.number().step(1000).min(30000).max(1800000).default(600000),
   selectionSelectTimeoutMs: z.number().step(1000).min(30000).max(600000).default(600000),
-  // 临时噪声门限（ruling I.1）：top-2 margin 低于它一律 abstain。2026-09-08
-  // 校准首轮（C0 24 次同文复跑）噪声 q95=0.0123、最大 0.0135、位置偏差≈0；
-  // 0.03 = 观测噪声上限的 2.2 倍，仍标 provisional 待多 fixture 复核。
+  // 临时噪声门限（ruling I.1）：top-2 margin 低于它一律 abstain。依据是
+  // kimi-k3@low、N=2、C=1、K=1、P=0、合成短 fixture 的 C0 自比较（第 2–5 轮
+  // 共 240 帧，最大 0.01377；0.03 ≈ 2.17 倍），仍为 provisional。其它条件
+  // 都未校准，见 src/selection/calibration.ts（review R3 3.1）。
   selectionMarginThreshold: z.number().min(0).max(0.5).default(DEFAULT_SELECTION_MARGIN_THRESHOLD),
+  // 条件未校准时的处理：flag（默认，照常过门限但标注未校准）或 abstain。
+  selectionUncalibratedMarginPolicy: z.union(['flag', 'abstain']).default('flag'),
   selectionProbeEnabled: z.boolean().default(true),
   // 后置审计可选测试命令（G-4）：空 = 绝不自动跑用户仓库的测试，delivered
   // 只可能到 unknown/no。

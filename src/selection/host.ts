@@ -75,6 +75,8 @@ export interface SelectionHostDeps {
   pivotsDefault?: () => number
   /** Provisional margin gate for the winner state machine (ruling I.1). */
   marginThresholdDefault?: () => number
+  /** Review R3 3.1: uncalibrated-condition policy for the margin gate. */
+  uncalibratedMarginPolicyDefault?: () => 'flag' | 'abstain'
   /** Config default for the selection time budget when /select omits it. */
   selectTimeoutMsDefault?: () => number
   /** Directory for the per-selection audit pack written BEFORE cleanup
@@ -631,6 +633,7 @@ export class SelectionHost {
     if (!sourceCwd && !injectedHarness) {
       throw new SelectionApiError(400, 'source-cwd-required', 'candidate selection requires a resolvable Git source session or workspace: without it candidates run in the host process directory and can overwrite host files')
     }
+    const uncalibratedMarginPolicy = this.deps.uncalibratedMarginPolicyDefault?.() === 'abstain' ? 'abstain' as const : 'flag' as const
     const marginThreshold = normalizeMarginThreshold(
       body.marginThreshold,
       this.deps.marginThresholdDefault?.() ?? PROVISIONAL_MARGIN_THRESHOLD,
@@ -689,6 +692,7 @@ export class SelectionHost {
       candidateTimeoutMs: normalizeCandidateTimeoutMs(body.candidateTimeoutMs, this.deps.candidateTimeoutMsDefault?.()),
       selectTimeoutMs,
       marginThreshold,
+      uncalibratedMarginPolicy,
       verifierModel: verifierConf.model,
       verifierEffort: verifierConf.effort ?? null,
       verifierBaseURLHost: safeHost(verifierConf.baseURL),
@@ -767,6 +771,7 @@ export class SelectionHost {
       ...(body.policy ? { policy: body.policy } : {}),
       taskKind: body.taskKind ?? body.policy?.taskKind,
       marginThreshold,
+      uncalibratedMarginPolicy,
       recordSeed: {
         configSnapshot,
         sourceModel,

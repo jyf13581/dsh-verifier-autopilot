@@ -199,6 +199,7 @@ export class VerifierHost {
       nEvaluationsDefault: () => this.config.selectionEvaluations,
       pivotsDefault: () => this.config.selectionPivots,
       marginThresholdDefault: () => this.config.selectionMarginThreshold,
+      uncalibratedMarginPolicyDefault: () => this.config.selectionUncalibratedMarginPolicy,
       selectTimeoutMsDefault: () => this.config.selectionSelectTimeoutMs,
       // I.5 audit pack sits next to the ledger; disabled when the ledger is.
       artifactsDir: options.selectionsFile == null ? null : path.join(path.dirname(options.selectionsFile), 'selection-artifacts'),
@@ -552,7 +553,7 @@ export class VerifierHost {
       ? '[Selection 结算] ' + record.selectionId + ' 已完成：outcome=' + (record.outcome ?? 'legacy')
         + '，' + (record.winner ? 'winner=c' + record.winner.index : 'fallback=c' + slot.index + '（未经候选间比较，非选优结论）')
         + (scores ? '（scores ' + scores + '，比较 ' + (record.nComparisons ?? 0) + ' 次）' : '')
-        + (record.margin !== undefined ? '（margin ' + record.margin.toFixed(4) + ' / 阈值 ' + (record.marginThreshold ?? 'n/a') + (record.marginProvisional ? '，临时' : '') + '）' : '')
+        + (record.margin !== undefined ? '（margin ' + record.margin.toFixed(4) + ' / 阈值 ' + (record.marginThreshold ?? 'n/a') + (record.marginProvisional ? '，临时' : '') + (record.marginCalibration?.status === 'uncalibrated' ? '，本条件未校准' : '') + '）' : '')
         + '。loser/淘汰候选已回收（会话与工作区均已删除）。保留对象的工作区位于 ' + slot.workspace + '，面板里可"丢弃 winner"彻底清理。此消息为结算通知，无需回复。'
       : '[Selection 结算] ' + record.selectionId + ' 结束：status=' + record.status + (record.outcome ? '，outcome=' + record.outcome : '') + (record.error ? '（' + record.error + '）' : '') + '，候选已全部回收。此消息为结算通知，无需回复。'
     const failed = (error: unknown): void => this.diagnostics.warn('selection.notice', error, { selectionId: record.selectionId })
