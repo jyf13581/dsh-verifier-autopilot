@@ -88,8 +88,75 @@ def _install_tolerant_tag_lookup() -> None:
     fgr._find_tag_logprobs = tolerant
 
 
+class _ExtractionCounter:
+    """Per-select tally of HOW each verifier score was read (review R3 3.5).
+
+    The upstream extractor never raises: with no score-token distribution it
+    parses the literal letter, and with no parseable tag at all it returns a
+    neutral 0.5. on_error='raise' cannot see either, so a malformed reply was
+    indistinguishable from a genuine 0.5, and a single defaulted slot next to
+    a real score manufactures a preference. The legacy TS lane stack fails
+    closed on the same inputs. Counts are returned with every select result."""
+
+    def __init__(self) -> None:
+        import threading
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._counts = {"logprobs": 0, "literal": 0, "default": 0}
+
+    def add(self, kind: str) -> None:
+        with self._lock:
+            self._counts[kind] = self._counts.get(kind, 0) + 1
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._counts)
+
+
+EXTRACTION = _ExtractionCounter()
+
+
+def _install_extraction_counter() -> None:
+    """Wrap extract_score so every call is classified. The score itself is
+    the untouched upstream value; classification mirrors its branches."""
+    import re
+    from llm_verifier import fine_grained_reward as fgr
+
+    original = fgr.extract_score
+
+    def classify(text, tokens, position_logprobs, tag) -> str:
+        valid = fgr.SCALE["valid_tokens"]
+        for tok_str, _ in fgr._find_tag_logprobs(tokens, position_logprobs, tag) or []:
+            tok = tok_str.strip()
+            if tok.startswith(">"):
+                tok = tok[1:].strip()
+            if tok in valid:
+                return "logprobs"
+        name = tag.strip("<>")
+        matches = list(re.finditer(rf"<{re.escape(name)}>\s*(.+?)\s*</{re.escape(name)}>", text or "", re.IGNORECASE))
+        if matches:
+            letter = matches[-1].group(1).strip()
+            if letter in valid or any(letter.lower() == k.lower() for k in valid):
+                return "literal"
+        return "default"
+
+    def counted(text, tokens, position_logprobs, tag):
+        value = original(text, tokens, position_logprobs, tag)
+        try:
+            EXTRACTION.add(classify(text, tokens, position_logprobs, tag))
+        except Exception:
+            EXTRACTION.add("default")
+        return value
+
+    fgr.extract_score = counted
+
+
 if llm_verifier is not None:
     _install_tolerant_tag_lookup()
+    _install_extraction_counter()
 
 MAX_MSG = 500
 
@@ -409,6 +476,7 @@ def _handle_select(req_id: Optional[str], req: Dict[str, Any]) -> None:
         cache_dir = tempfile.mkdtemp(prefix="llv-cache-")
         cache_path = os.path.join(cache_dir, "scores.json")
         USAGE.reset()
+        EXTRACTION.reset()
         try:
             with _effort_scoped(v["effort"]):
                 result = llm_verifier.select(
@@ -432,6 +500,7 @@ def _handle_select(req_id: Optional[str], req: Dict[str, Any]) -> None:
             "n_comparisons": result.n_comparisons,
             "criteria": list(result.criteria),
             "usage": USAGE.snapshot(),
+            "extraction": EXTRACTION.snapshot(),
         })
     except Exception as exc:
         code, retriable = _map_exception(exc)

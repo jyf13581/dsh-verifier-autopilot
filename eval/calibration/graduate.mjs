@@ -7,16 +7,26 @@
  * round instead of re-deriving the table by hand.
  *
  *   node eval/calibration/graduate.mjs [condition]
+ *   env: CAL_THRESHOLD (default: the shipped DEFAULT_SELECTION_MARGIN_THRESHOLD)
+ *
+ * A GRADUATE verdict covers only the condition the rounds measured (see
+ * src/selection/calibration.ts): graduating means updating that registry
+ * entry, never declaring the threshold valid for other verifiers, criteria
+ * counts, candidate counts, or production-length inputs (review R3 3.1).
  */
 import { readdirSync, readFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from "../../lib/constants.js"
+import { CALIBRATED_CONDITIONS } from "../../lib/selection/calibration.js"
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..")
 const calDir = path.join(repoRoot, ".data", "calibration")
 const condition = process.argv[2] ?? "kimi-k3@low"
 
-const THRESHOLD = 0.03           // current selectionMarginThreshold
+// The shipped default, not a copy that can drift from it (review R3 3.6).
+const THRESHOLD = process.env.CAL_THRESHOLD ? Number(process.env.CAL_THRESHOLD) : DEFAULT_SELECTION_MARGIN_THRESHOLD
+if (!Number.isFinite(THRESHOLD) || THRESHOLD <= 0) { console.error("CAL_THRESHOLD must be a positive number"); process.exit(1) }
 const SAFETY = 2.0               // graduation gate per the invoice (<= 1/2.0)
 const SAFETY_REPORT = 2.2        // historical observation line, report-only
 const TRIPWIRE_MAX = 0.015       // C0 max above this forces re-thresholding
@@ -63,6 +73,9 @@ const checks = [
 ]
 
 console.log(`condition    : ${condition}`)
+const registered = CALIBRATED_CONDITIONS.filter((c) => c.verifier.toLowerCase() === condition.toLowerCase())
+console.log(`registry     : ${registered.length ? registered.map((c) => `N=${c.survivors} C=${c.criteria} K=${c.evaluations} P=${c.pivots} ${c.inputs} threshold=${c.threshold} ${c.status}`).join("; ") : "no entry in src/selection/calibration.ts (a GRADUATE verdict must add one)"}`)
+console.log(`threshold    : ${THRESHOLD}`)
 console.log(`valid rounds : ${valid.length} -> ${valid.map((r) => r.label).join(", ")}`)
 if (voided.length) console.log(`void rounds  : ${voided.map((r) => `${r.label} (failures=${r.failures})`).join(", ")}  [excluded]`)
 console.log("")

@@ -13,13 +13,18 @@
 // --routes=N / --fallback pass through to /api/eval
 //
 // Run: npm run eval   (requires the plugin to be loaded in the local DSH host)
+//   env: DSH_VA_API_BASE (default http://127.0.0.1:3080/@dsh-external/dsh-verifier-autopilot/api),
+//        DSH_VA_API_TOKEN when the host requires the bearer token
 
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { SCENARIOS } from './scenarios.mjs'
 import { traceFor } from '../lib/index.js'
 import { decideFeedback } from '../lib/verifier.js'
 
-const BASE = 'http://127.0.0.1:3080/@dsh-external/dsh-verifier-autopilot/api'
+// Review R3 3.6: the host address and the optional API token (review R1 1.3)
+// come from the environment; the default is the local DSH host.
+const BASE = (process.env.DSH_VA_API_BASE || 'http://127.0.0.1:3080/@dsh-external/dsh-verifier-autopilot/api').replace(/\/+$/, '')
+const AUTH = process.env.DSH_VA_API_TOKEN ? { authorization: 'Bearer ' + process.env.DSH_VA_API_TOKEN } : {}
 
 const argv = new Map(process.argv.slice(2).map(arg => {
   const eq = arg.indexOf('=')
@@ -44,7 +49,7 @@ async function evalScenario(s, round) {
   try {
     const res = await fetch(BASE + '/eval', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', ...AUTH },
       body: JSON.stringify({ problem: built.problem, trace: built.trace, ...routeOverride }),
       signal: AbortSignal.timeout(180000),
     })

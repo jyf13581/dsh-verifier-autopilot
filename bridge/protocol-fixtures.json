@@ -67,7 +67,8 @@
           "output_tokens": 5,
           "reasoning_tokens": 0,
           "cache_hit_rate": 0.0
-        }
+        },
+        "extraction": { "logprobs": 2, "literal": 0, "default": 0 }
       }
     },
     "progress": {

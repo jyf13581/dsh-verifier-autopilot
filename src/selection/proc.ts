@@ -51,6 +51,29 @@ export interface ProcessResult {
   error?: string
 }
 
+/** Environment-variable names that carry credentials by convention: any
+ *  `_`-delimited segment naming a key, token, secret, password, credential, or
+ *  auth handle (KIMI_API_KEY, GITHUB_TOKEN, AWS_SECRET_ACCESS_KEY,
+ *  SSH_AUTH_SOCK, NPM_CONFIG__AUTH). Matching is per segment, so KEYBOARD or
+ *  TOKENIZERS_PARALLELISM survive. */
+const SECRET_ENV_NAME = /(?:^|_)(?:API_?KEYS?|KEYS?|TOKENS?|SECRETS?|PASSWORDS?|PASSWD|PASS|CREDENTIALS?|AUTH|PRIVATE)(?:_|$)/i
+
+/** Review R1 (1.2): a copy of `env` without credential-shaped variables and
+ *  without the explicitly named ones (the configured verifier key). Objective
+ *  checks and the post-audit execute candidate-authored code (`npm test` runs
+ *  whatever tests the candidate wrote), so they must not inherit the Host's
+ *  provider keys. PATH, HOME, locale, proxy, and toolchain variables stay. */
+export function scrubSecretEnv(extraNames: readonly string[] = [], env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const explicit = new Set(extraNames.filter(name => typeof name === 'string' && name).map(name => name.toUpperCase()))
+  const out: NodeJS.ProcessEnv = {}
+  for (const [name, value] of Object.entries(env)) {
+    if (value === undefined) continue
+    if (explicit.has(name.toUpperCase()) || SECRET_ENV_NAME.test(name)) continue
+    out[name] = value
+  }
+  return out
+}
+
 /** How long a killed child may take to release its stdio before we stop waiting. */
 const KILL_GRACE_MS = 2000
 /** How long after `exit` we wait for `close` (stdio flush) before settling anyway. */
