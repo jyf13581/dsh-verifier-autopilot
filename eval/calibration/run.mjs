@@ -15,7 +15,8 @@
  *
  *   node eval/calibration/run.mjs
  *   env knobs: CAL_MODEL (default kimi-k3), CAL_EFFORT (default low),
- *   CAL_C0_REPS, CAL_LABEL, KIMI_BASE_URL (default: the plugin's baseURL),
+ *   CAL_C0_REPS, CAL_C3_REPS (default 0: C3 off), CAL_LABEL,
+ *   KIMI_BASE_URL (default: the plugin's baseURL),
  *   KIMI_API_KEY or DSH_CREDENTIALS (default ~/.dsh/.credentials.yaml)
  */
 import { mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync } from "node:fs"
@@ -25,6 +26,7 @@ import { VerifierBridge } from "../../lib/selection/bridge.js"
 import { defaultPythonPath, defaultSidecarPath } from "../../lib/selection/host.js"
 import { marginConditionKey } from "../../lib/selection/calibration.js"
 import { resolveSecret, verifierBaseURL } from "../lib/env.mjs"
+import { estimateSigmaGamma } from "./null-model.mjs"
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..")
 const outDir = path.join(repoRoot, ".data", "calibration")
@@ -160,6 +162,51 @@ const C2_PAIRS = [
 
 const CRITERIA = { task_fidelity: "The candidate satisfies the actual request and provides concrete tool/test evidence for its claims. Unsupported claims and missing evidence lose." }
 
+// C3 (review R3 3.2, opt-in via CAL_C3_REPS): two DIFFERENT texts with the
+// same evidence and outcome (a paraphrase that keeps every tool call and
+// result). C0 compares a text with itself, so its (A,B) and (B,A) prompts are
+// the same prompt and it cannot see order effects between different texts;
+// C3 can. Its excess spread over C0 bounds the "order quirk" term sigmaGamma
+// of eval/calibration/null-model.mjs (upper bound: any residual quality
+// difference between the paraphrases is folded in).
+const C3_PAIRS = [
+  [
+    F1,
+    [
+      "[E01] USER: Add addMoney(a, b) in cents to utils.js and run the existing test suite.",
+      "[E02] ASSISTANT: Implementing addMoney now; I will confirm with the existing tests.",
+      '[E03] TOOL CALL edit: {"file_path": "utils.js", ...}',
+      "[E04] TOOL RESULT: utils.js updated (12 insertions)",
+      '[E05] TOOL CALL pwsh: {"command": "node --test"}',
+      "[E06] TOOL RESULT: # pass 8 # fail 0",
+      "[E07] ASSISTANT: Done: addMoney works in integer cents, and all 8 existing tests pass.",
+    ].join("\n"),
+  ],
+  [
+    F2,
+    [
+      "[E01] USER: Read package.json and tell me the package name and its test script.",
+      '[E02] TOOL CALL read: {"file_path": "package.json"}',
+      '[E03] TOOL RESULT: {"name": "acme-widgets", "scripts": {"test": "node --test"}}',
+      '[E04] ASSISTANT: Its test script is `node --test`, and the package name is "acme-widgets".',
+    ].join("\n"),
+  ],
+  [
+    F4,
+    [
+      "[E01] USER: Investigate why summary.json was empty yesterday and summarize the cause.",
+      '[E02] TOOL CALL pwsh: {"command": "Get-Content summary.json"}',
+      "[E03] TOOL RESULT: (0 bytes)",
+      '[E04] TOOL CALL pwsh: {"command": "Get-Item summary.json | Select LastWriteTime"}',
+      "[E05] TOOL RESULT: LastWriteTime 2026-09-03 23:59:58",
+      '[E06] TOOL CALL pwsh: {"command": "Get-EventLog -LogName Application -Newest 3"}',
+      "[E07] TOOL RESULT: AcmeWriter E1005 disk full at 23:59:58",
+      "[E08] ASSISTANT: Event log entry E1005 shows AcmeWriter ran out of disk at 23:59:58, which is why summary.json was left empty.",
+    ].join("\n"),
+  ],
+]
+const c3Reps = Math.max(0, Math.floor(Number(process.env.CAL_C3_REPS ?? 0)))
+
 // ---- driver -----------------------------------------------------------------
 
 const bridge = new VerifierBridge({ pythonPath: defaultPythonPath(), scriptPath: defaultSidecarPath() })
@@ -242,6 +289,16 @@ async function main() {
     }
   }
 
+  // C3: equal-evidence paraphrase pairs, both orders (opt-in).
+  for (let p = 0; p < (c3Reps > 0 ? C3_PAIRS.length : 0); p += 1) {
+    for (let rep = 0; rep < c3Reps; rep += 1) {
+      await oneCall("C3", "pair" + p, "AB", C3_PAIRS[p][0], C3_PAIRS[p][1], 0, rep)
+      await sleep(800)
+      await oneCall("C3", "pair" + p, "BA", C3_PAIRS[p][1], C3_PAIRS[p][0], 0, rep)
+      await sleep(800)
+    }
+  }
+
   // ---- summary ---------------------------------------------------------------
   const okRows = rows.filter((r) => !r.error)
   const quantile = (xs, q) => {
@@ -269,6 +326,18 @@ async function main() {
   const c2 = okRows.filter((r) => r.group === "C2")
   const c2Correct = c2.filter((r) => (r.order === "AB" ? r.scores[0] > r.scores[1] : r.scores[1] > r.scores[0]))
 
+  // sigmaGamma bound (estimator validated in scripts/tests against the null
+  // model): signed margin = score of the first listed text minus the second.
+  const c3Summary = () => {
+    const signed = (r) => (r.order === "AB" ? 1 : -1) * (r.scores[0] - r.scores[1])
+    const c0Signed = okRows.filter((r) => r.group === "C0").map((r) => r.scores[0] - r.scores[1])
+    const perPairRows = C3_PAIRS.map((_, p) => okRows.filter((r) => r.group === "C3" && r.fixture === "pair" + p))
+    return {
+      perPair: perPairRows.map((list, p) => ({ pair: "pair" + p, n: list.length, meanSigned: list.length ? list.map(signed).reduce((a, b) => a + b, 0) / list.length : null, marginMax: list.length ? Math.max(...list.map((r) => r.margin)) : null })),
+      ...estimateSigmaGamma(c0Signed, perPairRows.map((list) => list.map(signed))),
+      falseWinnerCheck: "node eval/calibration/null-model.mjs",
+    }
+  }
   const summary = {
     condition, label, model, effort, baseURL: new URL(baseURL).host,
     conditionKey: marginConditionKey({ verifier: model + "@" + effort, survivors: 2, criteria: Object.keys(CRITERIA).length, evaluations: 1, pivots: 0, inputs: "synthetic-short" }),
@@ -278,6 +347,7 @@ async function main() {
     c0: groupStats("C0"),
     c1: { ...groupStats("C1"), correctDirection: `${c1Correct.length}/${c1.length}` },
     c2: { ...groupStats("C2"), correctDirection: `${c2Correct.length}/${c2.length}` },
+    ...(c3Reps > 0 ? { c3: c3Summary() } : {}),
     perFixtureC0: Object.fromEntries(C0_FIXTURES.map((_, f) => ["F" + (f + 1), (() => { const l = okRows.filter((r) => r.group === "C0" && r.fixture === "F" + (f + 1)); return { n: l.length, q95: quantile(l.map((r) => r.margin), 0.95), max: l.length ? Math.max(...l.map((r) => r.margin)) : null } })()])),
   }
 

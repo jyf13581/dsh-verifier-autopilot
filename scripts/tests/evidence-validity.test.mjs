@@ -13,6 +13,7 @@ import { IsolatedWorkspaceManager, gitDiffStat, adoptionOf } from "../../lib/sel
 import { evaluateDelivery, SelectionRunner } from "../../lib/selection/candidates.js"
 import { lookupMarginCalibration, CALIBRATED_CONDITIONS } from "../../lib/selection/calibration.js"
 import { buildAutopilotRelay } from "../../lib/selection/autopilot.js"
+import { expectedC0Max, simulate, estimateSigmaGamma, signedFrame, rng } from "../../eval/calibration/null-model.mjs"
 import { makeGitRepo, runGit } from "./helpers/git.mjs"
 import { completedTurnEvents, fakeAgent, fakeContext, fireIdle, hostOverrides } from "./helpers/host.mjs"
 import { fakeBridge, makeFakeFactory, realWorkspaces, selInput } from "./helpers/selection.mjs"
@@ -293,4 +294,34 @@ test("R3 3.6: eval drivers carry no machine-specific paths or duplicated thresho
     if (/THRESHOLD\s*=\s*0\.\d/.test(text)) offenders.push(file + ": hardcoded margin threshold")
   }
   assert.deepEqual(offenders, [])
+})
+
+test("R3 3.2: the null model reproduces the invoice and shows C0 is blind to order quirks", () => {
+  // sigmaEta 0.0129 was fitted to the invoice's C0 max (0.01377 over 240 frames).
+  const c0max = expectedC0Max(0.0129, { reps: 60 })
+  assert.ok(Math.abs(c0max - 0.01377) / 0.01377 < 0.06, "model C0 max " + c0max)
+  const cell = { n: 2, criteria: 1, evaluations: 1, sigmaEta: 0.0129 }
+  const c0Quiet = simulate({ ...cell, sigmaGamma: 0, identical: true }, { trials: 4000 })
+  const c0Quirky = simulate({ ...cell, sigmaGamma: 0.1, identical: true }, { trials: 4000 })
+  assert.ok(Math.abs(c0Quirky.q95 - c0Quiet.q95) / c0Quiet.q95 < 0.1, "identical texts share one prompt, so a quirk cannot move C0")
+  const real = simulate({ ...cell, sigmaGamma: 0.05 }, { trials: 4000 })
+  assert.ok(real.falseWinnerRate > 0.05, "a one-level quirk between different equal texts clears 0.03 often: " + real.falseWinnerRate)
+  assert.equal(c0Quirky.falseWinnerRate, 0)
+})
+
+test("R3 3.2: the C3 estimator recovers a known sigmaGamma and reports ~0 without one", () => {
+  const r = rng(11)
+  const sample = (sigmaGamma, pairs = 60, frames = 12) => {
+    const c0 = Array.from({ length: 200 }, () => signedFrame(0, 0, 0.0129, r))
+    const perPair = Array.from({ length: pairs }, () => {
+      const gab = sigmaGamma * r.normal()
+      const gba = sigmaGamma * r.normal()
+      return Array.from({ length: frames }, () => signedFrame(gab, gba, 0.0129, r))
+    })
+    return estimateSigmaGamma(c0, perPair).sigmaGammaUpper
+  }
+  const recovered = sample(0.05)
+  assert.ok(recovered > 0.04 && recovered < 0.06, "recovered " + recovered)
+  assert.ok(sample(0) < 0.012, "no quirk -> near-zero bound")
+  assert.equal(estimateSigmaGamma([0.01], [[0.1]]).sigmaGammaUpper, null, "too little data is reported as unknown")
 })
