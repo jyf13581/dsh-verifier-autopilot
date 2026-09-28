@@ -5,7 +5,7 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, writeFileSync, readFileSync, rmSync, copyFileSync } from "node:fs"
+import { mkdtempSync, writeFileSync, readFileSync, rmSync, copyFileSync, readdirSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { VerifierHost } from "../../lib/index.js"
@@ -280,4 +280,17 @@ test("R3 3.1: selectionUncalibratedMarginPolicy is a validated setting defaultin
   host.setConfig({ selectionUncalibratedMarginPolicy: "abstain" })
   assert.equal(host.getConfig().selectionUncalibratedMarginPolicy, "abstain")
   await host.dispose()
+})
+
+test("R3 3.6: eval drivers carry no machine-specific paths or duplicated threshold literals", () => {
+  const root = new URL("../../eval/", import.meta.url)
+  const files = readdirSync(root, { recursive: true }).filter((f) => /\.(mjs|py)$/.test(f))
+  assert.ok(files.length >= 5, "fixture: eval drivers found")
+  const offenders = []
+  for (const file of files) {
+    const text = readFileSync(new URL(file, root), "utf8")
+    if (/[A-Z]:[\\/]+Users[\\/]/i.test(text)) offenders.push(file + ": user-profile path")
+    if (/THRESHOLD\s*=\s*0\.\d/.test(text)) offenders.push(file + ": hardcoded margin threshold")
+  }
+  assert.deepEqual(offenders, [])
 })
