@@ -97,6 +97,17 @@ export interface BridgeSelectResult {
   nComparisons: number
   criteria: string[]
   usage: BridgeUsage
+  /** How each verifier score was read (review R3 3.5): from the score-token
+   *  distribution, from the literal letter only, or the neutral 0.5 the
+   *  upstream extractor substitutes when no tag parses. Absent on sidecars
+   *  that predate the counter. */
+  extraction?: ScoreExtraction
+}
+
+export interface ScoreExtraction {
+  logprobs: number
+  literal: number
+  default: number
 }
 
 export interface VerifierBridgeOptions {
@@ -226,7 +237,20 @@ export function parseSelectResult(value: unknown): BridgeSelectResult {
     nComparisons: finiteNumber(value, 'n_comparisons'),
     criteria: stringArray(value, 'criteria'),
     usage: parseUsage(value.usage),
+    ...parseExtraction(value.extraction),
   }
+}
+
+/** Telemetry like usage: a malformed tally is dropped, never a verdict error. */
+function parseExtraction(raw: unknown): { extraction?: ScoreExtraction } {
+  if (!isRecord(raw)) return {}
+  const count = (key: string): number | null => {
+    const v = raw[key]
+    return typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null
+  }
+  const logprobs = count('logprobs'), literal = count('literal'), fallback = count('default')
+  if (logprobs === null || literal === null || fallback === null) return {}
+  return { extraction: { logprobs, literal, default: fallback } }
 }
 
 export function parseProgressResult(value: unknown): BridgeProgressResult {

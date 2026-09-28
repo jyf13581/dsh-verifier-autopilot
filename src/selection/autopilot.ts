@@ -293,6 +293,12 @@ export function buildAutopilotRelay(record: SelectionRecord): string {
       + ' condition=' + (record.marginCondition ?? 'n/a')
       + (cal ? ' calibration=' + cal.status + (cal.status === 'uncalibrated' ? ' [differs in: ' + describeMismatch(cal) + ']' : '') : ''))
   }
+  const extraction = record.scoreExtraction
+  if (extraction && extraction.literal + extraction.default > 0) {
+    const total = extraction.logprobs + extraction.literal + extraction.default
+    lines.push('Score extraction: ' + (extraction.literal + extraction.default) + ' of ' + total + ' verifier scores had no score-token distribution ('
+      + extraction.literal + ' literal letter, ' + extraction.default + ' neutral 0.5 substituted for an unparseable reply); the margin may be an artifact of reply formatting.')
+  }
   if (record.noSearchSpace) lines.push('Flag: no-search-space (all survivor diffs identical; deduped before the verifier)')
   if (!record.noSearchSpace && record.dedupedCandidates?.length) lines.push('Flag: deduped ' + record.dedupedCandidates.map((i) => 'c' + i).join(', ') + ' (byte-identical to a kept survivor; not ranked separately)')
   if (record.llmOnly) lines.push('Flag: llm-only (no candidate carried passing objective checks; LLM was the only signal)')

@@ -136,10 +136,23 @@ All responses contain the same `id` as the request (unless the request was malfo
       "reasoning_tokens": <integer>,
       "cache_hit_rate": <float>,
       "uncached_input_tokens": <integer>
+    },
+    "extraction": {            // optional (review R3 3.5); absent on older sidecars
+      "logprobs": <integer>,   // scores read from the score-token distribution
+      "literal": <integer>,    // no usable distribution: literal letter parsed
+      "default": <integer>     // no parseable tag: upstream substituted 0.5
     }
   }
 }
 ```
+
+`extraction` counts every `extract_score` call of the request (two per
+verifier call: `score_A` and `score_B`). The upstream extractor never raises,
+so `on_error="raise"` cannot catch an unparseable reply; any `default > 0`
+means a ranking input was a substituted neutral score, not a verifier
+judgment. The host records the tally as `scoreExtraction` and names it in the
+relay. Like `usage`, a malformed tally is dropped rather than failing the
+verdict.
 
 ### Failure Response
 

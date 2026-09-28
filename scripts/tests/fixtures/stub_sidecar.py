@@ -98,7 +98,8 @@ for line in sys.stdin:
                  "ranking": list(range(n)),
                  "n_comparisons": n,
                  "criteria": list(canonical["criteria"]),
-                 "usage": dict(canonical["usage"])})
+                 "usage": dict(canonical["usage"]),
+                 "extraction": dict(canonical["extraction"])})
         continue
     err(rid, "invalid_request", message="unknown type")
 sys.exit(0)

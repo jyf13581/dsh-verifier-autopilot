@@ -24,7 +24,7 @@ import { read, readString } from '../payload.js'
 import { boundCandidateHandoff, renderTrajectory, type TrajectoryEvent } from './trajectory.js'
 import { runChecks, type CheckResult, type ObjectiveCheck } from './checks.js'
 export type { CheckResult, ObjectiveCheck } from './checks.js'
-import { BridgeError, type BridgeProgressRequest, type BridgeProgressResult, type BridgeSelectRequest, type BridgeSelectResult, type BridgeUsage } from './bridge.js'
+import { BridgeError, type BridgeProgressRequest, type BridgeProgressResult, type BridgeSelectRequest, type BridgeSelectResult, type BridgeUsage, type ScoreExtraction } from './bridge.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
 
 export type CandidateStatus =
@@ -138,6 +138,11 @@ export interface SelectionRecord {
   /** Review R3 3.4: usage.calls != nComparisons x criteria x evaluations on a
    *  successful ranking (scheduler/counter regression or tie-swallowing). */
   verifierCallsAnomaly?: { expected: number; observed: number | null }
+  /** Review R3 3.5: how the verifier scores behind this ranking were read.
+   *  Any `default` means at least one score was the neutral 0.5 the upstream
+   *  extractor substitutes for an unparseable reply, which can manufacture a
+   *  preference when only one slot defaulted. */
+  scoreExtraction?: ScoreExtraction
   /** Threshold remains provisional until the graduation invoice clears (I.4). */
   marginProvisional?: boolean
   /** At least one candidate's checks were shell-level failures (B-10). */
@@ -999,6 +1004,10 @@ export class SelectionRunner {
               if (observedCalls !== record.expectedVerifierCalls) {
                 record.verifierCallsAnomaly = { expected: record.expectedVerifierCalls, observed: observedCalls }
                 diag.count('verifier.calls_identity_violated')
+              }
+              if (selectResult.extraction) {
+                record.scoreExtraction = selectResult.extraction
+                if (selectResult.extraction.default > 0) diag.count('verifier.score_defaulted')
               }
               // Margin gate (ruling I.1/I.4, B-8): a verifier preference inside
               // the provisional calibrated noise band — exact ties included — abstains.

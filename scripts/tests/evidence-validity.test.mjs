@@ -15,6 +15,10 @@ import { lookupMarginCalibration, CALIBRATED_CONDITIONS } from "../../lib/select
 import { buildAutopilotRelay } from "../../lib/selection/autopilot.js"
 import { expectedC0Max, simulate, estimateSigmaGamma, signedFrame, rng } from "../../eval/calibration/null-model.mjs"
 import { makeGitRepo, runGit } from "./helpers/git.mjs"
+import { BRIDGE_PY } from "./helpers/sidecar.mjs"
+import { parseSelectResult } from "../../lib/selection/bridge.js"
+import { spawnSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
 import { completedTurnEvents, fakeAgent, fakeContext, fireIdle, hostOverrides } from "./helpers/host.mjs"
 import { fakeBridge, makeFakeFactory, realWorkspaces, selInput } from "./helpers/selection.mjs"
 import { waitFor } from "./helpers/harness.mjs"
@@ -324,4 +328,45 @@ test("R3 3.2: the C3 estimator recovers a known sigmaGamma and reports ~0 withou
   assert.ok(recovered > 0.04 && recovered < 0.06, "recovered " + recovered)
   assert.ok(sample(0) < 0.012, "no quirk -> near-zero bound")
   assert.equal(estimateSigmaGamma([0.01], [[0.1]]).sigmaGammaUpper, null, "too little data is reported as unknown")
+})
+
+test("R3 3.5: the sidecar classifies every upstream score extraction, including the silent 0.5 default", (t) => {
+  const fake = fileURLToPath(new URL("./fixtures/fake_llm_verifier", import.meta.url))
+  const bridgeDir = fileURLToPath(new URL("../../bridge", import.meta.url))
+  const script = [
+    "import json, llm_verifier_sidecar as sc",
+    "from llm_verifier import fine_grained_reward as fgr",
+    "lp = lambda l: [(l, -0.1), ('B', -2.5)]",
+    "toks = ['<score_A>', ' A', '</score_A>', '<score_B>', ' C', '</score_B>']",
+    "pos = [[], lp('A'), [], [], lp('C'), []]",
+    "out = {}",
+    "out['canonical'] = [fgr.extract_score(''.join(toks), toks, pos, t) for t in ('<score_A>', '<score_B>')]",
+    "bare = ['score_A>', ' A', '</score_A>']",
+    "out['bare'] = fgr.extract_score(''.join(bare), bare, [[], lp('A'), []], '<score_A>')",
+    "out['literal'] = fgr.extract_score('<score_A> D </score_A>', [], [], '<score_A>')",
+    "out['missing'] = fgr.extract_score('A is clearly better', [], [], '<score_B>')",
+    "out['counts'] = sc.EXTRACTION.snapshot()",
+    "sc.EXTRACTION.reset()",
+    "out['reset'] = sc.EXTRACTION.snapshot()",
+    "print(json.dumps(out))",
+  ].join("\n")
+  const run = spawnSync(BRIDGE_PY, ["-c", script], { cwd: bridgeDir, env: { ...process.env, PYTHONPATH: fake }, encoding: "utf8" })
+  if (run.error) { t.skip("python unavailable: " + run.error.message); return }
+  assert.equal(run.status, 0, run.stderr)
+  const out = JSON.parse(run.stdout.trim().split("\n").at(-1))
+  assert.ok(out.canonical[0] > 0.99 && out.canonical[1] > 0.85)
+  assert.ok(out.bare > 0.99, "the tolerant lookup recovers a bare score_A> distribution")
+  assert.equal(out.missing, 0.5, "upstream substitutes a neutral score instead of failing")
+  assert.deepEqual(out.counts, { logprobs: 3, literal: 1, default: 1 })
+  assert.deepEqual(out.reset, { logprobs: 0, literal: 0, default: 0 })
+})
+
+test("R3 3.5: extraction counts reach the record and the relay; malformed tallies are dropped", async () => {
+  const base = { index: 0, best_preview: "", scores: [0.9, 0.4], ranking: [0, 1], n_comparisons: 2, criteria: ["c1"], usage: { calls: 2 } }
+  assert.deepEqual(parseSelectResult({ ...base, extraction: { logprobs: 3, literal: 0, default: 1 } }).extraction, { logprobs: 3, literal: 0, default: 1 })
+  assert.equal(parseSelectResult({ ...base, extraction: { logprobs: -1, literal: 0, default: 0 } }).extraction, undefined)
+  assert.equal(parseSelectResult(base).extraction, undefined, "older sidecars omit the tally")
+  const { record } = await decisiveRun({}, () => ({ index: 0, bestPreview: "", scores: [0.9, 0.4], ranking: [0, 1], nComparisons: 2, criteria: ["c1"], usage: { calls: 2 }, extraction: { logprobs: 3, literal: 0, default: 1 } }))
+  assert.deepEqual(record.scoreExtraction, { logprobs: 3, literal: 0, default: 1 })
+  assert.match(buildAutopilotRelay(record), /Score extraction: 1 of 4 verifier scores had no score-token distribution \(0 literal letter, 1 neutral 0\.5/)
 })
