@@ -157,9 +157,18 @@ async function assertIgnoredSnapshotBoundary(sourceRoot: string): Promise<void> 
   }
 }
 
+/** Machine-read `git diff` output must not depend on the user's presentation
+ *  config: `diff.external` replaces the patch with a viewer's output,
+ *  `color.ui=always` injects ANSI codes even into a pipe, and a textconv
+ *  driver (active by default, `--binary` included) rewrites hunks into text
+ *  that no longer applies. Any of them made every seed snapshot fail with
+ *  workspace-patch-apply-failed, and corrupted evidence and relay patches
+ *  (review R4 4.2b). */
+const RAW_DIFF = ['--no-ext-diff', '--no-textconv', '--no-color'] as const
+
 async function mirrorGitWorkingState(sourceRoot: string, candidateRoot: string): Promise<void> {
   await assertIgnoredSnapshotBoundary(sourceRoot)
-  const patch = await execCapture('git', ['-C', sourceRoot, 'diff', '--binary', 'HEAD', '--', '.'], undefined, 60000)
+  const patch = await execCapture('git', ['-C', sourceRoot, 'diff', ...RAW_DIFF, '--binary', 'HEAD', '--', '.'], undefined, 60000)
   if (patch.code !== 0) throw new Error(patch.truncated ? 'workspace-patch-too-large' : 'workspace-patch-read-failed: ' + patch.error)
   if (patch.out.length > 0) {
     const apply = await execCapture('git', ['-C', candidateRoot, 'apply', '--whitespace=nowarn', '-'], undefined, 60000, 1024 * 1024, patch.out)
@@ -168,7 +177,7 @@ async function mirrorGitWorkingState(sourceRoot: string, candidateRoot: string):
   // Git apply may run checkout filters (notably core.autocrlf). Overlay every
   // changed tracked file from the live tree so candidate bytes match the source
   // worktree exactly; the patch still owns deletions, renames, and mode changes.
-  const changed = await execCapture('git', ['-C', sourceRoot, 'diff', '--name-only', '-z', 'HEAD', '--', '.'], undefined, 30000, 2 * 1024 * 1024)
+  const changed = await execCapture('git', ['-C', sourceRoot, 'diff', ...RAW_DIFF, '--name-only', '-z', 'HEAD', '--', '.'], undefined, 30000, 2 * 1024 * 1024)
   if (changed.code !== 0) throw new Error(changed.truncated ? 'workspace-tracked-list-too-large' : 'workspace-tracked-list-failed: ' + changed.error)
   const trackedEntries = changed.out.toString('utf8').split(String.fromCharCode(0)).filter(Boolean)
   if (trackedEntries.length > 5000) throw new Error('workspace-tracked-count-exceeded')
@@ -639,7 +648,7 @@ async function gitRoot(cwd: string): Promise<string | null> {
  *  `ls-files --others` is cwd-relative, and mixing the two from a subdirectory
  *  cwd hashed the wrong files (review R3, found in the R2 fingerprint). */
 async function workspaceEntries(root: string): Promise<WorkspaceEntry[] | null> {
-  const changed = await execWide('git', ['-C', root, 'diff', '--no-renames', '--name-only', '-z', 'HEAD'], root)
+  const changed = await execWide('git', ['-C', root, 'diff', ...RAW_DIFF, '--no-renames', '--name-only', '-z', 'HEAD'], root)
   if (changed.code !== 0) return null
   const others = await execWide('git', ['-C', root, 'ls-files', '--others', '--exclude-standard', '-z'], root)
   const tracked = new Set(nulList(changed.out))
@@ -725,7 +734,7 @@ export async function gitDiffStat(cwd: string): Promise<DiffStatLite | null> {
     const ownTracked = new Set(changes.own.filter((e) => e.tracked).map((e) => e.path))
     let insertions = 0
     let deletions = 0
-    const numstat = await execWide('git', ['-C', changes.root, 'diff', '--no-renames', '--numstat', '-z', 'HEAD'], changes.root)
+    const numstat = await execWide('git', ['-C', changes.root, 'diff', ...RAW_DIFF, '--no-renames', '--numstat', '-z', 'HEAD'], changes.root)
     if (numstat.code === 0) {
       for (const record of nulList(numstat.out)) {
         const parts = record.replace(/^\n+/, '').split('\t')
@@ -798,7 +807,7 @@ export async function gitDiffFull(cwd: string, patchCap = 262144): Promise<DiffF
     try { await cp(path.resolve(cwd, indexPath.out.trim()), scratchIndex) } catch { /* no index yet: git starts from an empty one */ }
     const scratchEnv = { ...process.env, GIT_INDEX_FILE: scratchIndex }
     await execWide('git', ['-C', cwd, 'add', '-N', '.'], cwd, scratchEnv)
-    const diff = await exec('git', ['-C', cwd, 'diff', 'HEAD', '--', '.'], { cwd, cap: patchCap, keep: 'head', env: scratchEnv })
+    const diff = await exec('git', ['-C', cwd, 'diff', ...RAW_DIFF, 'HEAD', '--', '.'], { cwd, cap: patchCap, keep: 'head', env: scratchEnv })
     if (diff.code !== 0) return null
     const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard'], cwd)
     const untrackedFiles = others.code === 0 ? others.out.split(/\r?\n/).filter(Boolean) : []

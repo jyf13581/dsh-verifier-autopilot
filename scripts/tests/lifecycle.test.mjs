@@ -6,7 +6,7 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
@@ -16,7 +16,7 @@ import { PREFLIGHT_OK_TTL_MS } from "../../lib/selection/host.js"
 import { createModelProber } from "../../lib/selection/probe.js"
 import { BridgeError } from "../../lib/selection/bridge.js"
 import { makeGitRepo, runGit } from "./helpers/git.mjs"
-import { IsolatedWorkspaceManager, gitDiffStat } from "../../lib/selection/live.js"
+import { IsolatedWorkspaceManager, gitDiffFull, gitDiffStat } from "../../lib/selection/live.js"
 import { completedTurnEvents, fakeAgent, fakeContext, fakeReq, fakeRes, fireIdle, hostOverrides } from "./helpers/host.mjs"
 import { fakeBridge, fakeEvents, makeFakeFactory, realWorkspaces, selInput, SEL_TMP } from "./helpers/selection.mjs"
 import { SelectionRunner } from "../../lib/selection/candidates.js"
@@ -432,4 +432,44 @@ test("R4 4.6: an in-flight progress sample is cancelled and drained before ranki
   assert.equal(inFlight, 0, "no sample outlives the run")
   assert.equal(record.status, "completed", String(record.error))
   assert.deepEqual(warnings.filter((scope) => scope === "progress.sample"), [], "the runner's own drain is not reported as a degradation")
+})
+
+// ---------- 4.2b: snapshots and evidence diffs ignore presentation config ----------
+
+test("R4 4.2b: a user's diff.external, color.ui=always or textconv cannot corrupt the seed patch or the evidence diff", { skip: process.platform === "win32" && "POSIX shell script as the external diff" }, async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r4-diffcfg-"))
+  const manager = new IsolatedWorkspaceManager(path.join(base, "ws"))
+  const dirs = []
+  try {
+    const repo = makeGitRepo(base, "source")
+    writeFileSync(path.join(repo, "data.dat"), "lower case payload\n")
+    runGit(repo, "add", "data.dat")
+    runGit(repo, "commit", "-qm", "add data")
+    // Ordinary ~/.gitconfig content, set here at repo level (which the
+    // candidate worktrees share): a diff viewer, forced colour, a textconv.
+    const ext = path.join(base, "extdiff.sh")
+    writeFileSync(ext, "#!/bin/sh\necho EXTERNAL-DIFF-OUTPUT \"$1\"\n")
+    chmodSync(ext, 0o755)
+    runGit(repo, "config", "diff.external", ext)
+    runGit(repo, "config", "color.ui", "always")
+    runGit(repo, "config", "diff.upper.textconv", "tr a-z A-Z <")
+    writeFileSync(path.join(repo, ".git", "info", "attributes"), "*.dat diff=upper\n")
+    writeFileSync(path.join(repo, "data.dat"), "lower case payload, edited\n")
+    writeFileSync(path.join(repo, "tracked.txt"), "tracked-base\nuser edit v1\n")
+
+    dirs.push(await manager.prepare({ selectionId: "sel-r4cfg", index: 0, sourceCwd: repo, strictSnapshot: true }))
+    assert.equal(read(dirs[0], "data.dat"), "lower case payload, edited\n")
+    assert.equal(read(dirs[0], "tracked.txt"), "tracked-base\nuser edit v1\n")
+
+    // The candidate's own work, as evidence and as the relay patch.
+    writeFileSync(path.join(dirs[0], "tracked.txt"), "tracked-base\ncandidate fix\n")
+    const full = await gitDiffFull(dirs[0])
+    assert.ok(full, "diff produced")
+    assert.match(full.patch, /^diff --git /, "a real unified diff (old code: external tool output or ANSI colour codes)")
+    assert.ok(!full.patch.includes("\u001b[") && !full.patch.includes("EXTERNAL-DIFF-OUTPUT"))
+    assert.match(full.patch, /\+candidate fix/)
+  } finally {
+    for (const dir of dirs) await manager.remove(dir).catch(() => {})
+    rmSync(base, { recursive: true, force: true })
+  }
 })
