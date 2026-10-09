@@ -6,13 +6,14 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs"
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { VerifierHost } from "../../lib/index.js"
-import { makeGitRepo } from "./helpers/git.mjs"
+import { makeGitRepo, runGit } from "./helpers/git.mjs"
+import { IsolatedWorkspaceManager, gitDiffStat } from "../../lib/selection/live.js"
 import { completedTurnEvents, fakeAgent, fakeContext, fireIdle, hostOverrides } from "./helpers/host.mjs"
 import { fakeBridge, makeFakeFactory, realWorkspaces, SEL_TMP } from "./helpers/selection.mjs"
 import { runProcess, runProcessCapture } from "../../lib/selection/proc.js"
@@ -209,4 +210,77 @@ test("R4 4.7: one spawn policy — only proc.ts (and the long-lived sidecar brid
   }
   walk(dir)
   assert.deepEqual(offenders, [], "spawn outside proc.ts bypasses kill escalation, group reclamation, and EPIPE containment")
+})
+
+// ---------- 4.2: one seed snapshot per selection ----------
+
+function dirtyRepo(base) {
+  const repo = makeGitRepo(base, "source")
+  writeFileSync(path.join(repo, "tracked.txt"), "tracked-base\nuser edit v1\n")
+  writeFileSync(path.join(repo, "notes.md"), "user notes v1\n")
+  return repo
+}
+const read = (dir, file) => existsSync(path.join(dir, file)) ? readFileSync(path.join(dir, file), "utf8") : null
+
+test("R4 4.2: every candidate starts from the same snapshot even while the source keeps working", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r4-seed-"))
+  const manager = new IsolatedWorkspaceManager(path.join(base, "ws"))
+  const dirs = []
+  try {
+    const repo = dirtyRepo(base)
+    const headAtStart = runGit(repo, "rev-parse", "HEAD")
+    dirs.push(await manager.prepare({ selectionId: "sel-r4seed", index: 0, sourceCwd: repo, strictSnapshot: true }))
+    // The source agent is not paused by autopilot: between two prepares it
+    // edits a file, commits, and creates another.
+    writeFileSync(path.join(repo, "tracked.txt"), "tracked-base\nuser edit v2\n")
+    writeFileSync(path.join(repo, "src", "entry.ts"), "export const value = 2\n")
+    runGit(repo, "commit", "-qam", "source agent commit")
+    writeFileSync(path.join(repo, "late.txt"), "created after c0 was prepared\n")
+    dirs.push(await manager.prepare({ selectionId: "sel-r4seed", index: 1, sourceCwd: repo, strictSnapshot: true }))
+    for (const file of ["tracked.txt", "notes.md", "late.txt", "src/entry.ts"]) {
+      assert.equal(read(dirs[1], file), read(dirs[0], file), file + ": c1 must see exactly what c0 saw (old code: the live source)")
+    }
+    assert.equal(runGit(dirs[1], "rev-parse", "HEAD"), runGit(dirs[0], "rev-parse", "HEAD"), "same commit (old code: c1 at the source agent's new commit)")
+    assert.equal(runGit(dirs[0], "rev-parse", "HEAD"), headAtStart)
+    assert.equal(read(dirs[1], "tracked.txt"), "tracked-base\nuser edit v1\n")
+    const report = manager.seedReport("sel-r4seed")
+    assert.deepEqual(report, { seedIndex: 0, head: headAtStart, attempts: 1, consistent: true })
+    // Copies inherit the seed's state as their baseline: no candidate starts with "work".
+    const stat = await gitDiffStat(dirs[1])
+    assert.equal(stat.files + stat.untracked, 0, "the copy's inherited state is not candidate work")
+  } finally {
+    for (const dir of dirs) await manager.remove(dir).catch(() => {})
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test("R4 4.2: a source edit during the seed snapshot triggers a re-snapshot; endless churn is reported, not hidden", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r4-torn-"))
+  const dirs = []
+  let manager
+  try {
+    const repo = dirtyRepo(base)
+    // Edit lands mid-snapshot on the first attempt only: the retry is clean.
+    manager = new IsolatedWorkspaceManager(path.join(base, "ws"), undefined, {
+      onSeedMirrored: (attempt) => { if (attempt === 1) writeFileSync(path.join(repo, "notes.md"), "user notes v2\n") },
+    })
+    dirs.push(await manager.prepare({ selectionId: "sel-r4torn", index: 0, sourceCwd: repo, strictSnapshot: true }))
+    assert.equal(read(dirs[0], "notes.md"), "user notes v2\n", "the re-snapshot holds the settled state")
+    assert.deepEqual({ ...manager.seedReport("sel-r4torn"), head: "-" }, { seedIndex: 0, head: "-", attempts: 2, consistent: true })
+    await manager.remove(dirs.pop())
+    assert.equal(manager.seedReport("sel-r4torn"), undefined, "removing the seed forgets it")
+
+    // Source changes during every attempt: bounded, and flagged.
+    let n = 0
+    manager = new IsolatedWorkspaceManager(path.join(base, "ws2"), undefined, {
+      onSeedMirrored: () => { n += 1; writeFileSync(path.join(repo, "notes.md"), "churn " + n + "\n") },
+    })
+    dirs.push(await manager.prepare({ selectionId: "sel-r4churn", index: 0, sourceCwd: repo, strictSnapshot: true }))
+    const report = manager.seedReport("sel-r4churn")
+    assert.equal(report.attempts, 3)
+    assert.equal(report.consistent, false)
+  } finally {
+    for (const dir of dirs) await manager?.remove(dir).catch(() => {})
+    rmSync(base, { recursive: true, force: true })
+  }
 })

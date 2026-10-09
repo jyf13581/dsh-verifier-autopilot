@@ -12,7 +12,7 @@ import { createReadStream } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import os from 'node:os'
 import path from 'node:path'
-import type { CandidateFactory, CandidateSpec, DiffStatLite, SelectionAgentHandle, WorkspaceManager } from './candidates.js'
+import type { CandidateFactory, CandidateSpec, DiffStatLite, SelectionAgentHandle, WorkspaceManager, WorkspaceSeedReport } from './candidates.js'
 import type { TrajectoryEvent } from './trajectory.js'
 import { runProcess, runProcessCapture } from './proc.js'
 import { isAgentScope, type AgentCreate } from '../dsh-context.js'
@@ -389,11 +389,29 @@ export class WorkspacePrepareError extends Error {
 const MANAGED_SELECTION_DIR = /^sel-[A-Za-z0-9][A-Za-z0-9-]{0,100}$/
 const MANAGED_CANDIDATE_DIR = /^c(\d+)$/
 
+const SEED_ATTEMPTS = 3
+
+/** HEAD plus a content fingerprint of every dirty/untracked file: equal
+ *  before and after a mirror = nothing changed while it was copied. */
+async function sourceFingerprint(sourceRoot: string): Promise<{ head: string; digest: string } | null> {
+  const head = await exec('git', ['-C', sourceRoot, 'rev-parse', '--verify', 'HEAD'])
+  if (head.code !== 0 || !head.out.trim()) return null
+  const stat = await gitDiffStat(sourceRoot)
+  if (!stat?.fingerprint) return null
+  return { head: head.out.trim(), digest: stat.fingerprint }
+}
+
 export class IsolatedWorkspaceManager implements WorkspaceManager {
   private readonly root: string
   private readonly storeRoot: string
   private readonly worktrees = new Map<string, WorktreeLease>()
-  constructor(root: string, sessionStoreRoot?: string) {
+  /** Review R4 4.2: the seed worktree per selection while it exists. */
+  private readonly seeds = new Map<string, { sourceRoot: string; worktreeRoot: string; report: WorkspaceSeedReport }>()
+  /** Test seam (review R4 4.2): runs after each seed mirror, before the
+   *  source is fingerprinted again — where a concurrent source edit lands. */
+  private readonly onSeedMirrored?: (attempt: number) => void | Promise<void>
+  constructor(root: string, sessionStoreRoot?: string, testing?: { onSeedMirrored?: (attempt: number) => void | Promise<void> }) {
+    this.onSeedMirrored = testing?.onSeedMirrored
     this.root = path.resolve(root)
     this.storeRoot = path.resolve(sessionStoreRoot ?? defaultSessionStoreRoot())
   }
@@ -458,13 +476,42 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
         const sourceCwd = path.resolve(sel.sourceCwd)
         const relativeCwd = path.relative(sourceRoot, sourceCwd)
         if (path.isAbsolute(relativeCwd) || relativeCwd.split(/[\\/]/).includes('..')) throw new Error('source-cwd-outside-git-root')
-        const add = await exec('git', ['-C', sourceRoot, 'worktree', 'add', '--detach', worktreeRoot, 'HEAD'], { timeoutMs: 60000 })
-        if (add.code !== 0) throw new Error('workspace-worktree-add-failed: ' + add.out)
         const candidateCwd = path.join(worktreeRoot, relativeCwd)
         const lease = { candidateCwd, worktreeRoot, sourceRoot }
-        this.worktrees.set(candidateCwd, lease)
+        const addAt = async (commit: string): Promise<void> => {
+          const add = await exec('git', ['-C', sourceRoot, 'worktree', 'add', '--detach', worktreeRoot, commit], { timeoutMs: 60000 })
+          if (add.code !== 0) throw new Error('workspace-worktree-add-failed: ' + add.out)
+          this.worktrees.set(candidateCwd, lease)
+        }
+        // Review R4 4.2: the source agent keeps working while candidates are
+        // prepared. Cutting every candidate from the live source gave each a
+        // different snapshot (even a different HEAD after a source commit), so
+        // the verifier compared unequal starting points. Only the first
+        // candidate (the seed) reads the live source — re-snapshotting while
+        // the source changed under it — and the rest copy the seed, which no
+        // agent touches until every workspace is prepared.
+        const seed = this.seeds.get(sel.selectionId)
         try {
-          await mirrorGitWorkingState(sourceRoot, worktreeRoot)
+          if (seed && seed.sourceRoot === sourceRoot) {
+            await addAt(seed.report.head)
+            await mirrorGitWorkingState(seed.worktreeRoot, worktreeRoot)
+          } else {
+            let report: WorkspaceSeedReport | undefined
+            for (let attempt = 1; attempt <= SEED_ATTEMPTS && !report; attempt += 1) {
+              const before = await sourceFingerprint(sourceRoot)
+              if (attempt > 1) await this.removeLease(lease)
+              await addAt(before?.head ?? 'HEAD')
+              await mirrorGitWorkingState(sourceRoot, worktreeRoot)
+              await this.onSeedMirrored?.(attempt)
+              const after = before ? await sourceFingerprint(sourceRoot) : null
+              const consistent = before && after ? before.head === after.head && before.digest === after.digest : null
+              if (consistent !== false || attempt === SEED_ATTEMPTS) {
+                const head = await exec('git', ['-C', worktreeRoot, 'rev-parse', '--verify', 'HEAD'])
+                report = { seedIndex: sel.index, head: head.out.trim() || (before?.head ?? 'HEAD'), attempts: attempt, consistent }
+              }
+            }
+            if (report) this.seeds.set(sel.selectionId, { sourceRoot, worktreeRoot, report })
+          }
           await mkdir(candidateCwd, { recursive: true })
           // After the mirror, before the candidate runs: what it inherited.
           // Best effort — without a baseline, evidence falls back to HEAD.
@@ -472,6 +519,7 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
           return candidateCwd
         } catch (error) {
           let cleanupError = ''
+          if (this.seeds.get(sel.selectionId)?.worktreeRoot === worktreeRoot) this.seeds.delete(sel.selectionId)
           try { await this.removeLease(lease) } catch (cleanup) { cleanupError = '; cleanup: ' + (cleanup instanceof Error ? cleanup.message : String(cleanup)) }
           const detail = error instanceof Error ? error.message : String(error)
           throw new WorkspacePrepareError(detail + cleanupError, candidateCwd)
@@ -483,8 +531,17 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
     return worktreeRoot
   }
 
+  /** Review R4 4.2: how this selection's candidates were seeded. */
+  seedReport(selectionId: string): WorkspaceSeedReport | undefined {
+    const seed = this.seeds.get(selectionId)
+    return seed ? { ...seed.report } : undefined
+  }
+
   async remove(dir: string): Promise<void> {
     const managed = this.managedPath(dir)
+    for (const [selectionId, seed] of this.seeds) {
+      if (managed === seed.worktreeRoot || managed.startsWith(seed.worktreeRoot + path.sep)) this.seeds.delete(selectionId)
+    }
     const lease = await this.discoverLease(managed)
     if (lease) await this.removeLease(lease)
     else {

@@ -151,6 +151,9 @@ export interface SelectionRecord {
   configSnapshot?: Record<string, unknown>
   sourceModel?: string | null
   sourceHeadAtStart?: string | null
+  /** Review R4 4.2: every candidate's starting state came from one seed
+   *  snapshot; `consistent:false` = the source kept changing under it. */
+  workspaceSeed?: WorkspaceSeedReport
   /** Free-text note carrying an abstain/fallback reason for the ledger. */
   note?: string
   /**
@@ -250,6 +253,21 @@ export interface CandidateFactory {
   create(spec: CandidateSpec): Promise<SelectionAgentHandle>
 }
 
+/** Review R4 4.2: how a selection's candidates were seeded from the source. */
+export interface WorkspaceSeedReport {
+  /** Candidate whose workspace was cut from the live source; every other
+   *  candidate was copied from it, so all start from the same bytes. */
+  seedIndex: number
+  /** The commit every candidate worktree was created at. */
+  head: string
+  /** Seed snapshots taken (a retry follows a source change mid-snapshot). */
+  attempts: number
+  /** true: the source was unchanged across the final snapshot; false: it kept
+   *  changing (the seed may mix states the source passed through); null: the
+   *  source could not be fingerprinted. */
+  consistent: boolean | null
+}
+
 export interface WorkspaceManager {
   prepare(sel: { selectionId: string; index: number; sourceCwd?: string; strictSnapshot?: boolean }): Promise<string>
   remove(path: string): Promise<void>
@@ -262,6 +280,9 @@ export interface WorkspaceManager {
    *  lists disposed losers as dead sessions pointing at deleted workspaces
    *  (the "目录损坏" ghosts counted 25 orphaned entries on 2026-08-30). */
   purgeSessionRecord?(candidateWorkspace: string): Promise<void>
+  /** Review R4 4.2: how the selection's candidates were seeded (absent for
+   *  managers that do not snapshot a source). */
+  seedReport?(selectionId: string): WorkspaceSeedReport | undefined
 }
 
 export interface SelectionRunnerDeps {
@@ -593,6 +614,11 @@ export class SelectionRunner {
           continue
         }
         record.candidates[i] = { index: i, sessionId: null, workspace, status: 'created' }
+      }
+      const workspaceSeed = this.deps.workspaces.seedReport?.(selectionId)
+      if (workspaceSeed) {
+        record.workspaceSeed = workspaceSeed
+        if (workspaceSeed.consistent === false) diag.warn('workspace.seed_torn', 'the source changed during every seed snapshot attempt; candidates share one seed, but it may mix source states', { selectionId, attempts: workspaceSeed.attempts })
       }
       if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted before agent creation', false)
       record.stage = 'preflight'
