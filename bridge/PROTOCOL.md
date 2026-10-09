@@ -170,7 +170,7 @@ verdict.
 
 ## Preflight (caller-side note)
 
-The TS bridge offers `VerifierBridge.preflight()`: one tiny asymmetric pair must score strictly in favor of the present-output trajectory (mechanical + weak-semantic gate). Hosts memoize the pass per (baseURL, model, apiKeyEnv) and fail the selection before any candidate spend when it fails. This catches providers that return logprobs but never emit usable score tags — the residual case where scoring silently degenerates to 0.5 ties.
+The TS bridge offers `VerifierBridge.preflight()`: one tiny asymmetric pair must score strictly in favor of the present-output trajectory (mechanical + weak-semantic gate). Hosts memoize the pass per (baseURL, model, apiKeyEnv, a fingerprint of the key value, effort) for at most 30 minutes (review R4 4.5) and fail the selection before any candidate spend when it fails. This catches providers that return logprobs but never emit usable score tags — the residual case where scoring silently degenerates to 0.5 ties.
 
 ## Error Codes
 

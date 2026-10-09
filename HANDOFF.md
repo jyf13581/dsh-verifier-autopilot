@@ -183,13 +183,13 @@
 - progressGuard 默认关闭；启用时使用 llm_verifier.track，只有连续低分且没有新 tool/result 才取消，默认 60s、minScore=0.15、grace=3、maxChecks=8。
 - objective checks 最多 5 条、command 最长 2000 字符；顺序运行于进程内解析出的第一个可启动 shell（优先 `pwsh -NoProfile -Command`；没有 pwsh 时 win32 退到 `powershell`，其他平台退到 `/bin/sh -c`），默认 60s，记录 stdout+stderr 尾部 2000 字符与实际 shell 名。命令写成哪种方言由部署机决定——跨平台部署请用两种 shell 都能跑的命令（如 `npm test`）。
 - 整条链都启动不了、或 shell 启动失败（ENOENT）时是 harness error（`harnessError:true`，尾部以 `harness:` 开头）：候选保留并标 `checksInvalid`，与 B-10 的"解析错误不淘汰"同一路径。
-- checks 没有命令 allowlist，也不是 DSH fs sandbox。timeout 只 kill shell 进程，孙进程可能存活（runner 会在 exit 后最多等 1s flush 再放弃管道）；命令必须自包含且只作用于候选 workspace。
+- checks 没有命令 allowlist，也不是 DSH fs sandbox。POSIX 下每个 check 在独立进程组里运行：timeout/abort 杀整个进程组（SIGTERM，结束时补一次 SIGKILL），命令正常退出后它留下的后台进程也会被回收（review R4 4.4）；Windows 只能在 shell 存活期间用 `taskkill /T` 尽力回收，shell 退出前已脱离的孙进程仍可能存活。命令必须自包含且只作用于候选 workspace。
 - **checks 门禁可反噬**：若 check 的失败输出是 shell 解释器级错误（`is not recognized as`、ParserError 等），判 `checksInvalid=true`，候选不因此淘汰、该 check 视为缺省（rerun 时同指纹 check 全失败即属此类）；record 以 `checksUnreliable` 明示。
 
 ### 2.4 Preflight、ranking、margin gate 与重试
 
 - 多幸存者必须有真实 ranking 且 verifier 结果经过严格校验：winner index、有限 0..1 scores、完整唯一 ranking permutation、分数降序、index tie-break、winner/ranking 一致性、nComparisons>0；任何一项失败 fail-closed。
-- preflight 在 worktree 准备后、candidate agent 创建前运行；用一组明显非对称 pair 检查真实比较数和严格顺序，并按 baseURL/model/apiKeyEnv 在当前 Host 生命周期 memoize。
+- preflight 在 worktree 准备后、candidate agent 创建前运行；用一组明显非对称 pair 检查真实比较数和严格顺序，并按 baseURL/model/apiKeyEnv/key 值指纹/effort memoize，成功结果只信任 30 分钟（review R4 4.5：轮换 key 或中转丢失 logprobs 后会重新验证）。
 - preflight 与 ranking 使用相同的归一化 timeout 值，但各自创建独立绝对 deadline；不是从 preflight 开始共享一个跨阶段总 deadline。因此最坏总墙钟还包括 workspace、preflight、candidate 和 ranking 各阶段。
 - selection timeout 默认 600000ms，归一化范围 30000..600000ms（2026-09-05 从 300s 上限抬升至 600s：effort=max 下单次 minimax-m3 比较 70..100s，最小锦标赛已逼近 300s；host normalize、runner budget、autopilot clamp 三处同步）。preflight 和 ranking 各自最多 2 次 attempt，只重试 retriable BridgeError，backoff 和 attempt 共用该阶段 deadline。
 - Kimi verifier maxWorkers=1，避免并发撞 relay pending/concurrency 限制；候选 rollout 仍可并行。
@@ -200,7 +200,7 @@
 - **模型探活（2026-09-08 起）**：`selectionProbeEnabled` 默认开；autopilot 在规划前按 (baseURL,key) 对每个 preferred∩catalog 候选做 1-token 探活，死模型（kimi-k3 式窗口）从当次候选池剔除；结果按模型缓存、死模型 120 秒 cool-down 后复探；policy.probes 落进 ledger。
 - **source 后置审计增强**：交付判定改走 `evaluateDelivery()`；新增可选配置 `selectionPostAuditTestCommand`——仅当显式配置时 cleanup 会在 source cwd 跑一次测试命令（120s 上限），全部满足（HEAD 前进/有改动 + 测试退出码 0）才记 `delivered=yes`；缺省/未配置只记 `unknown`/`no`。record 另带 `timing.{relayedAt,auditedAt}` 供 B-9 判读回放。
 - **`outcome` 状态机六值**（每个 settled record 恰一）：`ranked_winner` / `objective_only_result`（历史值：R2 2.3 证明不可达，已不再产生，只为旧 ledger 保留）/ `single_candidate_fallback`（唯一幸存者，未比较，relay 明示）/ `insufficient_evidence` / `abstain` / `verifier_unavailable`（基础设施故障且全员 checks 通过——不再整条 `failed`；`error`/`note` 保留原因字段）。`winnerBasis` 收窄兼容：`verifier` 仅与 `ranked_winner` 同时出现。读 ledger 的消费者必须先读 `outcome`。
-- preflight 在 worktree 准备后、candidate agent 创建前运行；用一组明显非对称 pair 检查真实比较数和严格顺序，并按 baseURL/model/apiKeyEnv 在当前 Host 生命周期 memoize。
+- preflight 在 worktree 准备后、candidate agent 创建前运行；用一组明显非对称 pair 检查真实比较数和严格顺序，并按 baseURL/model/apiKeyEnv/key 值指纹/effort memoize，成功结果只信任 30 分钟（review R4 4.5：轮换 key 或中转丢失 logprobs 后会重新验证）。
 - preflight 与 ranking 使用相同的归一化 timeout 值，但各自创建独立绝对 deadline；不是从 preflight 开始共享一个跨阶段总 deadline。因此最坏总墙钟还包括 workspace、preflight、candidate 和 ranking 各阶段。
 - selection timeout 默认 600000ms，归一化范围 30000..600000ms（2026-09-05 自 300s 上限抬升；2026-09-08 起 manual /select 省略 selectTimeoutMs 时跟随 config，不再回落硬编码 180s）。preflight 和 ranking 各自最多 2 次 attempt，只重试 retriable BridgeError，backoff 和 attempt 共用该阶段 deadline。
 - Kimi verifier maxWorkers=1，避免并发撞 relay pending/concurrency 限制；候选 rollout 仍可并行。
