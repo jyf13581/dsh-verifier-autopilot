@@ -71,7 +71,8 @@ implementation code.
 | Module | Responsibility |
 | --- | --- |
 | `src/client/index.ts` | UI, API calls, SSE refresh, and operator actions. Shared state/selection/model types come from `src/protocol.ts`; no duplicate handwritten wire models belong here. |
-| `tsdown.config.ts` | Browser bundle wrapper and external dependency policy. |
+| `scripts/client-bundle.mjs` | The one browser-bundle spec (entry, externals, DSH loader wrapper) shared by `tsdown.config.ts` and the `scripts/build.sh` esbuild fallback (review R6 6.2). |
+| `tsdown.config.ts` | CI/release client build; reads `scripts/client-bundle.mjs`. |
 
 ## 3. Dependency rules
 
@@ -182,7 +183,10 @@ boundary helper to `util.ts`, or a persistence primitive to `ledger.ts` rather
 than introducing a reciprocal import. `npm run check:architecture` parses the
 TypeScript module graph, rejects runtime **and type-only** cycles, enforces
 these layer restrictions, and rejects blind casts and explicit `any` (rule 11)
-in CI.
+in CI. A type-aware pass also counts assertions applied to `unknown`/`any`
+operands per file and compares them exactly with `scripts/untyped-casts.json`
+(review R6 6.4): a new site fails with its location; a removed one fails until
+the baseline is lowered (`npm run check:architecture -- --update-cast-baseline`).
 
 ## 4. Evidence boundary: verification is not selection
 
@@ -449,6 +453,7 @@ lock with `--force`:
 ```sh
 npm ci --force --ignore-scripts
 npm run check:architecture
+npm run check:contract
 npm run typecheck
 npm run build:host
 npm run build:client
@@ -462,6 +467,11 @@ What each gate covers:
 - `check:architecture`: parses project imports, enforces allowed layer
   directions, rejects runtime or type-only module cycles, and rejects blind
   casts (`as never`, `as unknown as`) and explicit `any` anywhere in `src/`.
+  It also runs the untyped-assertion ratchet described in §3.
+- `check:contract`: type-checks the plugin's hand-declared DSH agent views
+  (`scripts/contract/dsh-agent.contract.ts`) against the installed
+  `@deepseek-ai/dsh-agent` declarations. It is what gives that peer dependency
+  meaning, and what found the cause-less `cancel()` (review R6 6.6a).
 - `typecheck`: strict Host and client TypeScript checking without emit.
 - `build:host`: emits Node modules, source maps, and declarations to `lib/`.
 - `build:client`: bundles `src/client/index.ts` as the DSH browser module in
@@ -500,6 +510,13 @@ scripts/tests/
   process-checks.test.mjs    bounded process runner, check shell chain, portability
   diagnostics.test.mjs       degradation sink, redaction, /events, leaf boundary
   payload.test.mjs           checked JSON readers: total reads, array/string narrowing
+  trust-boundary.test.mjs    review R1: sandbox/approval defaults, egress, check env
+  selection-correctness.test.mjs  review R2: fingerprints, dedupe, winner gate
+  evidence-validity.test.mjs review R3: inherited state, adoption, calibration registry
+  lifecycle.test.mjs         review R4: relay consumption, seed snapshot, process groups
+  egress-persistence.test.mjs review R5: redaction exits, ledger durability, protocol
+  build-contract.test.mjs    review R6: one build, DSH cancel contract, defaults, /select numbers
+  coverage-gaps.test.mjs     review R6: child setup injection, retry abort, Windows paths, autocrlf
   helpers/                   harness (timing, rejection collector), provider (mocked
                              verifier), host (fake DSH context), selection (fake
                              factories/bridges, real workspaces), sidecar, git
@@ -526,10 +543,18 @@ A protocol change is therefore made in the fixture and the document first, and
 each side of the pipe fails until it follows.
 
 Some regression fixtures invoke PowerShell and require `pwsh`. Run the complete
-suite on the Ubuntu CI image when a local environment lacks it. The historical
-`scripts/build.sh` remains the installed DSH packaging path and may depend on
-host-specific dependency locations; use `build:host` plus `build:client` for a
-portable repository build.
+suite in CI when a local environment lacks it: the `test` job (Ubuntu, gating)
+and the `test-windows` job (`windows-latest`, pwsh, Git for Windows defaults;
+observational until it has stayed green, see
+`docs/reviews/R6-ARCHITECTURE-BUILD.md` §6).
+
+There is one build (review R6 6.2). `scripts/build.sh` runs exactly
+`build:host` + `build:client` whenever the lockfile toolchain is installed, so
+a release ships what CI tested. Only a machine without `node_modules` (the
+installed-DSH operator setup) takes its fallback, which links the host's
+runtime packages, never replaces npm-installed ones, and bundles the client
+with esbuild from the same `scripts/client-bundle.mjs`. CI exercises that
+fallback with `DSH_BUILD_FORCE_INSTALLED=1`.
 
 Generated `lib/`, `node_modules/`, Python bytecode/cache directories, `.data/`,
 selection workspaces, and transient sidecar output are not source artifacts and

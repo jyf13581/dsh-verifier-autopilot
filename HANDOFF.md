@@ -283,7 +283,7 @@ provider 注意事项：candidateOptions 必须能补成完整 provider+model；
 
 - 工作目录：D:/tools。DSH_WEB_URL=http://127.0.0.1:3080，DSH_HOME=C:/Users/Admin/.dsh。
 - DSH_CHECKOUT 当前未设置。DSH 安装根：C:/Users/Admin/AppData/Local/hermes/node/node_modules/@deepseek-ai/dsh。
-- build.sh 首选有 packages/ 的 source checkout；当前走 installed-runtime fallback。
+- build.sh（R6 6.2 之后）：装了锁文件工具链（`npm ci --force --ignore-scripts`）时直接执行 CI 的 `build:host` + `build:client`，输出 `build: complete (lockfile toolchain, same as CI)`；没有 node_modules 时才走下面的回退（有 packages/ 的 source checkout 优先，其次 installed-runtime）。回退不会再替换 npm 安装的包，客户端打包规格与 CI 共用 `scripts/client-bundle.mjs`。
 - fallback 依赖：DSH_RUNTIME_DEPS 默认 D:/tools/dsh-plugins/dsh-plugin-playwright-0.2.0；DSH_TYPESCRIPT_ROOT 与 DSH_ESBUILD_ROOT 默认 D:/tools/dsh-plugins/dsh-thread-0.1.3；DSH_INSTALL_ROOT 和 DSH_ESBUILD_PATH 可覆盖。
 - bridge venv：Python 3.12.13，openai 3.3.1。显式 system Python 同为 3.12.13，但没有 openai，不能直接替代 bridge venv。
 - 参考目录 D:/tools/llm-as-a-verifier-main 存在但没有 .git；它是本机参考树，不是当前 working repository。
@@ -303,6 +303,7 @@ git diff --check
 
 - npm test 从 lib 导入，必须先 build。npm run eval 也不会自动 build，且旧 runner 主要覆盖 legacy /api/eval。
 - npm run typecheck 在当前 shell 曾因 PATH 中没有 tsc 失败；build.sh 已通过显式 TypeScript 路径执行 tsc。不要把 PATH 失败写成类型错误，也不要把它写成独立 typecheck 已通过。
+- R6 之后推荐先 `npm ci --force --ignore-scripts`：之后 `bash scripts/build.sh` 与 CI 构建一致，`npm run typecheck` / `npm run check:contract` 也不再依赖 PATH 中的 tsc。
 - 本轮最终重跑（2026-09-03，工作树 = HEAD 5d0d149 + 4 个未提交文件）：bash scripts/build.sh 输出 build: complete；npm test 为 167/167、0 fail；bridge self_test.py 全部 PASS（health/bad_frame/empty_candidates/single_candidate/missing_api_key/shutdown/progress_frame_validation/mojibake_expectation）；git diff --check 通过（退出码 0）。
 - 2026-09-05 强度旋钮改造后：build: complete；npm test 173/173；self_test 9/9（新增 effort_scoping 门：非法 level→invalid_request、单候选 effort=max 通过、health 观察到进程 env 未被请求污染）；`dev_reload_package` 两次热重载均成功；live lane 探针在 effort=max 下 70.7s 严格打分通过；live manual selection（minimax-m3）多幸存者排名首次完成。git diff --check 通过。
 - 2026-09-01 那轮同様为 167/167，但当时未跑 bridge self-test；09-03 补齐。
