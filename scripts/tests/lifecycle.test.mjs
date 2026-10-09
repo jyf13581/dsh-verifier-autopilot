@@ -14,10 +14,12 @@ import path from "node:path"
 import { apiRoutes, VerifierHost } from "../../lib/index.js"
 import { PREFLIGHT_OK_TTL_MS } from "../../lib/selection/host.js"
 import { createModelProber } from "../../lib/selection/probe.js"
+import { BridgeError } from "../../lib/selection/bridge.js"
 import { makeGitRepo, runGit } from "./helpers/git.mjs"
 import { IsolatedWorkspaceManager, gitDiffStat } from "../../lib/selection/live.js"
 import { completedTurnEvents, fakeAgent, fakeContext, fakeReq, fakeRes, fireIdle, hostOverrides } from "./helpers/host.mjs"
-import { fakeBridge, makeFakeFactory, realWorkspaces, SEL_TMP } from "./helpers/selection.mjs"
+import { fakeBridge, fakeEvents, makeFakeFactory, realWorkspaces, selInput, SEL_TMP } from "./helpers/selection.mjs"
+import { SelectionRunner } from "../../lib/selection/candidates.js"
 import { runProcess, runProcessCapture } from "../../lib/selection/proc.js"
 import { runChecks } from "../../lib/selection/checks.js"
 import { quiesce, waitFor } from "./helpers/harness.mjs"
@@ -373,4 +375,61 @@ test("R4 4.5: a model's ok probe verdict expires; an expired ok is re-probed, ne
   clock += 40_000
   assert.equal(await prober.probe("m"), true, "past okTtl but inside the dead cooldown: still re-probed, not 'dead'")
   assert.equal(calls.length, 2)
+})
+
+// ---------- 4.6: the decisive select never shares the pipe with a sample ----------
+
+/** Candidates that show partial work at once (so progress ticks have a
+ *  trajectory to score) and settle after 1.6 s. */
+function liveLookingFactory() {
+  const base = makeFakeFactory({ scripts: [{ idleDelay: 1600 }, { idleDelay: 1600 }] })
+  return {
+    ...base,
+    async create(spec) {
+      const handle = await base.create(spec)
+      const agent = handle.agent
+      const settle = agent.whenIdle.bind(agent)
+      agent.whenIdle = () => {
+        agent.session = { events: agent.session.events.concat(fakeEvents(0).map((ev, k) => ({ ...ev, seq: 900 + k }))) }
+        return settle()
+      }
+      return handle
+    },
+  }
+}
+
+test("R4 4.6: an in-flight progress sample is cancelled and drained before ranking", async () => {
+  let inFlight = 0
+  let progressCalls = 0
+  let inFlightAtSelect = null
+  const bridge = fakeBridge((req) => {
+    inFlightAtSelect = inFlight
+    return { index: 0, bestPreview: "", scores: req.candidates.map((_, i) => (i === 0 ? 0.9 : 0.4)), ranking: req.candidates.map((_, i) => i), nComparisons: req.candidates.length, criteria: ["c1"], usage: { calls: req.candidates.length, input_tokens: 1, cached_input_tokens: 0, uncached_input_tokens: 1, output_tokens: 1, reasoning_tokens: 0, cache_hit_rate: 0 } }
+  })
+  // A sample that never answers on its own — a slow provider. On the real
+  // bridge its eventual timeout tears the sidecar down, together with every
+  // request queued behind it on the serial pipe.
+  bridge.progress = (req) => new Promise((_resolve, reject) => {
+    progressCalls += 1
+    inFlight += 1
+    const stop = () => { inFlight -= 1; reject(new BridgeError("bridge_aborted", "sample aborted", false)) }
+    if (req.signal?.aborted) stop()
+    else req.signal?.addEventListener("abort", stop, { once: true })
+  })
+  const warnings = []
+  const diagnostics = { warn: (scope) => { warnings.push(scope) }, count: () => {} }
+  const stat = (fingerprint) => ({ files: 1, insertions: 1, deletions: 0, untracked: 0, fingerprint })
+  const runner = new SelectionRunner({
+    factory: liveLookingFactory(),
+    workspaces: realWorkspaces,
+    bridge,
+    diagnostics,
+    diffStat: async (cwd) => stat(path.basename(cwd) + "-fp"),
+  })
+  const { record } = await runner.run(selInput({ candidateCount: 2, nEvaluations: 1, pivots: 0, progressGuard: { intervalMs: 1000, maxChecks: 3 } }))
+  assert.ok(progressCalls >= 1, "a sample was in flight when the candidates settled")
+  assert.equal(inFlightAtSelect, 0, "select is dispatched only after the sample is cancelled (old code: queued behind it)")
+  assert.equal(inFlight, 0, "no sample outlives the run")
+  assert.equal(record.status, "completed", String(record.error))
+  assert.deepEqual(warnings.filter((scope) => scope === "progress.sample"), [], "the runner's own drain is not reported as a degradation")
 })

@@ -571,6 +571,13 @@ export class SelectionRunner {
     // finds its own sample still pending is skipped (a sample is a best-effort
     // observation, not a scheduled obligation).
     let progressChain: Promise<void> = Promise.resolve()
+    // Review R4 4.6: progress samples share the sidecar's serial pipe with the
+    // ranking request, and a timeout/abort tears the whole child down. Samples
+    // therefore run on their own signal, and the runner cancels and drains
+    // them before ranking, so an advisory sample can never take the decisive
+    // select down with it.
+    const progressAbort = new AbortController()
+    const progressSignal = input.signal ? AbortSignal.any([input.signal, progressAbort.signal]) : progressAbort.signal
     const progressPending = new Set<number>()
     const enqueueProgressSample = (index: number, sample: () => Promise<void>): void => {
       if (progressPending.has(index)) return
@@ -719,8 +726,9 @@ export class SelectionRunner {
                     apiKeyEnv: input.verifier.apiKeyEnv,
                     effort: input.verifier.effort,
                     nEvaluations: 1,
-                    // A run abort must not leave a sample occupying the pipe.
-                    signal: input.signal,
+                    // A run abort, or the pre-ranking drain, must not leave a
+                    // sample occupying the pipe.
+                    signal: progressSignal,
                   })
                   score = r.score
                 }
@@ -731,7 +739,7 @@ export class SelectionRunner {
                 // bridge already recorded the per-request detail (timeout text,
                 // stderr tail); here the stable code keeps one entry per outage
                 // instead of one per tick.
-                if (!input.signal?.aborted) diag.warn('progress.sample', error instanceof BridgeError ? 'sidecar ' + error.code : error, { selectionId: record.selectionId })
+                if (!progressSignal.aborted) diag.warn('progress.sample', error instanceof BridgeError ? 'sidecar ' + error.code : error, { selectionId: record.selectionId })
               }
               if (score !== null) {
                 pgLastScore = score
@@ -848,6 +856,11 @@ export class SelectionRunner {
         }
         publish()
       }))
+      // Every candidate has settled: no further samples are useful. Cancel the
+      // one possibly in flight and wait for the queue, so ranking starts on a
+      // pipe nothing else is using (review R4 4.6).
+      progressAbort.abort()
+      await progressChain
       if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted after candidate runs', false)
 
       record.stage = 'checks'
