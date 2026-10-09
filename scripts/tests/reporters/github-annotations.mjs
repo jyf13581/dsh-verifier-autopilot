@@ -8,6 +8,10 @@ const escapeData = (s) => String(s).replace(/%/g, "%25").replace(/\r/g, "%0D").r
 const escapeProp = (s) => escapeData(s).replace(/:/g, "%3A").replace(/,/g, "%2C")
 
 export default async function* githubAnnotations(source) {
+  // GitHub keeps at most 10 error annotations per step; past that, failures
+  // vanish from the checks API. One closing warning (a separate quota) names
+  // every failed test so the full list is always readable (review R6 6.5).
+  const failed = []
   for await (const event of source) {
     // Test-authored diagnostics (e.g. which check shell this runner resolved)
     // become notices; the runner's own summary diagnostics stay in the log.
@@ -25,6 +29,8 @@ export default async function* githubAnnotations(source) {
       .filter(Boolean).join("\n").slice(0, 3000)
     const file = typeof data.file === "string" ? data.file.replace(/^file:\/\//, "").replace(process.cwd() + "/", "") : ""
     const props = [file && "file=" + escapeProp(file), data.line && "line=" + data.line, "title=" + escapeProp("test failed: " + data.name)].filter(Boolean).join(",")
+    failed.push((file ? file + ":" + (data.line ?? "?") + " " : "") + data.name)
     yield "::error " + props + "::" + escapeData(message) + "\n"
   }
+  if (failed.length > 0) yield "::warning title=" + escapeProp("failed tests (" + failed.length + ")") + "::" + escapeData(failed.join("\n").slice(0, 8000)) + "\n"
 }

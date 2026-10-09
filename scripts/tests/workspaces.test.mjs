@@ -7,7 +7,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { VerifierHost } from "../../lib/index.js"
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { makeGitRepo, runGit } from "./helpers/git.mjs"
@@ -24,7 +24,9 @@ test("live: projectStoreKey matches the session store's directory convention", a
 
 test("live: non-git session roots resolve only one explicitly referenced nested repository", async () => {
   const { resolveAutopilotSourceCwd } = await import("../../lib/selection/live.js")
-  const base = mkdtempSync(path.join(tmpdir(), "va-resolve-"))
+  // git prints long, resolved paths; os.tmpdir() on Windows runners is an
+  // 8.3 alias (C:\\Users\\RUNNER~1). Compare like with like (review R6 6.5).
+  const base = realpathSync.native(mkdtempSync(path.join(tmpdir(), "va-resolve-")))
   try {
     const repo = makeGitRepo(base, "primary")
     const other = makeGitRepo(base, "other")
@@ -38,7 +40,9 @@ test("live: non-git session roots resolve only one explicitly referenced nested 
 
 test("live: git workspace mirrors dirty content, removes from the source repo, and rejects path escape", async () => {
   const { IsolatedWorkspaceManager } = await import("../../lib/selection/live.js")
-  const base = mkdtempSync(path.join(tmpdir(), "va-worktree-"))
+  // git prints long, resolved paths; os.tmpdir() on Windows runners is an
+  // 8.3 alias (C:\\Users\\RUNNER~1). Compare like with like (review R6 6.5).
+  const base = realpathSync.native(mkdtempSync(path.join(tmpdir(), "va-worktree-")))
   try {
     const repo = makeGitRepo(base, "source")
     writeFileSync(path.join(repo, "tracked.txt"), "tracked-dirty\n")

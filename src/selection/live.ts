@@ -43,7 +43,8 @@ interface ExecOptions {
  *  diagnostic one: when git fails, the reason is at the end. `code` is -1 for
  *  anything that did not produce an honest exit code (spawn failure, timeout). */
 async function exec(cmd: string, args: string[], options: ExecOptions = {}): Promise<{ code: number; out: string }> {
-  const result = await runProcess(cmd, args, options)
+  // Every caller reads git's stdout as data; stderr only explains failures.
+  const result = await runProcess(cmd, args, { ...options, separateStderr: true })
   return { code: result.code ?? -1, out: result.out }
 }
 

@@ -6,7 +6,8 @@ import assert from "node:assert/strict"
 import { mkdtempSync, rmSync, symlinkSync, readFileSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { IsolatedWorkspaceManager, makeLiveCandidateFactory } from "../../lib/selection/live.js"
+import { IsolatedWorkspaceManager, adoptionOf, gitDiffStat, makeLiveCandidateFactory } from "../../lib/selection/live.js"
+import { execFileSync } from "node:child_process"
 import { makeGitRepo } from "./helpers/git.mjs"
 import { abortableRetrySleep } from "../../lib/selection/retry.js"
 
@@ -122,6 +123,41 @@ test("R6 6.5: prepare accepts an aliased spelling of the source repository (8.3 
     assert.equal(readFileSync(path.join(path.dirname(cwd), "tracked.txt"), "utf8").replace(/\r\n/g, "\n"), "tracked-base\nuncommitted\n", "the uncommitted edit is mirrored")
   } finally {
     if (cwd) await manager.remove(path.dirname(cwd)).catch(() => {})
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+// Git for Windows installs with core.autocrlf=true; git then writes
+// "warning: in the working copy of 'f.js', LF will be replaced by CRLF" to
+// STDERR for every LF file it lists, on any OS. GIT_CONFIG_COUNT injects the
+// same setting into every git child of this process, so Linux CI reproduces
+// what the second windows-latest run showed: stderr merged into the listing
+// turned into path entries, all three repositories below fingerprinted
+// 43ff21557eb328cc, and own-work counts / adoption / audit patches were
+// computed over warning text.
+test("R6 6.5: git evidence reads stdout only (core.autocrlf=true, the Git for Windows default)", async () => {
+  const saved = { count: process.env.GIT_CONFIG_COUNT, key: process.env.GIT_CONFIG_KEY_0, value: process.env.GIT_CONFIG_VALUE_0 }
+  Object.assign(process.env, { GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.autocrlf", GIT_CONFIG_VALUE_0: "true" })
+  const base = mkdtempSync(path.join(tmpdir(), "va-r6-crlf-"))
+  try {
+    const repo = (name, edit) => {
+      const dir = makeGitRepo(base, name)
+      writeFileSync(path.join(dir, "src", "entry.ts"), edit)
+      return dir
+    }
+    const [a, b, c] = [repo("a", "export const value = 2\n"), repo("b", "export const value = 9\n"), repo("c", "export const value = 2\n")]
+    const warned = execFileSync("git", ["diff", "--name-only", "HEAD"], { cwd: a, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] })
+    assert.equal(warned.trim(), "src/entry.ts", "precondition: git lists the file (its CRLF warning goes to stderr)")
+    const [sa, sb, sc] = await Promise.all([a, b, c].map(gitDiffStat))
+    assert.deepEqual([sa.files, sa.insertions, sa.deletions, sa.untracked], [1, 1, 1, 0], "one own edit, counted from numstat (old code under autocrlf: insertions 0)")
+    assert.notEqual(sa.fingerprint, sb.fingerprint, "different deliverables are different (old code under autocrlf: equal)")
+    assert.equal(sa.fingerprint, sc.fingerprint, "byte-identical deliverables still dedupe")
+    const adoption = await adoptionOf(a, c)
+    assert.deepEqual(adoption, { total: 1, adopted: ["src/entry.ts"] }, "adoption names real paths only")
+  } finally {
+    for (const [k, v] of [["GIT_CONFIG_COUNT", saved.count], ["GIT_CONFIG_KEY_0", saved.key], ["GIT_CONFIG_VALUE_0", saved.value]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v
+    }
     rmSync(base, { recursive: true, force: true })
   }
 })

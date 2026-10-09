@@ -43,6 +43,15 @@ export interface RunProcessOptions {
   /** Wall-clock budget; the child is killed when it elapses. Default 30 s. */
   timeoutMs?: number
   signal?: AbortSignal
+  /** Stdout is data, stderr is diagnostics: `out` is stdout alone when the
+   *  child exits 0, and stdout followed by the stderr tail otherwise. For git
+   *  plumbing read as data. Git for Windows ships core.autocrlf=true, so
+   *  `diff --name-only` writes 'warning: in the working copy of ..., LF will be
+   *  replaced by CRLF' to stderr for every LF file; merged into the listing it
+   *  became path entries, and every candidate's fingerprint, has-work count,
+   *  adoption set and audit patch was computed over warning text (review R6
+   *  6.5, first windows-latest run). Default false (checks want both). */
+  separateStderr?: boolean
   /** Characters of combined output retained. Default 2000. */
   cap?: number
   /** Which end of an over-long output survives. Default `tail`. */
@@ -61,7 +70,7 @@ export type ProcessEnd = 'exit' | 'spawn-failed' | 'timeout' | 'aborted'
 export interface ProcessResult {
   /** The child's exit code; null whenever `end !== 'exit'`. */
   code: number | null
-  /** Bounded combined stdout+stderr. */
+  /** Bounded combined stdout+stderr (see `separateStderr`). */
   out: string
   end: ProcessEnd
   durationMs: number
@@ -225,10 +234,12 @@ export function runProcess(cmd: string, args: readonly string[], options: RunPro
     if (keep === 'tail') out = (out + String(chunk)).slice(-cap)
     else if (out.length < cap) out = (out + String(chunk)).slice(0, cap)
   }
-  return spawnBounded(cmd, args, options, { stdout: (chunk) => { take(chunk); return true }, stderr: take }).then((result) => ({
+  let errTail = ''
+  const takeError = options.separateStderr ? (chunk: Buffer): void => { errTail = (errTail + String(chunk)).slice(-Math.max(cap, 2000)) } : take
+  return spawnBounded(cmd, args, options, { stdout: (chunk) => { take(chunk); return true }, stderr: takeError }).then((result) => ({
     // runProcess never stops on output volume, so 'overflow' cannot occur.
     code: result.code,
-    out,
+    out: options.separateStderr && result.code !== 0 && errTail ? (out ? out + '\n' : '') + errTail : out,
     end: result.end === 'overflow' ? 'aborted' : result.end,
     durationMs: result.durationMs,
     ...(result.error ? { error: result.error } : {}),
