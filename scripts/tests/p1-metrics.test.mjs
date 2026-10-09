@@ -6,7 +6,7 @@
 // in its own process; this file also runs alone with `node --test scripts/tests/p1-metrics.test.mjs`.
 import test from "node:test"
 import assert from "node:assert/strict"
-import { P1_THRESHOLDS, computeP1Metrics, decideP1, wilson } from "../../eval/p1/metrics.mjs"
+import { P1_THRESHOLDS, computeLegacyFlagMetrics, computeP1Metrics, decideLegacy, decideP1, wilson } from "../../eval/p1/metrics.mjs"
 
 // 40 tasks: 10 both-pass, 10 both-fail, 20 discordant (candidate 1 passes);
 // the baseline passes exactly the both-pass tasks plus 2 more.
@@ -72,4 +72,23 @@ test("R7 7.2: Wilson interval and frozen thresholds", () => {
   assert.ok(low > 0.5 && low < 0.55 && high > 0.88 && high < 0.92, low + " " + high)
   assert.deepEqual(wilson(0, 0), { low: 0, high: 1 })
   assert.ok(Object.isFrozen(P1_THRESHOLDS))
+})
+
+test("R7 7.3: the legacy arm keeps only a flag that predicts hidden-test failure", () => {
+  // 30 tasks, 12 baseline failures.
+  const rows = (flag, valid = () => true) => Array.from({ length: 30 }, (_, i) => ({ baselinePass: i >= 12, flagged: flag(i), valid: valid(i) }))
+  const good = computeLegacyFlagMetrics(rows((i) => i < 9 || i === 20)) // 9 of 12 failures, 1 false alarm
+  assert.equal(good.precision, 0.9)
+  assert.equal(good.recall, 0.75)
+  assert.equal(decideLegacy(good).decision, "keep")
+  // Flags everything: perfect recall, precision = base failure rate 0.4.
+  const noisy = decideLegacy(computeLegacyFlagMetrics(rows(() => true)))
+  assert.equal(noisy.decision, "retire")
+  assert.match(noisy.reasons.join(";"), /precision 0\.4 < 0\.7/)
+  // Flags nothing: the shipped autoFeedback=false behaviour in effect.
+  assert.equal(decideLegacy(computeLegacyFlagMetrics(rows(() => false))).decision, "retire")
+  // A good flag behind an unreliable transport is still retired.
+  assert.match(decideLegacy(computeLegacyFlagMetrics(rows((i) => i < 9, (i) => i % 4 !== 3))).reasons.join(";"), /invalid rate/)
+  // Too few failures to judge.
+  assert.equal(decideLegacy(computeLegacyFlagMetrics(rows((i) => i < 3).map((r, i) => ({ ...r, baselinePass: i >= 5 })))).decision, "insufficient")
 })

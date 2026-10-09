@@ -16,7 +16,7 @@
 | R4 并发、生命周期与资源回收 | ✅ 已完成（4.1 按 agent 状态和 inbox 判定 relay 是否已消费；4.4 POSIX 进程组回收；4.2 单一 seed 快照；4.5 key 值指纹加 30 分钟 TTL；4.6 ranking 前排空采样；4.7 合并 spawn 实现；新发现的 4.7b stdin EPIPE 可致宿主崩溃、4.2b 用户 diff 配置让 seed 快照失败，均已修复；4.3 只做可观测，会话内通知待负责人决策；Windows 孙进程仍是残余风险） | `docs/reviews/R4-LIFECYCLE.md` | `scripts/tests/lifecycle.test.mjs` |
 | R5 持久化、审计包、脱敏与协议 | ✅ 已完成（5.1 选择路径所有出口统一脱敏，出口清单与脱敏矩阵见报告 §2；5.3 截断尾行吞掉下一次写入、未 fsync、新发现的 5.3b 降级时删除新版本行，均已修复，掉电语义写入文件头；5.2 保留最后一行为准，并固定只改生命周期字段；5.4 health 协议版本握手、错误分类先看类型、K 缺省统一为 1；5.6 审计补丁只含候选自己的路径；5.5 读取鉴权和 Host 白名单待负责人决策） | `docs/reviews/R5-PERSISTENCE-REDACTION.md` | `scripts/tests/egress-persistence.test.mjs`、`bridge/self_test.py` (i) |
 | R6 架构与构建/发布链 | ✅ 已完成（新发现的 6.6a 取消候选不带原因、6.5a Windows 上 git CRLF 警告混入证据、6.5b 8.3 短名/junction 源路径被拒，均已修复；6.2 统一为一条构建，`build.sh` 委托 CI 命令；6.3 缺省值收敛到 `constants.ts`；6.4 `/select` 数值校验和无类型断言棘轮；6.6 peer 依赖由类型契约赋予意义；6.1 只做拆分设计；Windows CI 只观察，第 3 轮已全部通过；`OPERATOR_BRIDGE_VENV_PYTHON` 待负责人决策） | `docs/reviews/R6-ARCHITECTURE-BUILD.md` | `scripts/tests/build-contract.test.mjs`、`scripts/tests/coverage-gaps.test.mjs` |
-| R7 文档真实性与产品方向 | ⏳ | | |
+| R7 文档真实性与产品方向 | ✅ 已完成（负责人决定：`selectionMode` 默认 `off`、legacy `enabled` 默认 `false`，两条花钱路径改为显式 opt-in；README 默认值和限额表由代码生成，权威文档禁止手写测试数、本机路径和与代码不符的默认值；HANDOFF 降级为运维日志，§2/§4 与代码的矛盾已修正；P1 固定 30 题预注册，判定规则是代码，未执行；legacy 冻结，按 P1 的 L 臂决定是否退役自动触发；新发现的 7.4 没有任何测试固定默认值，已补上） | `docs/reviews/R7-DOCS-PRODUCT-DIRECTION.md`、`eval/experiments/p1-fixed-set.preregistration.md` | `scripts/tests/product-defaults.test.mjs`、`scripts/tests/doc-truth.test.mjs`、`scripts/tests/p1-metrics.test.mjs` |
 | R8 复核收口 | ⏳ | | |
 
 ## 0. 基线（审查开始前已实测）

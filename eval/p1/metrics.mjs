@@ -105,3 +105,49 @@ export function decideP1(metrics, thresholds = P1_THRESHOLDS) {
   if (metrics.costMultiplier === null || metrics.costMultiplier > thresholds.maxCostMultiplier) reasons.push('cost multiplier ' + metrics.costMultiplier + ' > ' + thresholds.maxCostMultiplier)
   return reasons.length === 0 ? { decision: 'continue', reasons: [] } : { decision: 'inconclusive', reasons }
 }
+
+// Arm L (legacy keep/retire, review R7 7.3): the legacy five-lane verifier
+// scores each arm-A trajectory once, after the fact, through manual /verify.
+// One row per task: { baselinePass: boolean, flagged: boolean, valid: boolean }
+// where `flagged` means the record would have sent feedback with
+// autoFeedback=true -- decideFeedback(aggregate, config).feedback under the
+// shipped thresholds AND independent defect evidence from the citation audit
+// (the src/host.ts feedback branch) -- and `valid` is false when the lanes
+// could not produce a decision (too few valid lanes, transport failure).
+
+export const LEGACY_THRESHOLDS = Object.freeze({
+  minFailures: 10,
+  minPrecision: 0.7,
+  minRecall: 0.5,
+  maxInvalidRate: 0.2,
+})
+
+export function computeLegacyFlagMetrics(rows) {
+  const valid = rows.filter((row) => row.valid)
+  const failures = valid.filter((row) => !row.baselinePass)
+  const flagged = valid.filter((row) => row.flagged)
+  const truePositives = flagged.filter((row) => !row.baselinePass)
+  return {
+    tasks: rows.length,
+    invalidRate: rows.length === 0 ? 0 : (rows.length - valid.length) / rows.length,
+    failures: failures.length,
+    flagged: flagged.length,
+    precision: flagged.length === 0 ? null : truePositives.length / flagged.length,
+    recall: failures.length === 0 ? null : truePositives.length / failures.length,
+  }
+}
+
+/** keep: the flag predicts hidden-test failure well enough to justify an
+ *  idle-time path. retire: remove the automatic idle path (keep manual
+ *  /verify). insufficient: too few failures in the set to judge -- treated as
+ *  retire for the default-on question, since spend needs evidence, not doubt. */
+export function decideLegacy(metrics, thresholds = LEGACY_THRESHOLDS) {
+  // An unreliable transport is disqualifying at any sample size, and it also
+  // shrinks the valid set, so it is judged before the failure count.
+  if (metrics.invalidRate > thresholds.maxInvalidRate) return { decision: 'retire', reasons: ['invalid rate ' + metrics.invalidRate.toFixed(3) + ' > ' + thresholds.maxInvalidRate] }
+  if (metrics.failures < thresholds.minFailures) return { decision: 'insufficient', reasons: ['failures ' + metrics.failures + ' < ' + thresholds.minFailures] }
+  const reasons = []
+  if (metrics.precision === null || metrics.precision < thresholds.minPrecision) reasons.push('precision ' + metrics.precision + ' < ' + thresholds.minPrecision)
+  if (metrics.recall === null || metrics.recall < thresholds.minRecall) reasons.push('recall ' + metrics.recall + ' < ' + thresholds.minRecall)
+  return reasons.length === 0 ? { decision: 'keep', reasons: [] } : { decision: 'retire', reasons }
+}

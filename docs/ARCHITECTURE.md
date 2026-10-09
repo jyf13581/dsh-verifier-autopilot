@@ -517,10 +517,14 @@ scripts/tests/
   egress-persistence.test.mjs review R5: redaction exits, ledger durability, protocol
   build-contract.test.mjs    review R6: one build, DSH cancel contract, defaults, /select numbers
   coverage-gaps.test.mjs     review R6: child setup injection, retry abort, Windows paths, autocrlf
+  product-defaults.test.mjs  review R7: opt-in defaults, auto admission profile, per-turn spend
+  doc-truth.test.mjs         review R7: generated README defaults, authoritative-doc drift lint
+  p1-metrics.test.mjs        review R7: preregistered P1 metrics and decision rules (eval/p1)
   helpers/                   harness (timing, rejection collector), provider (mocked
                              verifier), host (fake DSH context), selection (fake
                              factories/bridges, real workspaces), sidecar, git
   fixtures/stub_sidecar.py   protocol-conformant stub sidecar (answers from the fixtures)
+  fixtures/admission-corpus.mjs  labelled first messages for the admission profile
 ```
 
 Helpers are plain functions with no registration side effects, with two
@@ -582,6 +586,7 @@ must remain untracked.
 | Browser presentation only | `src/client/index.ts` | Client build; no server-domain import |
 | Public package surface | `src/index.ts` | Declaration build and compatibility review |
 | Build or dependency policy | `package.json`, lockfile, CI | Architecture/README when workflow changes |
+| Config default, range, or new key | `src/config.ts`, then `npm run docs:facts` (a new key also needs a line in `NOTES` in `scripts/doc-facts.mjs`) | README generated block (`doc-truth` fails while stale); `product-defaults` for the spending switches |
 
 Before merging, inspect `git status --short` and the staged file list. A normal
 architecture change must not include secrets, internal addresses, `.data`,

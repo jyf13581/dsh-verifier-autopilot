@@ -32,6 +32,7 @@
     "build:client": "tsdown",
     "check:architecture": "node scripts/check-architecture.mjs",
     "check:contract": "tsc -p scripts/contract/tsconfig.json",
+    "docs:facts": "node scripts/doc-facts.mjs --write",
     "test": "node --test \"scripts/tests/*.test.mjs\"",
     "eval": "node eval/run.mjs"
   },
