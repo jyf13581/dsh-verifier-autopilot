@@ -193,7 +193,7 @@
 - preflight 与 ranking 使用相同的归一化 timeout 值，但各自创建独立绝对 deadline；不是从 preflight 开始共享一个跨阶段总 deadline。因此最坏总墙钟还包括 workspace、preflight、candidate 和 ranking 各阶段。
 - selection timeout 默认 600000ms，归一化范围 30000..600000ms（2026-09-05 从 300s 上限抬升至 600s：effort=max 下单次 minimax-m3 比较 70..100s，最小锦标赛已逼近 300s；host normalize、runner budget、autopilot clamp 三处同步）。preflight 和 ranking 各自最多 2 次 attempt，只重试 retriable BridgeError，backoff 和 attempt 共用该阶段 deadline。
 - Kimi verifier maxWorkers=1，避免并发撞 relay pending/concurrency 限制；候选 rollout 仍可并行。
-- 当前自动运行默认是可用优先的标准档 N=2/K=1/P=0，deep 为 N=3 且 K 至少 2；verifier 思考强度为 low。N/K/P/effort 可在 GUI 或配置中提高；bridge 的 n_evaluations=4 只是直接调用未传值时的上游兼容 fallback；P 缺省时（极少路径）fallback 为 1。
+- 当前自动运行默认是可用优先的标准档 N=2/K=1/P=0，deep 为 N=3 且 K 至少 2；verifier 思考强度为 low。N/K/P/effort 可在 GUI 或配置中提高；K 未传值时 config、runner 与 bridge 直接调用统一回落到 `DEFAULT_SELECTION_EVALUATIONS`=1（review R5 5.4；此前 runner 回落 2、bridge 回落 4）；P 缺省时（极少路径）fallback 为 1。
 - 思考强度（verifierEffort，off/low/high/max）同时作用于两条 verifier 路径：五路 lane 在 chat body 里附带 thinking/reasoning_effort 字段（off 显式 thinking:disabled）；selection 侧的 effort 字段经 bridge frame 直达 sidecar，由其在请求作用域内设置 DEEPSEEK_EFFORT（调用结束后还原，不会污染 health 或下一个请求）。preflight 的 memoize tuple 包含 effort，切换强度会重新预检。
 - 多幸存者必须过三道门才可能成为 winner（2026-09-08 起）：(1) has-work —— code/file 型任务要求候选有执行类工具调用（`tool_search`/`tool_slimmer_catalog`/`tool_call` 等元工具不计）或非空 worktree diff，否则记 `insufficient-evidence` 淘汰；全灭则 `outcome=insufficient_evidence`，不 relay winner。(2) noSearchSpace —— 幸存候选 git diff 指纹全等时去重为 single_candidate_fallback，绝不花 verifier 配额（R2 起：指纹按文件内容哈希；按指纹分组只留最小编号，部分重复也去重，记 `dedupedCandidates`；空 diff 不去重；只读工具 read/grep/ls 等不计 has-work）。(3) margin gate —— verifier 返回通过严格校验后，top-2 margin < `selectionMarginThreshold`（当前 **0.03**，首轮 C0 校准噪声上限 2.2×，仍标 provisional；record 留存 `margin/marginThreshold/marginCondition/marginProvisional`）或完全平分时 `outcome=abstain`，不设 winner、不写 winnerBasis。
 - **ranking 输入可靠性（2026-09-08 补强）**：每个幸存者轨迹前会前置 `[DETERMINISTIC EVIDENCE]` 块（taskKind、执行类调用数、diff 统计、checks 逐条 exit 码、harness-error 标注），ranker 不再只依赖 24000 字符截断后的轨迹尾部。
@@ -204,7 +204,7 @@
 - preflight 与 ranking 使用相同的归一化 timeout 值，但各自创建独立绝对 deadline；不是从 preflight 开始共享一个跨阶段总 deadline。因此最坏总墙钟还包括 workspace、preflight、candidate 和 ranking 各阶段。
 - selection timeout 默认 600000ms，归一化范围 30000..600000ms（2026-09-05 自 300s 上限抬升；2026-09-08 起 manual /select 省略 selectTimeoutMs 时跟随 config，不再回落硬编码 180s）。preflight 和 ranking 各自最多 2 次 attempt，只重试 retriable BridgeError，backoff 和 attempt 共用该阶段 deadline。
 - Kimi verifier maxWorkers=1，避免并发撞 relay pending/concurrency 限制；候选 rollout 仍可并行。
-- 当前自动运行默认是可用优先的标准档 N=2/K=1/P=0，deep 为 N=3 且 K 至少 2；verifier 思考强度为 low。N/K/P/effort 可在 GUI 或配置中提高；bridge 的 n_evaluations=4 只是直接调用未传值时的上游兼容 fallback；P 缺省时（极少路径）fallback 为 1。
+- 当前自动运行默认是可用优先的标准档 N=2/K=1/P=0，deep 为 N=3 且 K 至少 2；verifier 思考强度为 low。N/K/P/effort 可在 GUI 或配置中提高；K 未传值时 config、runner 与 bridge 直接调用统一回落到 `DEFAULT_SELECTION_EVALUATIONS`=1（review R5 5.4；此前 runner 回落 2、bridge 回落 4）；P 缺省时（极少路径）fallback 为 1。
 - 思考强度（verifierEffort，off/low/high/max）同时作用于两条 verifier 路径：五路 lane 在 chat body 里附带 thinking/reasoning_effort 字段（off 显式 thinking:disabled）；selection 侧的 effort 字段经 bridge frame 直达 sidecar，由其在请求作用域内设置 DEEPSEEK_EFFORT（调用结束后还原，不会污染 health 或下一个请求）。preflight 的 memoize tuple 包含 effort，切换强度会重新预检。
 - 单幸存者只可标 objective-check-only 或 single-candidate（`outcome=single_candidate_fallback`），score 为 null，不能冒充 verifier winner。
 - 任务类型在准入阶段由确定性分类器定（`classifyTaskKind`），写入 policy.taskKind；「已收口/全部通过/汇总如下」类完成汇报直接拒收（K.4-7，sel-1c8d28ef 教训），候选/LLM 不自报类型。analysis-text 任务不做 has-work 淘汰，全程 `llmOnly=true`，永不 verified。

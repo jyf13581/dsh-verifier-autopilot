@@ -26,7 +26,8 @@
  */
 
 import { tmpdir } from 'node:os'
-import { runProcess, scrubSecretEnv, type ProcessResult } from './proc.js'
+import { runProcess, type ProcessResult } from './proc.js'
+import { scrubSecretEnv } from '../util.js'
 
 export interface ObjectiveCheck {
   name: string

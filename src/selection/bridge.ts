@@ -11,6 +11,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 import { isRecord } from '../payload.js'
+import { DEFAULT_SELECTION_EVALUATIONS } from '../constants.js'
 
 /** Error codes the sidecar may put in a failure frame (bridge/PROTOCOL.md
  *  "Error Codes"). The protocol fixtures test keeps this list and the
@@ -43,7 +44,14 @@ export class BridgeError extends Error {
   }
 }
 
+/** Version of bridge/PROTOCOL.md this bridge speaks. The sidecar reports its
+ *  own in every health frame; any other value (or none) fails fast (review
+ *  R5 5.4). */
+export const SIDECAR_PROTOCOL_VERSION = 1
+
 export interface BridgeHealth {
+  /** Protocol version the sidecar reports; null when it reports none. */
+  protocol: number | null
   python: string
   llm_verifier_version: string
   select_available: boolean
@@ -217,6 +225,7 @@ export function parseHealthResult(value: unknown): BridgeHealth {
   if (!isRecord(value)) throw protocolError('health result must be an object')
   if (typeof value.select_available !== 'boolean') throw protocolError('select_available must be a boolean')
   return {
+    protocol: typeof value.protocol === 'number' && Number.isInteger(value.protocol) ? value.protocol : null,
     python: String(value.python ?? ''),
     llm_verifier_version: String(value.llm_verifier_version ?? ''),
     select_available: value.select_available,
@@ -380,6 +389,15 @@ export class VerifierBridge {
         this.diagnostics.count('sidecar.warmup_ms', elapsed)
         if (elapsed > SIDECAR_SLOW_WARMUP_MS) this.diagnostics.warn('sidecar.warmup', 'sidecar took ' + elapsed + 'ms from spawn to its first answer', { python: this.pythonPath })
         const result = frame.ok === true && isRecord(frame.result) ? frame.result : null
+        // Every request queued behind this probe goes to the same child: a
+        // sidecar speaking another protocol version must not answer them.
+        const protocol = result && typeof result.protocol === 'number' ? result.protocol : null
+        if (result && protocol !== SIDECAR_PROTOCOL_VERSION) {
+          const failure = new BridgeError('bridge_protocol', 'sidecar speaks protocol ' + (protocol === null ? '(none reported)' : String(protocol)) + ', bridge expects ' + SIDECAR_PROTOCOL_VERSION + ' (stale or foreign sidecar script: ' + this.scriptPath + ')', false)
+          this.diagnostics.warn('sidecar.protocol_mismatch', failure, { python: this.pythonPath })
+          this.teardownChild(failure)
+          return
+        }
         if (result && result.select_available === false) this.diagnostics.warn('sidecar.select_unavailable', String(result.note ?? 'llm_verifier dependency is unavailable'), { python: this.pythonPath })
       },
     })
@@ -512,7 +530,7 @@ export class VerifierBridge {
       candidates: req.candidates,
       criteria: req.criteria,
       ground_truth_note: req.groundTruthNote ?? null,
-      n_evaluations: req.nEvaluations ?? 4, // direct-call fallback matches upstream; Host defaults are in HANDOFF §2.4
+      n_evaluations: req.nEvaluations ?? DEFAULT_SELECTION_EVALUATIONS, // one K default everywhere (review R5 5.4); upstream's own default is 4
       pivots: req.pivots ?? 1,
       seed: req.seed ?? 0,
       effort: req.effort ?? null,

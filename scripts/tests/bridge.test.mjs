@@ -110,6 +110,8 @@ test("bridge: PROTOCOL.md, the fixtures, and the TypeScript error union agree", 
   const documentedResultKeys = keysIn("### Success Response").filter((k) => !["id", "ok", "result"].includes(k))
   const fixtureResultKeys = [...Object.keys(PROTOCOL.responses.select.result), ...Object.keys(PROTOCOL.responses.select.result.usage), ...Object.keys(PROTOCOL.responses.select.result.extraction ?? {})].sort()
   assert.deepEqual(fixtureResultKeys, documentedResultKeys, "select success result keys (including usage and extraction)")
+  const documentedHealthKeys = keysIn("### Health Response").filter((k) => !["id", "ok", "result"].includes(k))
+  assert.deepEqual(Object.keys(PROTOCOL.responses.health.result).sort(), documentedHealthKeys, "health result keys (review R5 5.4: the Health Response anchor used to point nowhere)")
 })
 
 test("bridge: real sidecar rejects empty candidates offline", async () => {

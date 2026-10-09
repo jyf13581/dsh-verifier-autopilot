@@ -6,7 +6,7 @@
 
 import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import z from 'schemastery'
-import { DEFAULT_SELECTION_MARGIN_THRESHOLD, SETTINGS_NAMESPACE_ID } from './constants.js'
+import { DEFAULT_SELECTION_EVALUATIONS, DEFAULT_SELECTION_MARGIN_THRESHOLD, SETTINGS_NAMESPACE_ID } from './constants.js'
 
 export { DEFAULT_SELECTION_MARGIN_THRESHOLD, SETTINGS_NAMESPACE_ID } from './constants.js'
 
@@ -131,7 +131,7 @@ export const Config = z.object({
   // explicit operator controls for deliberate quality runs.
   selectionStandardCandidates: z.number().step(1).min(2).max(5).default(2),
   selectionDeepCandidates: z.number().step(1).min(2).max(5).default(3),
-  selectionEvaluations: z.number().step(1).min(1).max(8).default(1),
+  selectionEvaluations: z.number().step(1).min(1).max(8).default(DEFAULT_SELECTION_EVALUATIONS),
   // 枢轴迭代数 k：O(N·k) 的比较成本，下游按幸存者数自动收敛。
   selectionPivots: z.number().step(1).min(0).max(5).default(0),
   selectionCandidateTimeoutMs: z.number().step(1000).min(30000).max(1800000).default(600000),

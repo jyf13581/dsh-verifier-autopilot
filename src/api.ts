@@ -19,7 +19,7 @@ import {
   type SelectionsListResponse, type StateResponse, type VerificationRecord,
   type VerifyResponse, type WebRequest, type WebResponse, type WebRoute,
 } from './protocol.js'
-import { normalizeBaseUrl, redactSecrets, resolveKey, type Credentials } from './util.js'
+import { normalizeBaseUrl, redactWithEnvSecrets, resolveKey, type Credentials } from './util.js'
 
 /** Structural domain seam consumed by the transport. VerifierHost satisfies it
  * at the composition root, while API tests can use a focused fake without
@@ -166,7 +166,7 @@ async function readSelectionIdRequest(req: WebRequest): Promise<{ ok: true; sele
  *  to the operator unfiltered. */
 function internalFailure(res: WebResponse, error: unknown): void {
   const message = error instanceof Error ? error.message : String(error)
-  json(res, 500, { ok: false, error: redactSecrets(message).slice(0, 240) })
+  json(res, 500, { ok: false, error: redactWithEnvSecrets(message).slice(0, 240) })
 }
 
 /** One status/error mapping for every selection route: domain admission

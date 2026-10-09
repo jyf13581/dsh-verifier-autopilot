@@ -1030,7 +1030,8 @@ export class SelectionHost {
           if (d) {
             atomicWriteFile(
               path.join(selDir, 'diffs', 'c' + i + '.patch'),
-              d.patch + String.fromCharCode(10) + '# truncated=' + d.truncated + '; untracked=' + (d.untrackedFiles.join(' ') || 'none') + String.fromCharCode(10),
+              d.patch + String.fromCharCode(10) + '# truncated=' + d.truncated + '; untracked=' + (d.untrackedFiles.join(' ') || 'none')
+                + (d.scope ? '; scope=' + d.scope + (d.inheritedExcluded !== undefined ? '; inheritedExcluded=' + d.inheritedExcluded : '') : '') + String.fromCharCode(10),
             )
           }
         }

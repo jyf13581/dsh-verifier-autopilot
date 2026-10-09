@@ -19,7 +19,8 @@ import { randomUUID } from 'node:crypto'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 import { rmdir } from 'node:fs/promises'
 import path from 'node:path'
-import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
+import { DEFAULT_SELECTION_EVALUATIONS, DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
+import { makeRedactor } from '../util.js'
 import { read, readString } from '../payload.js'
 import { boundCandidateHandoff, renderTrajectory, type TrajectoryEvent } from './trajectory.js'
 import { runChecks, type CheckResult, type ObjectiveCheck } from './checks.js'
@@ -299,7 +300,7 @@ export interface SelectionRunnerDeps {
   diffStat?: (cwd: string) => Promise<DiffStatLite | null>
   /** Full patch capture for the audit pack (ruling I.5). Runs right after the
    *  per-candidate accounting pass, before any workspace disposal. */
-  diffFull?: (cwd: string) => Promise<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null>
+  diffFull?: (cwd: string) => Promise<{ patch: string; truncated: boolean; untrackedFiles: string[]; scope?: 'own' | 'head'; inheritedExcluded?: number } | null>
   /** Test seam for bounded verifier backoff; production uses abort-aware timers. */
   sleep?: RetrySleep
   now?: () => number
@@ -380,7 +381,7 @@ export interface SelectionRunResult {
    *  (.data/selection-artifacts/<id>/) by the host at settle time. */
   artifacts?: {
     traces: Array<string | null>
-    diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null>
+    diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[]; scope?: 'own' | 'head'; inheritedExcluded?: number } | null>
   }
 }
 
@@ -548,11 +549,22 @@ export class SelectionRunner {
       verifierModel: input.verifier.model,
     }
     const diag = this.deps.diagnostics ?? defaultDiagnostics
+    // Review R5 5.1: every text this run sends to the verifier, records,
+    // writes to the audit pack, or relays to the source session passes one
+    // redactor (the verifier key plus every credential-named env value, then
+    // the shared token patterns), as the legacy lane prompt always did. A
+    // candidate that ran `env` must not ship the user's keys to a third-party
+    // verifier endpoint, the ledger, /state, or the source conversation.
+    const redact = makeRedactor([input.verifier.apiKey])
+    const redactCriteria = (criteria: BridgeSelectRequest['criteria']): BridgeSelectRequest['criteria'] => Array.isArray(criteria)
+      ? criteria.map((c) => ({ ...c, name: redact(c.name), description: redact(c.description) }))
+      : Object.fromEntries(Object.entries(criteria ?? {}).map(([k, v]) => [k, redact(v)]))
+    const failureText = (e: unknown) => redact(errText(e))
     const publish = () => { try { input.onUpdate?.(record) } catch { diag.count('selection.observer_error') } }
     publish()
     const handles: Array<SelectionAgentHandle | null> = new Array(n).fill(null)
     const trajectories: Array<string | null> = new Array(n).fill(null)
-    const diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null> = new Array(n).fill(null)
+    const diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[]; scope?: 'own' | 'head'; inheritedExcluded?: number } | null> = new Array(n).fill(null)
     const seed = input.seed && input.seed.length > 0 ? input.seed : undefined
     const candidateTimeout = input.candidateTimeoutMs ?? 600000
     const cancelGrace = Math.max(0, input.cancelGraceMs ?? 30_000)
@@ -663,7 +675,7 @@ export class SelectionRunner {
           }
         } catch (e) {
           cand.status = 'failed'
-          cand.error = 'agent-create: ' + errText(e)
+          cand.error = 'agent-create: ' + failureText(e)
         }
       }))
       if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted during agent creation', false)
@@ -718,8 +730,8 @@ export class SelectionRunner {
                 const rendered = renderTrajectory(agent.session.events.slice(preRunCount))
                 if (rendered.text.trim()) {
                   const r = await progressFn({
-                    problem: input.problem,
-                    steps: [rendered.text.slice(-12000)],
+                    problem: redact(input.problem),
+                    steps: [redact(rendered.text).slice(-12000)],
                     model: input.verifier.model,
                     baseUrl: input.verifier.baseUrl,
                     apiKey: input.verifier.apiKey,
@@ -810,14 +822,14 @@ export class SelectionRunner {
             if (bad.length > 0) {
               cand.status = 'failed'
               const reason = readString(bad[bad.length - 1].data, 'reason', 'error', 'message')
-              cand.error = 'turn-error' + (reason ? ': ' + reason.slice(0, 160) : '')
+              cand.error = 'turn-error' + (reason ? ': ' + redact(reason).slice(0, 160) : '')
             } else {
               cand.status = 'finished'
             }
           }
         } catch (e) {
           cand.status = 'failed'
-          cand.error = errText(e)
+          cand.error = failureText(e)
         } finally {
           clearTimeout(timer)
           if (hardStop) clearTimeout(hardStop)
@@ -841,7 +853,7 @@ export class SelectionRunner {
           cand.toolCalls = r.toolCalls
           cand.execToolCalls = r.execToolCalls
           cand.trajectoryChars = r.totalChars
-          trajectories[cand.index] = r.text
+          trajectories[cand.index] = redact(r.text)
         } catch (error) { diag.warn('evidence.render', error, { selectionId: record.selectionId, candidate: cand.index }) }
         // Objective diff evidence (ruling I.5): the workspace's git surface is
         // the has-work gate's primary trust anchor. Best-effort; a non-git
@@ -852,7 +864,10 @@ export class SelectionRunner {
         // Full patch capture for the artifact pack — BEFORE any cleanup could
         // delete the worktree (loser disposal runs later).
         if (this.deps.diffFull) {
-          try { diffPatches[cand.index] = await this.deps.diffFull(cand.workspace) } catch (error) { diffPatches[cand.index] = null; diag.warn('evidence.diff', error, { selectionId: record.selectionId, candidate: cand.index }) }
+          try {
+            const full = await this.deps.diffFull(cand.workspace)
+            diffPatches[cand.index] = full ? { ...full, patch: redact(full.patch), untrackedFiles: full.untrackedFiles.map(redact) } : full
+          } catch (error) { diffPatches[cand.index] = null; diag.warn('evidence.diff', error, { selectionId: record.selectionId, candidate: cand.index }) }
         }
         publish()
       }))
@@ -872,7 +887,8 @@ export class SelectionRunner {
       for (const cand of record.candidates) {
         if (cand.status !== 'finished') continue
         if (!input.checks || input.checks.length === 0) { cand.objectiveEvidence = 'none'; continue }
-        cand.checks = await runChecks(cand.workspace, input.checks, { signal: input.signal, secretEnvNames: input.verifier.apiKeyEnv ? [input.verifier.apiKeyEnv] : [] })
+        cand.checks = (await runChecks(cand.workspace, input.checks, { signal: input.signal, secretEnvNames: input.verifier.apiKeyEnv ? [input.verifier.apiKeyEnv] : [] }))
+          .map((check) => ({ ...check, outputTail: redact(check.outputTail) }))
         const failed = cand.checks.filter((c) => !c.ok)
         if (failed.length > 0 && failed.every((c) => c.harnessError)) {
           cand.checksInvalid = true
@@ -974,15 +990,15 @@ export class SelectionRunner {
             // 2026-09-05): max-effort verifiers need >300s for even two beats.
             const rankingBudgetMs = Math.max(1, Math.min(600_000, Math.floor(input.selectTimeoutMs ?? 180_000)))
             const rankingDeadlineAt = now() + rankingBudgetMs
-            const nEvaluations = Math.max(1, Math.min(8, Math.floor(input.nEvaluations ?? 2)))
+            const nEvaluations = Math.max(1, Math.min(8, Math.floor(input.nEvaluations ?? DEFAULT_SELECTION_EVALUATIONS)))
             const pivots = Math.max(0, Math.min(survivors.length, Math.floor(input.pivots ?? 1)))
             let selectResult: BridgeSelectResult | null = null
             try {
               selectResult = await retryTransientBridge((attempt) => this.deps.bridge.select({
-                problem: input.problem,
+                problem: redact(input.problem),
                 candidates: survivors.map((c) => deterministicPreface(c, record.taskKind ?? input.taskKind) + '\n\n' + (trajectories[c.index] ?? '')),
-                criteria: input.criteria,
-                groundTruthNote: input.groundTruthNote ?? null,
+                criteria: redactCriteria(input.criteria),
+                groundTruthNote: input.groundTruthNote ? redact(input.groundTruthNote) : null,
                 nEvaluations,
                 pivots,
                 seed: input.algorithmSeed ?? 0,
@@ -1017,7 +1033,7 @@ export class SelectionRunner {
               if (!survivors.every((c) => c.objectiveEvidence === 'pass')) throw bridgeFailure
               record.outcome = 'verifier_unavailable'
               diag.warn('verifier.unavailable', bridgeFailure, { selectionId: record.selectionId })
-              record.note = 'ranking failed after retries: ' + errText(bridgeFailure)
+              record.note = 'ranking failed after retries: ' + failureText(bridgeFailure)
               // No objective-only ordering exists here (review R2 2.3): this
               // branch is reached only when EVERY survivor passed EVERY check,
               // so pass counts are equal by construction. The former
@@ -1131,7 +1147,7 @@ export class SelectionRunner {
     } catch (e) {
       const isAbort = aborted || (e instanceof BridgeError && e.code === 'bridge_aborted')
       record.status = isAbort ? 'aborted' : 'failed'
-      record.error = errText(e)
+      record.error = failureText(e)
       record.finishedAt = now()
       record.stage = 'settled'
       publish()

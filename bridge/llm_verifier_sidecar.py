@@ -11,6 +11,7 @@ Protocol: see bridge/PROTOCOL.md.
 from __future__ import annotations
 
 import json
+import re
 import os
 import sys
 import tempfile
@@ -19,6 +20,10 @@ from typing import Any, Dict, List, NoReturn, Optional
 os.environ.setdefault("DEEPSEEK_EFFORT", "off")
 
 _LLM_VERIFIER_IMPORT_ERROR: Optional[ImportError] = None
+
+# Version of bridge/PROTOCOL.md this script implements; reported in health and
+# checked by the bridge on every spawn (review R5 5.4).
+PROTOCOL_VERSION = 1
 
 try:
     import llm_verifier
@@ -282,6 +287,7 @@ def _ok(req_id: Optional[str], result: Dict[str, Any]) -> None:
 def _handle_health(req_id: Optional[str]) -> None:
     available = llm_verifier is not None
     _ok(req_id, {
+        "protocol": PROTOCOL_VERSION,
         "python": sys.version,
         "llm_verifier_version": (getattr(llm_verifier, "__version__", "unknown")
                                  if available else None),
@@ -386,14 +392,23 @@ class _effort_scoped:
         else:
             os.environ["DEEPSEEK_EFFORT"] = self.previous
 
+# How a missing score distribution actually surfaces (review R5 5.4): the
+# upstream deepseek path raises RuntimeError("DeepSeek returned no answer
+# logprobs ..."), and relays that cannot return logprobs reject the parameter
+# with a 4xx naming it. A bare "logprob" substring is not evidence: a 429/5xx
+# body or a timeout message that echoes the request parameters mentions it too,
+# and mapping those to the non-retriable missing_logprobs turned a transient
+# outage into a permanent "this verifier cannot work" verdict.
+_MISSING_LOGPROBS = re.compile(
+    r"returned no answer logprobs|logprobs?\W+(?:is|are)?\s*(?:not supported|unsupported|not available|not enabled)"
+    r"|(?:does not|doesn't|cannot) (?:support|return) (?:top_)?logprobs", re.IGNORECASE)
+
+
 def _map_exception(exc: BaseException) -> "tuple[str, bool]":
-    """Map a library/provider failure to (code, retriable)."""
-    if isinstance(exc, ValueError):
-        return "invalid_request", False
+    """Map a library/provider failure to (code, retriable). Typed classes are
+    decided before any message text is consulted."""
     if isinstance(exc, MissingAPIKeyError):
         return "missing_api_key", False
-    if "logprob" in str(exc).lower():
-        return "missing_logprobs", False
     try:  # openai exception taxonomy (installed in the venv)
         import openai
         if isinstance(exc, openai.APITimeoutError):
@@ -404,10 +419,20 @@ def _map_exception(exc: BaseException) -> "tuple[str, bool]":
             status = getattr(exc, "status_code", None)
             if status == 429 or (isinstance(status, int) and status >= 500):
                 return "provider_error", True
+            if status in (400, 422) and ("logprob" in str(exc).lower()):
+                return "missing_logprobs", False
             return "provider_error", False
     except Exception:
         pass
-    if "timeout" in str(exc).lower():
+    if isinstance(exc, RuntimeError) and _MISSING_LOGPROBS.search(str(exc)):
+        return "missing_logprobs", False
+    # A reply the client could not decode is the provider's fault and usually
+    # transient, not a malformed request (both are ValueError subclasses).
+    if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+        return "provider_error", True
+    if isinstance(exc, ValueError):
+        return "invalid_request", False
+    if isinstance(exc, TimeoutError) or "timeout" in str(exc).lower() or "timed out" in str(exc).lower():
         return "timeout", True
     return "selection_failed", False
 

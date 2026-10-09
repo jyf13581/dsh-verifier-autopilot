@@ -154,6 +154,30 @@ judgment. The host records the tally as `scoreExtraction` and names it in the
 relay. Like `usage`, a malformed tally is dropped rather than failing the
 verdict.
 
+### Health Response
+
+```json
+{
+  "id": "<same as request>",
+  "ok": true,
+  "result": {
+    "protocol": 1,  // protocol version this sidecar speaks
+    "python": "<sys.version>",
+    "llm_verifier_version": "<string or null>",
+    "select_available": <boolean>,
+    "note": "<string>",
+    "deepseek_effort": "<string or null>"
+  }
+}
+```
+
+`protocol` is the version of this document the sidecar implements (review R5
+5.4). The bridge sends a health frame first on every spawn and tears the child
+down with a non-retriable `bridge_protocol` failure when the version is absent
+or differs from its own, so a stale or foreign sidecar script fails the first
+request loudly instead of answering frames it may interpret differently.
+Bump it on any change to a request or result field's meaning.
+
 ### Failure Response
 
 ```json
@@ -201,7 +225,7 @@ The TS bridge offers `VerifierBridge.preflight()`: one tiny asymmetric pair must
 ```
 **Response:**
 ```
-{"id": "h1", "ok": true, "result": {"python": "3.11....", "llm_verifier_version": "0.2.0", "select_available": true, "note": "client must be deepseek-flagged: sampled score tags, no prefill support on this relay", "deepseek_effort": "off"}}
+{"id": "h1", "ok": true, "result": {"protocol": 1, "python": "3.11....", "llm_verifier_version": "0.2.0", "select_available": true, "note": "client must be deepseek-flagged: sampled score tags, no prefill support on this relay", "deepseek_effort": "off"}}
 ```
 
 **Select request (single candidate, short-circuits):**

@@ -788,7 +788,19 @@ export interface DiffFull {
   truncated: boolean
   /** Untracked (non-ignored) file names — the typical brand-new deliverable. */
   untrackedFiles: string[]
+  /** 'own': only paths the candidate changed since its start baseline (review
+   *  R5 5.6); 'head': everything vs HEAD (no baseline, or too many own paths
+   *  to pass as pathspecs). Absent on records written before R5. */
+  scope?: 'own' | 'head'
+  /** Inherited source edits left out of an 'own' patch: the user's
+   *  work-in-progress, not candidate work. */
+  inheritedExcluded?: number
 }
+
+/** Pathspec budget for an own-paths patch; beyond it the patch falls back to
+ *  scope 'head' rather than risk the platform's command-line limit. */
+const OWN_PATCH_MAX_PATHS = 400
+const OWN_PATCH_MAX_CHARS = 16_000
 
 /** Full diff evidence for the audit pack (ruling I.5): what the candidate
  *  actually changed, captured BEFORE the workspace can be reclaimed. */
@@ -807,11 +819,32 @@ export async function gitDiffFull(cwd: string, patchCap = 262144): Promise<DiffF
     try { await cp(path.resolve(cwd, indexPath.out.trim()), scratchIndex) } catch { /* no index yet: git starts from an empty one */ }
     const scratchEnv = { ...process.env, GIT_INDEX_FILE: scratchIndex }
     await execWide('git', ['-C', cwd, 'add', '-N', '.'], cwd, scratchEnv)
-    const diff = await exec('git', ['-C', cwd, 'diff', ...RAW_DIFF, 'HEAD', '--', '.'], { cwd, cap: patchCap, keep: 'head', env: scratchEnv })
-    if (diff.code !== 0) return null
-    const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard'], cwd)
-    const untrackedFiles = others.code === 0 ? others.out.split(/\r?\n/).filter(Boolean) : []
-    return { patch: diff.out, truncated: diff.out.length >= patchCap, untrackedFiles }
+    // Review R5 5.6: a patch vs HEAD also carried the source edits the
+    // candidate inherited at start (prepare mirrors the user's uncommitted
+    // work): the audit pack then showed the user's work as candidate work and
+    // shipped it to disk with every candidate. With a start baseline, limit
+    // the patch to the paths the candidate itself changed.
+    const changes = await candidateOwnChanges(cwd)
+    const ownPaths = changes?.hasBaseline ? changes.own.map((entry) => entry.path) : null
+    const ownSpecs = ownPaths ? ownPaths.map((rel) => ':(top,literal)' + rel) : null
+    const ownFits = ownSpecs !== null && ownSpecs.length <= OWN_PATCH_MAX_PATHS && ownSpecs.reduce((n, spec) => n + spec.length + 1, 0) <= OWN_PATCH_MAX_CHARS
+    const scope: 'own' | 'head' = ownFits ? 'own' : 'head'
+    let patch = ''
+    if (scope === 'head' || (ownSpecs && ownSpecs.length > 0)) {
+      const diff = await exec('git', ['-C', cwd, 'diff', ...RAW_DIFF, 'HEAD', '--', ...(scope === 'own' ? ownSpecs! : ['.'])], { cwd, cap: patchCap, keep: 'head', env: scratchEnv })
+      if (diff.code !== 0) return null
+      patch = diff.out
+    }
+    const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard', '--full-name'], cwd)
+    const ownSet = scope === 'own' ? new Set(ownPaths) : null
+    const untrackedFiles = (others.code === 0 ? others.out.split(/\r?\n/).filter(Boolean) : []).filter((rel) => !ownSet || ownSet.has(rel))
+    return {
+      patch,
+      truncated: patch.length >= patchCap,
+      untrackedFiles,
+      scope,
+      ...(scope === 'own' && changes ? { inheritedExcluded: changes.inherited } : {}),
+    }
   } catch {
     return null
   } finally {
