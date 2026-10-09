@@ -2,9 +2,9 @@
 
 - 基线：`d28f656`（R3 之后），审查分支 `arena/01a0d1de-dsh-verifier-autopilot`，PR #5
 - 计划：`docs/REVIEW-PLAN-2026-09-24.md` §R4
-- 提交：`0a5a1da`（4.1/4.4/4.7/4.7b）、`31e9aee`（4.2）、`4feed3a`（4.3/4.5）、`e256ce1`（4.6）、`d5ceba0`（本报告与文档同步）、`7513e78`（4.2b）
+- 提交：`0a5a1da`（4.1/4.4/4.7/4.7b）、`31e9aee`（4.2）、`4feed3a`（4.3/4.5）、`e256ce1`（4.6）、`d5ceba0`（本报告与文档同步）、`7513e78`（4.2b）、`7eed911`（CI 偶发失败的测试修正）
 - 回归测试：`scripts/tests/lifecycle.test.mjs`，15 个测试。用于替身的 fake 只模拟 DSH 类型声明里写明的契约（`agent.status` 镜像、inbox 投影）；进程类测试跑的是真实子进程，用 `ps` 精确匹配 argv 计数，中间不经过 shell
-- 门禁：`check:architecture`、`typecheck`、`build:host`、`build:client` 全绿；`npm test` **304/304**（R3 之后 289，新增 15；原有测试一条未改）；`bridge/self_test.py` 13 PASS / 1 SKIP；`git diff --check` 干净；四个提交的 push 和 pull_request 两路 CI 全绿，check shell 均为 pwsh
+- 门禁：`check:architecture`、`typecheck`、`build:host`、`build:client` 全绿；`npm test` **304/304**（R3 之后 289，新增 15；原有测试只改了一处：`autopilot.test.mjs` 清理竞态测试原本假定删除会在固定的 40 ms 内开始，而删除要等真实 git 审计完成；`e9197ca` 的 push CI 因此偶发失败，现改为等待删除开始（6 个 CPU 压测进程下旧版 2/2 失败，新版 5/5 通过），断言本身未改）；`bridge/self_test.py` 13 PASS / 1 SKIP；`git diff --check` 干净；R4 全部提交的 pull_request CI 全绿；push CI 除 `e9197ca` 那次偶发失败（由 `7eed911` 修正）外全绿；check shell 均为 pwsh
 - 约束：本轮没有产生任何 provider 调用
 
 ## 1. 目标与方法
