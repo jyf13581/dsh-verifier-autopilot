@@ -30,6 +30,16 @@ jobs:
         run: npm ci --force --ignore-scripts
       - name: Check architecture boundaries
         run: npm run check:architecture
+      - name: Check the DSH agent contract
+        # The plugin's hand-declared agent views against the installed DSH
+        # declarations (scripts/contract/dsh-agent.contract.ts, review R6 6.6).
+        run: npm run check:contract
+      - name: Build through the installed-runtime fallback
+        # scripts/build.sh without the lockfile shortcut, all roots pointed at
+        # this checkout: proves the operator path still builds and bundles from
+        # the shared spec. The next two steps rebuild lib/ the CI way; the
+        # suite then compares both client bundles (review R6 6.2).
+        run: DSH_BUILD_FORCE_INSTALLED=1 DSH_RUNTIME_DEPS="$PWD" DSH_TYPESCRIPT_ROOT="$PWD" DSH_ESBUILD_ROOT="$PWD" DSH_INSTALL_ROOT="$PWD" bash scripts/build.sh
       - name: Build Host and declarations
         run: npm run build:host
       - name: Build Web client
@@ -57,3 +67,42 @@ jobs:
             base="$(git merge-base origin/main "$HEAD_SHA")"
           fi
           git diff --check "$base" "$HEAD_SHA"
+
+  # Review R6 6.5: production runs on Windows (pwsh checks, junctions, drive
+  # paths, taskkill), CI only ran Ubuntu. Observational until its failures are
+  # triaged (docs/reviews/R6-ARCHITECTURE-BUILD.md §6): it reports, it does
+  # not gate. Flip continue-on-error off once the suite is green here.
+  test-windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Install locked dependencies
+        run: npm ci --force --ignore-scripts
+      - name: Check architecture boundaries
+        run: npm run check:architecture
+      - name: Check the DSH agent contract
+        run: npm run check:contract
+      - name: Build (scripts/build.sh, lockfile path)
+        run: bash scripts/build.sh
+      - name: Run regression suite
+        env:
+          DSH_VA_PYTHON: python
+        run: >-
+          node --test
+          --test-reporter=spec --test-reporter-destination=stdout
+          --test-reporter=./scripts/tests/reporters/github-annotations.mjs --test-reporter-destination=stdout
+          "scripts/tests/*.test.mjs"
+      - name: Run sidecar offline gates
+        run: python bridge/self_test.py

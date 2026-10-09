@@ -11,7 +11,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 import { isRecord } from '../payload.js'
-import { DEFAULT_SELECTION_EVALUATIONS } from '../constants.js'
+import { DEFAULT_SELECTION_EVALUATIONS, DEFAULT_SELECTION_PIVOTS } from '../constants.js'
 
 /** Error codes the sidecar may put in a failure frame (bridge/PROTOCOL.md
  *  "Error Codes"). The protocol fixtures test keeps this list and the
@@ -531,7 +531,7 @@ export class VerifierBridge {
       criteria: req.criteria,
       ground_truth_note: req.groundTruthNote ?? null,
       n_evaluations: req.nEvaluations ?? DEFAULT_SELECTION_EVALUATIONS, // one K default everywhere (review R5 5.4); upstream's own default is 4
-      pivots: req.pivots ?? 1,
+      pivots: req.pivots ?? DEFAULT_SELECTION_PIVOTS, // one P default everywhere (review R6 6.3)
       seed: req.seed ?? 0,
       effort: req.effort ?? null,
       model: req.model,

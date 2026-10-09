@@ -19,7 +19,10 @@ import { randomUUID } from 'node:crypto'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 import { rmdir } from 'node:fs/promises'
 import path from 'node:path'
-import { DEFAULT_SELECTION_EVALUATIONS, DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
+import {
+  DEFAULT_CANDIDATE_TIMEOUT_MS, DEFAULT_SELECTION_EVALUATIONS, DEFAULT_SELECTION_MARGIN_THRESHOLD, DEFAULT_SELECTION_PIVOTS,
+  DEFAULT_SELECTION_TIMEOUT_MS, SELECTION_TIMEOUT_MAX_MS,
+} from '../constants.js'
 import { makeRedactor } from '../util.js'
 import { read, readString } from '../payload.js'
 import { boundCandidateHandoff, renderTrajectory, type TrajectoryEvent } from './trajectory.js'
@@ -209,6 +212,18 @@ export interface SelectionRecord {
   verifierModel?: string
 }
 
+/** The part of DSH's `AgentCancelCause` this plugin emits. DSH's agent loop
+ *  (dsh-agent-loop >= 0.1.7-rc.1) maps the abort reason of an ending turn
+ *  through an exhaustive switch on `cause.kind`; a cause-less `cancel()`
+ *  leaves the platform AbortError there, the switch throws, and the turn ends
+ *  with `turn/end` reason undefined and the driver failing (review R6 6.6).
+ *  `hook` carries a reason, so the session log says why the plugin stopped
+ *  the candidate. */
+export type CandidateCancelCause = { readonly kind: 'hook'; readonly reason: string }
+
+export const CANCEL_CANDIDATE_TIMEOUT: CandidateCancelCause = Object.freeze({ kind: 'hook', reason: 'dsh-verifier-autopilot: candidate window elapsed' })
+export const CANCEL_PROGRESS_GUARD: CandidateCancelCause = Object.freeze({ kind: 'hook', reason: 'dsh-verifier-autopilot: progress guard abandoned a hopeless rollout' })
+
 export interface SelectionAgentHandle {
   agent: {
     id: string
@@ -220,7 +235,7 @@ export interface SelectionAgentHandle {
       source: { kind: 'user' }
     }): void | Promise<void>
     whenIdle(): Promise<void>
-    cancel?: () => void
+    cancel?: (cause: CandidateCancelCause) => void
   }
   dispose(): Promise<void>
 }
@@ -566,7 +581,7 @@ export class SelectionRunner {
     const trajectories: Array<string | null> = new Array(n).fill(null)
     const diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[]; scope?: 'own' | 'head'; inheritedExcluded?: number } | null> = new Array(n).fill(null)
     const seed = input.seed && input.seed.length > 0 ? input.seed : undefined
-    const candidateTimeout = input.candidateTimeoutMs ?? 600000
+    const candidateTimeout = input.candidateTimeoutMs ?? DEFAULT_CANDIDATE_TIMEOUT_MS
     const cancelGrace = Math.max(0, input.cancelGraceMs ?? 30_000)
     // A signal that is already aborted never fires 'abort' again: a run that
     // starts after its host was disposed/cancelled must still see it, or it
@@ -696,7 +711,7 @@ export class SelectionRunner {
         let hardStop: ReturnType<typeof setTimeout> | null = null
         const timer = setTimeout(() => {
           timedOut = true
-          try { agent.cancel?.() } catch { /* no-op */ }
+          try { agent.cancel?.(CANCEL_CANDIDATE_TIMEOUT) } catch { /* no-op */ }
         }, candidateTimeout)
         // Opt-in online hopeless-rollout abandonment (progressGuard): sample
         // the candidate's live trajectory through the verifier's progress
@@ -765,7 +780,7 @@ export class SelectionRunner {
               lastEvidence = evidence
               if (lowStreak >= grace) {
                 pgCancelled = true
-                try { agent.cancel?.() } catch { /* no-op */ }
+                try { agent.cancel?.(CANCEL_PROGRESS_GUARD) } catch { /* no-op */ }
               }
               if (monitor && (pgCancelled || samples >= maxChecks)) {
                 clearInterval(monitor)
@@ -986,12 +1001,10 @@ export class SelectionRunner {
             record.note = 'all survivors produced byte-identical workspaces; deduped before verifier (no-search-space)'
           } else {
             if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted before verifier select', false)
-            // Ceiling matches host.ts MAX_SELECTION_TIMEOUT_MS (600s since
-            // 2026-09-05): max-effort verifiers need >300s for even two beats.
-            const rankingBudgetMs = Math.max(1, Math.min(600_000, Math.floor(input.selectTimeoutMs ?? 180_000)))
+            const rankingBudgetMs = Math.max(1, Math.min(SELECTION_TIMEOUT_MAX_MS, Math.floor(input.selectTimeoutMs ?? DEFAULT_SELECTION_TIMEOUT_MS)))
             const rankingDeadlineAt = now() + rankingBudgetMs
             const nEvaluations = Math.max(1, Math.min(8, Math.floor(input.nEvaluations ?? DEFAULT_SELECTION_EVALUATIONS)))
-            const pivots = Math.max(0, Math.min(survivors.length, Math.floor(input.pivots ?? 1)))
+            const pivots = Math.max(0, Math.min(survivors.length, Math.floor(input.pivots ?? DEFAULT_SELECTION_PIVOTS)))
             let selectResult: BridgeSelectResult | null = null
             try {
               selectResult = await retryTransientBridge((attempt) => this.deps.bridge.select({

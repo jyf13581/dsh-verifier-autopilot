@@ -13,6 +13,9 @@
  *   handle; no orphan agents, workspaces, or sidecar processes survive.
  */
 
+import {
+  CANDIDATE_TIMEOUT_MAX_MS, CANDIDATE_TIMEOUT_MIN_MS, DEFAULT_SELECTION_TIMEOUT_MS, SELECTION_TIMEOUT_MAX_MS, SELECTION_TIMEOUT_MIN_MS,
+} from '../constants.js'
 import path from 'node:path'
 import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
@@ -66,7 +69,7 @@ export interface SelectionHostDeps {
   verifier: () => { model: string; baseURL: string; apiKeyEnv: string; effort?: string; maxWorkers?: number; minIntervalMs?: number }
   /** Host-level default for manual /select when the request omits
    *  candidateTimeoutMs; sourced from config so strong slow models get the
-   *  same time budget as autopilot instead of the runner's 300s floor. */
+   *  same time budget as autopilot instead of the runner's built-in default. */
   candidateTimeoutMsDefault?: () => number
   /** Host-level config defaults for manual /select when the request omits
    *  them. Autopilot always passes its plan explicitly; these defaults let
@@ -157,19 +160,11 @@ export class SelectionApiError extends Error {
 export const SELECTIONS_HISTORY_LIMIT = 200
 const SELECTIONS_FILE_MAX_BYTES = 4 * 1024 * 1024
 const SEED_EVENT_CAP = 600
-const MIN_SELECTION_TIMEOUT_MS = 30_000
-// 600s ceiling (raised 2026-09-05 from 300s): at verifierEffort=max a single
-// minimax-m3 comparison runs 70..100s wall clock, so even the minimal two-beat
-// tournament needs ~300s and any deeper K/P needs real headroom. The budget
-// still must not outlive a candidate window counterpart shared with abort.
-const MAX_SELECTION_TIMEOUT_MS = 600_000
-const DEFAULT_SELECTION_TIMEOUT_MS = 180_000
 
 /** Keep every verifier phase on the same finite request budget. */
 export function normalizeSelectionTimeoutMs(value: unknown, fallback?: number): number {
-  const parsed = value === undefined ? (fallback ?? DEFAULT_SELECTION_TIMEOUT_MS) : Number(value)
-  if (!Number.isFinite(parsed)) return DEFAULT_SELECTION_TIMEOUT_MS
-  return Math.max(MIN_SELECTION_TIMEOUT_MS, Math.min(MAX_SELECTION_TIMEOUT_MS, Math.floor(parsed)))
+  const parsed = value === undefined || value === null ? (fallback ?? DEFAULT_SELECTION_TIMEOUT_MS) : finiteRequestNumber(value, 'selectTimeoutMs')
+  return Math.max(SELECTION_TIMEOUT_MIN_MS, Math.min(SELECTION_TIMEOUT_MAX_MS, Math.floor(parsed)))
 }
 
 export function normalizeMarginThreshold(value: unknown, fallback = PROVISIONAL_MARGIN_THRESHOLD): number {
@@ -183,11 +178,25 @@ export function normalizeMarginThreshold(value: unknown, fallback = PROVISIONAL_
 }
 
 /** Explicit per-request candidate timeout wins; otherwise the host-level config
- *  default applies; without either the runner keeps its 300s safety floor. */
+ *  default applies; without either the runner uses DEFAULT_CANDIDATE_TIMEOUT_MS. */
 export function normalizeCandidateTimeoutMs(value: unknown, fallback: number | undefined): number | undefined {
-  const parsed = value === undefined ? fallback : Number(value)
+  const parsed = value === undefined || value === null ? fallback : finiteRequestNumber(value, 'candidateTimeoutMs')
   if (parsed === undefined || !Number.isFinite(parsed)) return undefined
-  return Math.max(30_000, Math.min(1_800_000, Math.floor(parsed)))
+  return Math.max(CANDIDATE_TIMEOUT_MIN_MS, Math.min(CANDIDATE_TIMEOUT_MAX_MS, Math.floor(parsed)))
+}
+
+/** A numeric /select field is a JSON number or absent. Coercion used to turn
+ *  "abc" into NaN, which reached the verifier only after every candidate
+ *  agent had run and been paid for (review R6 6.4); null stays "absent". */
+export function finiteRequestNumber(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new SelectionApiError(400, 'numeric-field-invalid', field + ' must be a finite JSON number')
+  }
+  return value
+}
+
+function optionalRequestNumber(value: unknown, field: string): number | undefined {
+  return value === undefined || value === null ? undefined : finiteRequestNumber(value, field)
 }
 
 export function defaultSelectionsFile(): string {
@@ -697,8 +706,8 @@ export class SelectionHost {
       candidateOptions: candidateOptions
         ? candidateOptions.map((route) => ({ provider: route?.provider ?? null, model: route?.model ?? null }))
         : [{ provider: sharedRoute?.provider ?? null, model: sharedRoute?.model ?? null, shared: true }],
-      nEvaluations: body.nEvaluations ?? this.deps.nEvaluationsDefault?.() ?? null,
-      pivots: body.pivots ?? this.deps.pivotsDefault?.() ?? null,
+      nEvaluations: optionalRequestNumber(body.nEvaluations, 'nEvaluations') ?? this.deps.nEvaluationsDefault?.() ?? null,
+      pivots: optionalRequestNumber(body.pivots, 'pivots') ?? this.deps.pivotsDefault?.() ?? null,
       candidateTimeoutMs: normalizeCandidateTimeoutMs(body.candidateTimeoutMs, this.deps.candidateTimeoutMsDefault?.()),
       selectTimeoutMs,
       marginThreshold,

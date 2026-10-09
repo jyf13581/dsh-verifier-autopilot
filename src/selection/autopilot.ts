@@ -1,6 +1,9 @@
 import type { AutopilotMode, CandidateModelStrategy } from '../config.js'
 import { describeMismatch } from './calibration.js'
-import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
+import {
+  CANDIDATE_TIMEOUT_MAX_MS, CANDIDATE_TIMEOUT_MIN_MS, DEFAULT_SELECTION_MARGIN_THRESHOLD, SELECTION_TIMEOUT_MAX_MS,
+  SELECTION_TIMEOUT_MIN_MS,
+} from '../constants.js'
 import { read } from '../payload.js'
 import type { SelectionRecord } from './candidates.js'
 import { boundText, neutralizeControlMarkers, type TrajectoryEvent } from './trajectory.js'
@@ -150,11 +153,9 @@ export function planAutopilotTask(
     model: modelStrategy === 'exploration' ? usable[index % usable.length] : usable[0],
   }))
   const candidateInstructions = Array.from({ length: candidateCount }, (_, index) => STRATEGIES[index % STRATEGIES.length])
-  const candidateTimeoutMs = clamp(config.candidateTimeoutMs, 30_000, 1_800_000)
-  // Ranking is a shared budget across all PPT calls and one retry. Ceiling is
-  // ten minutes (raised 2026-09-05 from 5): at verifierEffort=max a minimax-m3
-  // comparison alone costs ~70..100s, so N=2 needs ~300s already.
-  const selectTimeoutMs = clamp(config.selectTimeoutMs, 30_000, 600_000)
+  const candidateTimeoutMs = clamp(config.candidateTimeoutMs, CANDIDATE_TIMEOUT_MIN_MS, CANDIDATE_TIMEOUT_MAX_MS)
+  // Ranking is one budget across all PPT calls and their retry (constants.ts).
+  const selectTimeoutMs = clamp(config.selectTimeoutMs, SELECTION_TIMEOUT_MIN_MS, SELECTION_TIMEOUT_MAX_MS)
 
   return {
     admitted: true,

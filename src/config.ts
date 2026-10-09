@@ -6,7 +6,11 @@
 
 import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import z from 'schemastery'
-import { DEFAULT_SELECTION_EVALUATIONS, DEFAULT_SELECTION_MARGIN_THRESHOLD, SETTINGS_NAMESPACE_ID } from './constants.js'
+import {
+  CANDIDATE_TIMEOUT_MAX_MS, CANDIDATE_TIMEOUT_MIN_MS, DEFAULT_CANDIDATE_TIMEOUT_MS, DEFAULT_SELECTION_EVALUATIONS,
+  DEFAULT_SELECTION_MARGIN_THRESHOLD, DEFAULT_SELECTION_PIVOTS, DEFAULT_SELECTION_TIMEOUT_MS, SELECTION_TIMEOUT_MAX_MS,
+  SELECTION_TIMEOUT_MIN_MS, SETTINGS_NAMESPACE_ID,
+} from './constants.js'
 
 export { DEFAULT_SELECTION_MARGIN_THRESHOLD, SETTINGS_NAMESPACE_ID } from './constants.js'
 
@@ -133,9 +137,9 @@ export const Config = z.object({
   selectionDeepCandidates: z.number().step(1).min(2).max(5).default(3),
   selectionEvaluations: z.number().step(1).min(1).max(8).default(DEFAULT_SELECTION_EVALUATIONS),
   // 枢轴迭代数 k：O(N·k) 的比较成本，下游按幸存者数自动收敛。
-  selectionPivots: z.number().step(1).min(0).max(5).default(0),
-  selectionCandidateTimeoutMs: z.number().step(1000).min(30000).max(1800000).default(600000),
-  selectionSelectTimeoutMs: z.number().step(1000).min(30000).max(600000).default(600000),
+  selectionPivots: z.number().step(1).min(0).max(5).default(DEFAULT_SELECTION_PIVOTS),
+  selectionCandidateTimeoutMs: z.number().step(1000).min(CANDIDATE_TIMEOUT_MIN_MS).max(CANDIDATE_TIMEOUT_MAX_MS).default(DEFAULT_CANDIDATE_TIMEOUT_MS),
+  selectionSelectTimeoutMs: z.number().step(1000).min(SELECTION_TIMEOUT_MIN_MS).max(SELECTION_TIMEOUT_MAX_MS).default(DEFAULT_SELECTION_TIMEOUT_MS),
   // 临时噪声门限（ruling I.1）：top-2 margin 低于它一律 abstain。依据是
   // kimi-k3@low、N=2、C=1、K=1、P=0、合成短 fixture 的 C0 自比较（第 2–5 轮
   // 共 240 帧，最大 0.01377；0.03 ≈ 2.17 倍），仍为 provisional。其它条件

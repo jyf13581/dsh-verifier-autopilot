@@ -260,8 +260,9 @@ class _ResilientCompletions:
 
 # Verifier thinking strength ('思考强度'). A request may pin it via its
 # per-request "effort" field; absent means the process env decides. The
-# plugin default is "max" (plugin-side config default), so this module-level
-# fallback only guards bare direct calls.
+# plugin always sends its configured level (config default "low", see
+# src/config.ts verifierEffort), so this module-level fallback only guards
+# bare direct calls.
 EFFORT_LEVELS = ("off", "low", "high", "max")
 
 

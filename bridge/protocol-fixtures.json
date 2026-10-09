@@ -11,7 +11,7 @@
       "criteria": { "c1": "demo criterion" },
       "ground_truth_note": null,
       "n_evaluations": 1,
-      "pivots": 1,
+      "pivots": 0,
       "seed": 0,
       "effort": null,
       "model": "m",
