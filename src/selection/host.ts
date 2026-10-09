@@ -17,7 +17,7 @@ import path from 'node:path'
 import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { VerifierBridge, type BridgeSelectRequest, type BridgeSelectResult } from './bridge.js'
 import { SelectionRunner,
   MAX_CANDIDATES,
@@ -139,6 +139,9 @@ export interface StartSelectionBody extends SelectionStartRequest {
   policy?: SelectionRecord['policy']
   taskKind?: string
 }
+
+/** How long a successful verifier preflight is trusted (review R4 4.5). */
+export const PREFLIGHT_OK_TTL_MS = 30 * 60_000
 
 export class SelectionApiError extends Error {
   readonly status: number
@@ -529,8 +532,12 @@ export class SelectionHost {
 
   activeSelectionId(): string | null { return this.active?.selectionId ?? null }
 
-  /** Provider tuples proven ready during this host's lifetime. */
-  private readonly preflightOk = new Set<string>()
+  /** Provider tuples proven ready, with when (review R4 4.5): keyed by a
+   *  fingerprint of the key VALUE, so a rotated or revoked key re-proves
+   *  instead of riding an earlier key's success, and trusted only for
+   *  PREFLIGHT_OK_TTL_MS, so a relay that later loses logprobs or a retired
+   *  model is noticed before the next candidate spend. */
+  private readonly preflightOk = new Map<string, number>()
 
   private bridge(): { select(req: BridgeSelectRequest): Promise<BridgeSelectResult> } {
     if (this.deps.testing?.bridge) return this.deps.testing.bridge
@@ -553,8 +560,11 @@ export class SelectionHost {
     if (typeof (bridge as Partial<VerifierBridge>).preflight !== 'function') return
     // Effort changes tag-emission behavior (thinking traces shift where score
     // tokens land), so a changed thinking strength re-proves readiness.
-    const tuple = v.baseURL + '|' + v.model + '|' + v.apiKeyEnv + '|' + (v.effort ?? '')
-    if (this.preflightOk.has(tuple)) return
+    const keyFingerprint = createHash('sha256').update(key).digest('hex').slice(0, 16)
+    const tuple = v.baseURL + '|' + v.model + '|' + v.apiKeyEnv + '|' + keyFingerprint + '|' + (v.effort ?? '')
+    const provenAt = this.preflightOk.get(tuple)
+    if (provenAt !== undefined && this.now() - provenAt < PREFLIGHT_OK_TTL_MS) return
+    this.preflightOk.delete(tuple)
     const deadlineAt = this.now() + timeoutMs
     await retryTransientBridge((attempt) => (bridge as VerifierBridge).preflight({
       model: v.model,
@@ -574,7 +584,7 @@ export class SelectionHost {
       now: this.now,
       onRetry: (error, attempt) => this.diagnostics.warn('verifier.preflight_retry', error, { attempt, model: v.model }),
     })
-    this.preflightOk.add(tuple)
+    this.preflightOk.set(tuple, this.now())
   }
 
   /** Explicit operator-triggered selection. Throws SelectionApiError for the

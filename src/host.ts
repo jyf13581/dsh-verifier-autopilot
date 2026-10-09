@@ -20,11 +20,11 @@ import {
   type EventRecord,
 } from './evidence.js'
 import { appendJsonlLedger, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from './ledger.js'
-import type { StateResponse, VerificationRecord, WebRoute } from './protocol.js'
+import type { AutopilotSkip, StateResponse, VerificationRecord, WebRoute } from './protocol.js'
 import { resolveKey, type Credentials } from './util.js'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from './diagnostics.js'
 import { isHookSource, requireHookSource, type AgentCreate, type HookSource } from './dsh-context.js'
-import { SelectionHost } from './selection/host.js'
+import { SelectionApiError, SelectionHost } from './selection/host.js'
 import { runChecks } from './selection/checks.js'
 import { evaluateDelivery, type SelectionRecord } from './selection/candidates.js'
 import { buildAutopilotContext, buildAutopilotRelay, planAutopilotTask } from './selection/autopilot.js'
@@ -173,6 +173,11 @@ export class VerifierHost {
    *  can tell whether a turn has consumed it yet. In memory only; a reload
    *  re-relays (recoverAutopilotRelays) and records the new id. */
   private readonly relayMessageIds = new Map<string, string>()
+  /** Review R4 4.3: autopilot launches refused because the single selection
+   *  slot was taken. A policy outcome, not a fault — kept out of the warning
+   *  feed and surfaced as its own state instead. */
+  private autopilotSkipCount = 0
+  private readonly autopilotSkips: AutopilotSkip[] = []
 
   /** Candidate-model liveness prober, memoized per (baseURL, key) pair so
    *  config churn never keeps a stale credential around. */
@@ -397,6 +402,14 @@ export class VerifierHost {
       // Once admitted, its terminal outcome is handled by the background waiter.
       payload.signal.removeEventListener('abort', cancel)
       payload.signal.throwIfAborted()
+      if (error instanceof SelectionApiError && error.code === 'selection-busy') {
+        this.autopilotSkipCount += 1
+        this.autopilotSkips.unshift({ at: Date.now(), sourceSessionId: String(agent.id), reason: 'busy', activeSelectionId: this.selections.activeSelectionId() })
+        this.autopilotSkips.length = Math.min(this.autopilotSkips.length, 20)
+        this.diagnostics.count('autopilot.skipped_busy')
+        this.emit()
+        return decision
+      }
       this.diagnostics.warn('autopilot.admission', error, { sourceSessionId: String(agent.id) })
       return decision
     }
@@ -890,7 +903,14 @@ export class VerifierHost {
   }
 
   snapshot(): StateResponse {
-    return { config: { ...this.config }, agents: this.agents.size, records: this.records.slice(0, 20), selection: this.selections.snapshot(), diagnostics: this.diagnostics.snapshot() }
+    return {
+      config: { ...this.config },
+      agents: this.agents.size,
+      records: this.records.slice(0, 20),
+      selection: this.selections.snapshot(),
+      autopilotSkipped: { count: this.autopilotSkipCount, recent: this.autopilotSkips.map((skip) => ({ ...skip })) },
+      diagnostics: this.diagnostics.snapshot(),
+    }
   }
 
   /** The degradation ledger behind `/state`, for tests and embedded hosts. */

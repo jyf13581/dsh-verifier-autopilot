@@ -294,6 +294,13 @@ function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsSco
     h('div', { style: { ...rowStyle, justifyContent: 'space-between' } },
       h('strong', null, '候选控制'),
       h('span', null, data?.active ? '运行中' : '空闲')),
+    // Review R4 4.3: one selection at a time; autopilot turns that found the
+    // slot taken were skipped, and the operator should see that they were.
+    hostState?.autopilotSkipped && hostState.autopilotSkipped.count > 0
+      ? h('div', { style: { fontSize: 12, opacity: 0.8 } },
+        '自动候选已跳过 ' + hostState.autopilotSkipped.count + ' 次（当时另一个选择正在运行）'
+        + (hostState.autopilotSkipped.recent[0] ? '；最近一次 ' + formatDiagnosticTime(hostState.autopilotSkipped.recent[0].at) + '，会话 ' + hostState.autopilotSkipped.recent[0].sourceSessionId + '，占用者 ' + (hostState.autopilotSkipped.recent[0].activeSelectionId ?? '未知') : ''))
+      : null,
     h('div', { role: 'group', 'aria-label': '候选控制模式', style: { display: 'flex', width: 'fit-content', border: '1px solid var(--border-color, #ccc)', borderRadius: 6, overflow: 'hidden' } },
       ...modes.map((item) => h('button', {
         key: item.id, type: 'button', disabled: saving, 'aria-pressed': mode === item.id,

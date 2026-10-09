@@ -54,11 +54,24 @@ export interface SelectionSnapshot {
   selections: SelectionRecord[]
 }
 
+/** Review R4 4.3: one autopilot launch that did not happen because another
+ *  selection held the single selection slot. */
+export interface AutopilotSkip {
+  at: number
+  sourceSessionId: string
+  reason: 'busy'
+  /** The selection that was running at the time. */
+  activeSelectionId: string | null
+}
+
 export interface StateResponse {
   config: Config
   agents: number
   records: VerificationRecord[]
   selection: SelectionSnapshot
+  /** Review R4 4.3: autopilot launches skipped since start (count) and the
+   *  most recent ones, newest first. */
+  autopilotSkipped: { count: number; recent: AutopilotSkip[] }
   /** Recent best-effort degradations and counters (bounded, redacted). */
   diagnostics: DiagnosticsSnapshot
 }

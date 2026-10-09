@@ -11,10 +11,12 @@ import { execFileSync } from "node:child_process"
 import { fileURLToPath } from "node:url"
 import { tmpdir } from "node:os"
 import path from "node:path"
-import { VerifierHost } from "../../lib/index.js"
+import { apiRoutes, VerifierHost } from "../../lib/index.js"
+import { PREFLIGHT_OK_TTL_MS } from "../../lib/selection/host.js"
+import { createModelProber } from "../../lib/selection/probe.js"
 import { makeGitRepo, runGit } from "./helpers/git.mjs"
 import { IsolatedWorkspaceManager, gitDiffStat } from "../../lib/selection/live.js"
-import { completedTurnEvents, fakeAgent, fakeContext, fireIdle, hostOverrides } from "./helpers/host.mjs"
+import { completedTurnEvents, fakeAgent, fakeContext, fakeReq, fakeRes, fireIdle, hostOverrides } from "./helpers/host.mjs"
 import { fakeBridge, makeFakeFactory, realWorkspaces, SEL_TMP } from "./helpers/selection.mjs"
 import { runProcess, runProcessCapture } from "../../lib/selection/proc.js"
 import { runChecks } from "../../lib/selection/checks.js"
@@ -283,4 +285,92 @@ test("R4 4.2: a source edit during the seed snapshot triggers a re-snapshot; end
     for (const dir of dirs) await manager?.remove(dir).catch(() => {})
     rmSync(base, { recursive: true, force: true })
   }
+})
+
+// ---------- 4.3: a busy slot is a visible skip, not a buried warning ----------
+
+test("R4 4.3: an autopilot turn that finds the selection slot taken is recorded as a skip in /state", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r4-busy-"))
+  try {
+    const ctx = fakeContext()
+    ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+    ctx.llm = { async listModels() { return [{ id: "kimi-k3" }, { id: "minimaxai/minimax-m3" }] } }
+    // Candidates of the first selection hang: it holds the only slot.
+    const factory = makeFakeFactory({ scripts: [{ hang: true }, { hang: true }] })
+    const host = new VerifierHost(ctx, hostOverrides({ enabled: false }), {
+      selectionsTesting: { factory, workspaces: realWorkspaces, bridge: fakeBridge() },
+    })
+    const first = ctx.spawnAgent(fakeAgent("sess-r4-first", completedTurnEvents(1)))
+    first.session.header = { cwd: makeGitRepo(base, "a") }
+    const second = ctx.spawnAgent(fakeAgent("sess-r4-second", completedTurnEvents(1)))
+    second.session.header = { cwd: makeGitRepo(base, "b") }
+    host.start()
+    const direct = { id: "u1", role: "user", content: [{ type: "text", text: "Refactor src/entry.ts and run the lifecycle tests" }], source: { kind: "user" } }
+    const enter = async () => ({ kind: "enter", messages: [direct] })
+    await first.handlers.get("agent/pre-step")[0]({ messages: [direct], turn: 2, step: 1, signal: new AbortController().signal }, enter)
+    const holder = host.selections.activeSelectionId()
+    assert.ok(holder, "the first selection holds the slot")
+    const decision = await second.handlers.get("agent/pre-step")[0]({ messages: [direct], turn: 5, step: 1, signal: new AbortController().signal }, enter)
+    assert.equal(decision.kind, "enter", "the source turn itself is never blocked")
+    const state = host.snapshot()
+    assert.equal(state.autopilotSkipped.count, 1)
+    assert.deepEqual({ ...state.autopilotSkipped.recent[0], at: typeof state.autopilotSkipped.recent[0].at },
+      { at: "number", sourceSessionId: "sess-r4-second", reason: "busy", activeSelectionId: holder })
+    assert.equal(state.diagnostics.counters["autopilot.skipped_busy"], 1)
+    assert.equal(state.diagnostics.entries.filter((entry) => entry.scope === "autopilot.admission").length, 0,
+      "busy is a policy outcome, not an admission fault (old code: a generic autopilot.admission warning only)")
+    host.selections.cancel(holder)
+    await host.dispose()
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+// ---------- 4.5: readiness proofs expire and are bound to the key value ----------
+
+test("R4 4.5: a rotated key or an expired proof re-runs the verifier preflight", async () => {
+  const ctx = fakeContext()
+  let key = "key-one"
+  ctx.credentials = { resolve: async () => ({ value: key }) }
+  const bridge = fakeBridge()
+  const preflightKeys = []
+  bridge.preflight = async (request) => { preflightKeys.push(request.apiKey) }
+  const host = new VerifierHost(ctx, hostOverrides(), { selectionsTesting: { factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge } })
+  let clock = 1_000_000
+  host.selections.now = () => clock
+  ctx.spawnAgent(fakeAgent("sess-A", completedTurnEvents(1)))
+  const selectRoute = apiRoutes(host).find((r) => r.path.endsWith("/select"))
+  const round = async () => {
+    const res = fakeRes()
+    await selectRoute.handler(fakeReq({ sourceSessionId: "sess-A", candidateCount: 2, selectTimeoutMs: 120000 }), res)
+    assert.equal(res.status, 202, res.bodyText)
+    const id = JSON.parse(res.bodyText).selection.selectionId
+    const final = await waitFor(() => { const s = host.selections.getSelection(id); return s && s.status !== "running" ? s : null })
+    assert.equal(final.status, "completed")
+    await host.selections.releaseWinner(id)
+  }
+  await round()
+  await round()
+  assert.deepEqual(preflightKeys, ["key-one"], "same key, fresh proof: memoized")
+  key = "key-two"
+  await round()
+  assert.deepEqual(preflightKeys, ["key-one", "key-two"], "a rotated key value proves itself (old code: same env name = still proven)")
+  clock += PREFLIGHT_OK_TTL_MS + 1
+  await round()
+  assert.equal(preflightKeys.length, 3, "a proof older than the TTL is re-established")
+  await host.selections.dispose()
+})
+
+test("R4 4.5: a model's ok probe verdict expires; an expired ok is re-probed, never reported dead", async () => {
+  let clock = 0
+  const calls = []
+  const prober = createModelProber({
+    baseURL: "http://mock.local/v1", apiKey: "k", now: () => clock, okTtlMs: 60_000, deadCooldownMs: 120_000,
+    fetchImpl: async (_url, init) => { calls.push(JSON.parse(init.body).model); return { ok: true, status: 200, body: null } },
+  })
+  assert.equal(await prober.probe("m"), true)
+  clock += 30_000
+  assert.equal(await prober.probe("m"), true)
+  assert.equal(calls.length, 1, "within the TTL the verdict is reused")
+  clock += 40_000
+  assert.equal(await prober.probe("m"), true, "past okTtl but inside the dead cooldown: still re-probed, not 'dead'")
+  assert.equal(calls.length, 2)
 })
