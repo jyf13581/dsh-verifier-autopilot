@@ -10,8 +10,8 @@
       "candidates": ["cand-0", "cand-1"],
       "criteria": { "c1": "demo criterion" },
       "ground_truth_note": null,
-      "n_evaluations": 4,
-      "pivots": 1,
+      "n_evaluations": 1,
+      "pivots": 0,
       "seed": 0,
       "effort": null,
       "model": "m",
@@ -42,6 +42,7 @@
       "id": "h1",
       "ok": true,
       "result": {
+        "protocol": 1,
         "python": "3.12.0 (stub)",
         "llm_verifier_version": "0.2.0",
         "select_available": true,
@@ -67,7 +68,8 @@
           "output_tokens": 5,
           "reasoning_tokens": 0,
           "cache_hit_rate": 0.0
-        }
+        },
+        "extraction": { "logprobs": 2, "literal": 0, "default": 0 }
       }
     },
     "progress": {
@@ -118,7 +120,7 @@
     {
       "name": "health",
       "request": { "id": "h1", "type": "health" },
-      "expect": { "ok": true, "result_keys": ["python", "llm_verifier_version", "select_available", "note", "deepseek_effort"] }
+      "expect": { "ok": true, "result_keys": ["protocol", "python", "llm_verifier_version", "select_available", "note", "deepseek_effort"] }
     },
     {
       "name": "bad_frame",

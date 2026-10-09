@@ -1,9 +1,25 @@
 #!/bin/bash
-# Build the Host entry with tsc and the Web entry with esbuild.
+# Build lib/ (Host entry + declarations, and the Web client bundle).
+#
+# Review R6 6.2: there is one build. When the lockfile toolchain is installed
+# (`npm ci`), this script runs exactly what CI runs (build:host + build:client)
+# so the artifact a release ships is the artifact CI tested. Only a machine
+# without node_modules (the installed-DSH operator setup in HANDOFF §5) takes
+# the fallback below, which links the host's runtime packages and bundles the
+# client with esbuild from the SAME bundle spec (scripts/client-bundle.mjs).
+# Set DSH_BUILD_FORCE_INSTALLED=1 to exercise the fallback anyway (CI does).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+
+if [ -z "${DSH_BUILD_FORCE_INSTALLED:-}" ] && [ -f node_modules/typescript/bin/tsc ] && [ -f node_modules/tsdown/package.json ]; then
+  rm -rf lib
+  npm run -s build:host
+  npm run -s build:client
+  echo "build: complete (lockfile toolchain, same as CI)"
+  exit 0
+fi
 
 # A source checkout remains the preferred build source. The installed DSH
 # distribution has no packages/ tree, so use the local runtime dependency tree
@@ -23,6 +39,12 @@ fi
 link_dep() {
   local name="$1"
   local target="$2"
+  # Never replace a package npm installed: this used to rm -rf it and leave a
+  # symlink to a host path, silently swapping the lockfile's version (or
+  # breaking the checkout when the host path does not exist).
+  if [ -e "node_modules/$name" ] && [ ! -L "node_modules/$name" ]; then
+    return 0
+  fi
   if [ ! -e "$target" ]; then
     echo "build: dependency target missing: $target" >&2
     exit 1
@@ -62,23 +84,13 @@ if [ ! -f "$ESBUILD" ]; then
 fi
 export DSH_ESBUILD_PATH="$ESBUILD"
 node --input-type=module <<'NODE'
+import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 const esbuildPath = process.env.DSH_ESBUILD_PATH
 if (!esbuildPath) throw new Error('build: resolved esbuild path is missing')
 const { build } = await import(pathToFileURL(esbuildPath).href)
-const pluginId = '@dsh-external/dsh-verifier-autopilot'
-const quote = String.fromCharCode(34)
-await build({
-  entryPoints: ['src/client/index.ts'],
-  bundle: true,
-  platform: 'browser',
-  format: 'cjs',
-  external: ['react', 'react/jsx-runtime', 'react-dom', 'react-dom/client'],
-  outfile: 'lib/client.js',
-  sourcemap: true,
-  banner: { js: 'var module = { exports: {} }; var exports = module.exports; window.__ModuleLoader__.load({ id: ' + quote + pluginId + quote + ', factory: (require) => {' },
-  footer: { js: 'return module.exports; } });' },
-})
+const { esbuildClientOptions } = await import(pathToFileURL(path.resolve('scripts/client-bundle.mjs')).href)
+await build(esbuildClientOptions('lib/client.js'))
 NODE
 
-echo "build: complete"
+echo "build: complete (installed-runtime fallback)"

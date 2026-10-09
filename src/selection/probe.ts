@@ -22,11 +22,15 @@ export interface ModelProberOptions {
   probeTimeoutMs?: number
   /** How long a dead verdict is trusted before one retry (default 120s). */
   deadCooldownMs?: number
+  /** How long an ok verdict is trusted before the model is probed again
+   *  (default 30 min; review R4 4.5 — it used to last until reload, so a
+   *  model retired mid-session kept being treated as live). */
+  okTtlMs?: number
 }
 
 export interface ModelProber {
   /** true = model answered; false = timeout / HTTP failure. Results are
-   *  cached: an ok verdict lasts until reload, a dead verdict cools off.
+   *  cached: an ok verdict lasts `okTtlMs`, a dead verdict cools off.
    *  Concurrent probes of the same model share one in-flight request. */
   probe(model: string): Promise<boolean>
   /** Force a model into the dead window (e.g. after a rollout failure). */
@@ -39,6 +43,7 @@ export function createModelProber(options: ModelProberOptions): ModelProber {
   const now = options.now ?? Date.now
   const timeoutMs = options.probeTimeoutMs ?? 10_000
   const cooldownMs = options.deadCooldownMs ?? 120_000
+  const okTtlMs = options.okTtlMs ?? 30 * 60_000
   const table = new Map<string, ProbeVerdict>()
   /** One request per model at a time: parallel pre-steps (or a duplicated
    *  entry in the preferred list) coalesce onto the same verdict instead of
@@ -76,8 +81,8 @@ export function createModelProber(options: ModelProberOptions): ModelProber {
     probe(model: string): Promise<boolean> {
       const cached = table.get(model)
       if (cached) {
-        if (cached.ok) return Promise.resolve(true)
-        if (now() - cached.at < cooldownMs) return Promise.resolve(false)
+        if (cached.ok && now() - cached.at < okTtlMs) return Promise.resolve(true)
+        if (!cached.ok && now() - cached.at < cooldownMs) return Promise.resolve(false)
       }
       const pending = inFlight.get(model)
       if (pending) return pending

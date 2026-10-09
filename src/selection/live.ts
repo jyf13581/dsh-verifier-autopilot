@@ -7,15 +7,14 @@
  * and this file is typechecked + smoke-tested against the live host.
  */
 
-import { cp, lstat, mkdir, readdir, readlink, rm, rmdir } from 'node:fs/promises'
-import { statSync } from 'node:fs'
+import { cp, lstat, mkdir, readdir, readFile, readlink, realpath, rm, rmdir, writeFile } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
-import type { CandidateFactory, CandidateSpec, DiffStatLite, SelectionAgentHandle, WorkspaceManager } from './candidates.js'
+import type { CandidateFactory, CandidateSpec, DiffStatLite, SelectionAgentHandle, WorkspaceManager, WorkspaceSeedReport } from './candidates.js'
 import type { TrajectoryEvent } from './trajectory.js'
-import { runProcess } from './proc.js'
+import { runProcess, runProcessCapture } from './proc.js'
 import { isAgentScope, type AgentCreate } from '../dsh-context.js'
 
 interface LiveAgentLike {
@@ -44,7 +43,8 @@ interface ExecOptions {
  *  diagnostic one: when git fails, the reason is at the end. `code` is -1 for
  *  anything that did not produce an honest exit code (spawn failure, timeout). */
 async function exec(cmd: string, args: string[], options: ExecOptions = {}): Promise<{ code: number; out: string }> {
-  const result = await runProcess(cmd, args, options)
+  // Every caller reads git's stdout as data; stderr only explains failures.
+  const result = await runProcess(cmd, args, { ...options, separateStderr: true })
   return { code: result.code ?? -1, out: result.out }
 }
 
@@ -65,6 +65,12 @@ async function existingAncestor(input: string): Promise<string | undefined> {
       current = parent
     }
   }
+}
+
+/** One spelling per directory: realpath (libuv's native realpath, which on
+ *  Windows expands 8.3 names and resolves junctions), else the lexical form. */
+async function canonicalDir(input: string): Promise<string> {
+  try { return await realpath(path.resolve(input)) } catch { return path.resolve(input) }
 }
 
 async function gitRootOf(input: string): Promise<string | undefined> {
@@ -112,7 +118,12 @@ export async function resolveAutopilotSourceCwd(task: string, sessionCwd: string
 
 interface CaptureResult { code: number; out: Buffer; error: string; truncated: boolean }
 
-function execCapture(
+/** Byte-exact git plumbing call on the shared spawn core (review R4 4.7):
+ *  same kill escalation, process-group reclamation, flush grace, and EPIPE
+ *  containment as every other child. `code` is -2 when stdout exceeded
+ *  `maxOutputBytes` (the child was stopped), -1 when there is no honest exit
+ *  code (spawn failure, timeout, abort). */
+async function execCapture(
   cmd: string,
   args: string[],
   cwd?: string,
@@ -120,35 +131,11 @@ function execCapture(
   maxOutputBytes = 8 * 1024 * 1024,
   input?: Buffer,
 ): Promise<CaptureResult> {
-  return new Promise((resolve) => {
-    const chunks: Buffer[] = []
-    let total = 0
-    let error = ''
-    let truncated = false
-    let settled = false
-    const child = spawn(cmd, args, { cwd, windowsHide: true })
-    const finish = (code: number) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve({ code, out: Buffer.concat(chunks), error, truncated })
-    }
-    child.stdout?.on('data', (value: Buffer | string) => {
-      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value)
-      total += chunk.length
-      if (total > maxOutputBytes) {
-        truncated = true
-        try { child.kill() } catch { /* gone */ }
-        return
-      }
-      chunks.push(chunk)
-    })
-    child.stderr?.on('data', (value: Buffer | string) => { error = (error + String(value)).slice(-4000) })
-    child.on('error', () => finish(-1))
-    child.on('close', (code) => finish(truncated ? -2 : (code ?? -1)))
-    const timer = setTimeout(() => { error = (error + ' command timed out').trim(); try { child.kill() } catch { /* gone */ } }, timeoutMs)
-    child.stdin?.end(input)
-  })
+  const result = await runProcessCapture(cmd, args, { cwd, timeoutMs, maxOutputBytes, input })
+  const truncated = result.end === 'overflow'
+  const code = truncated ? -2 : result.end === 'exit' ? (result.code ?? -1) : -1
+  const error = result.end === 'timeout' ? (result.error + ' command timed out').trim() : result.error
+  return { code, out: result.out, error, truncated }
 }
 
 const ALLOWED_IGNORED_SNAPSHOT_PREFIXES = ['node_modules/', 'lib/', '.data/', 'eval/results/']
@@ -177,9 +164,18 @@ async function assertIgnoredSnapshotBoundary(sourceRoot: string): Promise<void> 
   }
 }
 
+/** Machine-read `git diff` output must not depend on the user's presentation
+ *  config: `diff.external` replaces the patch with a viewer's output,
+ *  `color.ui=always` injects ANSI codes even into a pipe, and a textconv
+ *  driver (active by default, `--binary` included) rewrites hunks into text
+ *  that no longer applies. Any of them made every seed snapshot fail with
+ *  workspace-patch-apply-failed, and corrupted evidence and relay patches
+ *  (review R4 4.2b). */
+const RAW_DIFF = ['--no-ext-diff', '--no-textconv', '--no-color'] as const
+
 async function mirrorGitWorkingState(sourceRoot: string, candidateRoot: string): Promise<void> {
   await assertIgnoredSnapshotBoundary(sourceRoot)
-  const patch = await execCapture('git', ['-C', sourceRoot, 'diff', '--binary', 'HEAD', '--', '.'], undefined, 60000)
+  const patch = await execCapture('git', ['-C', sourceRoot, 'diff', ...RAW_DIFF, '--binary', 'HEAD', '--', '.'], undefined, 60000)
   if (patch.code !== 0) throw new Error(patch.truncated ? 'workspace-patch-too-large' : 'workspace-patch-read-failed: ' + patch.error)
   if (patch.out.length > 0) {
     const apply = await execCapture('git', ['-C', candidateRoot, 'apply', '--whitespace=nowarn', '-'], undefined, 60000, 1024 * 1024, patch.out)
@@ -188,7 +184,7 @@ async function mirrorGitWorkingState(sourceRoot: string, candidateRoot: string):
   // Git apply may run checkout filters (notably core.autocrlf). Overlay every
   // changed tracked file from the live tree so candidate bytes match the source
   // worktree exactly; the patch still owns deletions, renames, and mode changes.
-  const changed = await execCapture('git', ['-C', sourceRoot, 'diff', '--name-only', '-z', 'HEAD', '--', '.'], undefined, 30000, 2 * 1024 * 1024)
+  const changed = await execCapture('git', ['-C', sourceRoot, 'diff', ...RAW_DIFF, '--name-only', '-z', 'HEAD', '--', '.'], undefined, 30000, 2 * 1024 * 1024)
   if (changed.code !== 0) throw new Error(changed.truncated ? 'workspace-tracked-list-too-large' : 'workspace-tracked-list-failed: ' + changed.error)
   const trackedEntries = changed.out.toString('utf8').split(String.fromCharCode(0)).filter(Boolean)
   if (trackedEntries.length > 5000) throw new Error('workspace-tracked-count-exceeded')
@@ -409,11 +405,29 @@ export class WorkspacePrepareError extends Error {
 const MANAGED_SELECTION_DIR = /^sel-[A-Za-z0-9][A-Za-z0-9-]{0,100}$/
 const MANAGED_CANDIDATE_DIR = /^c(\d+)$/
 
+const SEED_ATTEMPTS = 3
+
+/** HEAD plus a content fingerprint of every dirty/untracked file: equal
+ *  before and after a mirror = nothing changed while it was copied. */
+async function sourceFingerprint(sourceRoot: string): Promise<{ head: string; digest: string } | null> {
+  const head = await exec('git', ['-C', sourceRoot, 'rev-parse', '--verify', 'HEAD'])
+  if (head.code !== 0 || !head.out.trim()) return null
+  const stat = await gitDiffStat(sourceRoot)
+  if (!stat?.fingerprint) return null
+  return { head: head.out.trim(), digest: stat.fingerprint }
+}
+
 export class IsolatedWorkspaceManager implements WorkspaceManager {
   private readonly root: string
   private readonly storeRoot: string
   private readonly worktrees = new Map<string, WorktreeLease>()
-  constructor(root: string, sessionStoreRoot?: string) {
+  /** Review R4 4.2: the seed worktree per selection while it exists. */
+  private readonly seeds = new Map<string, { sourceRoot: string; worktreeRoot: string; report: WorkspaceSeedReport }>()
+  /** Test seam (review R4 4.2): runs after each seed mirror, before the
+   *  source is fingerprinted again — where a concurrent source edit lands. */
+  private readonly onSeedMirrored?: (attempt: number) => void | Promise<void>
+  constructor(root: string, sessionStoreRoot?: string, testing?: { onSeedMirrored?: (attempt: number) => void | Promise<void> }) {
+    this.onSeedMirrored = testing?.onSeedMirrored
     this.root = path.resolve(root)
     this.storeRoot = path.resolve(sessionStoreRoot ?? defaultSessionStoreRoot())
   }
@@ -474,21 +488,61 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
     if (sel.sourceCwd) {
       const root = await exec('git', ['-C', sel.sourceCwd, 'rev-parse', '--show-toplevel'])
       if (root.code === 0 && root.out.trim()) {
-        const sourceRoot = path.resolve(root.out.trim())
-        const sourceCwd = path.resolve(sel.sourceCwd)
+        // Compare canonical spellings. git prints its toplevel resolved
+        // (long names, symlinks and junctions followed) while the caller's
+        // cwd may be an alias of the same directory: a Windows 8.3 short
+        // name such as C:\Users\RUNNER~1\... (os.tmpdir() on GitHub's
+        // runners), a junction, or a symlinked checkout. path.relative on two
+        // spellings is '..\..\...' and every selection there was refused as
+        // source-cwd-outside-git-root (review R6 6.5, first windows-latest run).
+        const sourceRoot = await canonicalDir(root.out.trim())
+        const sourceCwd = await canonicalDir(sel.sourceCwd)
         const relativeCwd = path.relative(sourceRoot, sourceCwd)
         if (path.isAbsolute(relativeCwd) || relativeCwd.split(/[\\/]/).includes('..')) throw new Error('source-cwd-outside-git-root')
-        const add = await exec('git', ['-C', sourceRoot, 'worktree', 'add', '--detach', worktreeRoot, 'HEAD'], { timeoutMs: 60000 })
-        if (add.code !== 0) throw new Error('workspace-worktree-add-failed: ' + add.out)
         const candidateCwd = path.join(worktreeRoot, relativeCwd)
         const lease = { candidateCwd, worktreeRoot, sourceRoot }
-        this.worktrees.set(candidateCwd, lease)
+        const addAt = async (commit: string): Promise<void> => {
+          const add = await exec('git', ['-C', sourceRoot, 'worktree', 'add', '--detach', worktreeRoot, commit], { timeoutMs: 60000 })
+          if (add.code !== 0) throw new Error('workspace-worktree-add-failed: ' + add.out)
+          this.worktrees.set(candidateCwd, lease)
+        }
+        // Review R4 4.2: the source agent keeps working while candidates are
+        // prepared. Cutting every candidate from the live source gave each a
+        // different snapshot (even a different HEAD after a source commit), so
+        // the verifier compared unequal starting points. Only the first
+        // candidate (the seed) reads the live source — re-snapshotting while
+        // the source changed under it — and the rest copy the seed, which no
+        // agent touches until every workspace is prepared.
+        const seed = this.seeds.get(sel.selectionId)
         try {
-          await mirrorGitWorkingState(sourceRoot, worktreeRoot)
+          if (seed && seed.sourceRoot === sourceRoot) {
+            await addAt(seed.report.head)
+            await mirrorGitWorkingState(seed.worktreeRoot, worktreeRoot)
+          } else {
+            let report: WorkspaceSeedReport | undefined
+            for (let attempt = 1; attempt <= SEED_ATTEMPTS && !report; attempt += 1) {
+              const before = await sourceFingerprint(sourceRoot)
+              if (attempt > 1) await this.removeLease(lease)
+              await addAt(before?.head ?? 'HEAD')
+              await mirrorGitWorkingState(sourceRoot, worktreeRoot)
+              await this.onSeedMirrored?.(attempt)
+              const after = before ? await sourceFingerprint(sourceRoot) : null
+              const consistent = before && after ? before.head === after.head && before.digest === after.digest : null
+              if (consistent !== false || attempt === SEED_ATTEMPTS) {
+                const head = await exec('git', ['-C', worktreeRoot, 'rev-parse', '--verify', 'HEAD'])
+                report = { seedIndex: sel.index, head: head.out.trim() || (before?.head ?? 'HEAD'), attempts: attempt, consistent }
+              }
+            }
+            if (report) this.seeds.set(sel.selectionId, { sourceRoot, worktreeRoot, report })
+          }
           await mkdir(candidateCwd, { recursive: true })
+          // After the mirror, before the candidate runs: what it inherited.
+          // Best effort — without a baseline, evidence falls back to HEAD.
+          try { await captureWorkspaceBaseline(worktreeRoot) } catch { /* evidence degrades to HEAD-relative */ }
           return candidateCwd
         } catch (error) {
           let cleanupError = ''
+          if (this.seeds.get(sel.selectionId)?.worktreeRoot === worktreeRoot) this.seeds.delete(sel.selectionId)
           try { await this.removeLease(lease) } catch (cleanup) { cleanupError = '; cleanup: ' + (cleanup instanceof Error ? cleanup.message : String(cleanup)) }
           const detail = error instanceof Error ? error.message : String(error)
           throw new WorkspacePrepareError(detail + cleanupError, candidateCwd)
@@ -500,8 +554,17 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
     return worktreeRoot
   }
 
+  /** Review R4 4.2: how this selection's candidates were seeded. */
+  seedReport(selectionId: string): WorkspaceSeedReport | undefined {
+    const seed = this.seeds.get(selectionId)
+    return seed ? { ...seed.report } : undefined
+  }
+
   async remove(dir: string): Promise<void> {
     const managed = this.managedPath(dir)
+    for (const [selectionId, seed] of this.seeds) {
+      if (managed === seed.worktreeRoot || managed.startsWith(seed.worktreeRoot + path.sep)) this.seeds.delete(selectionId)
+    }
     const lease = await this.discoverLease(managed)
     if (lease) await this.removeLease(lease)
     else {
@@ -533,50 +596,198 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
 
 /** The evidence shape is owned by the runner contract (candidates.ts); this
  *  adapter produces it and re-exports the type so the two can never drift.
- *  files = tracked files whose worktree bytes differ from HEAD; untracked =
- *  non-ignored new files (candidate NEW artifacts live here); fingerprint =
- *  stable hash of numstat lines + untracked name:size, so equal fingerprints
- *  mean the same diff shape. */
+ *  files/untracked = paths the CANDIDATE changed relative to what it started
+ *  with (the mirrored source state, review R3 3.7; HEAD when no baseline);
+ *  inherited = source edits carried in untouched; fingerprint =
+ *  stable hash of every changed or new path together with its CONTENT digest,
+ *  so equal fingerprints mean byte-identical deliverables (review R2 2.1: the
+ *  previous numstat+size hash collided for any two edits with equal line
+ *  counts, e.g. `x = 2` vs `x = 9`, and deduped a different solution away). */
 export type { DiffStatLite }
+
+/** Bytes hashed per fingerprint before falling back to size-only entries: the
+ *  snapshot limits already bound workspaces, this bounds a candidate that
+ *  generated huge artifacts. */
+const FINGERPRINT_CONTENT_BUDGET = 256 * 1024 * 1024
+const FINGERPRINT_MAX_PATHS = 10_000
+
+function nulList(out: string): string[] {
+  return out.split(String.fromCharCode(0)).filter(Boolean)
+}
+
+function hashFile(file: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(file)
+    stream.on('data', (chunk) => hash.update(chunk))
+    stream.on('error', reject)
+    stream.on('end', () => resolve(hash.digest('hex')))
+  })
+}
+
+/** Content identity of one workspace path: deleted, symlink target, or file
+ *  bytes plus the executable bit (git tracks it, so it is part of the diff). */
+async function contentDigest(file: string, budget: { left: number }): Promise<string> {
+  let info
+  try { info = await lstat(file) } catch { return 'deleted' }
+  if (info.isSymbolicLink()) {
+    try { return 'link:' + await readlink(file) } catch { return 'link:?' }
+  }
+  if (!info.isFile()) return 'other'
+  const mode = (info.mode & 0o111) !== 0 ? 'x' : '-'
+  if (info.size > budget.left) return mode + 'size:' + info.size
+  budget.left -= info.size
+  try { return mode + (await hashFile(file)) } catch { return mode + 'unreadable:' + info.size }
+}
+
+interface WorkspaceEntry {
+  /** Repository-root-relative path, exactly as git reports it. */
+  path: string
+  digest: string
+  tracked: boolean
+}
+
+/** Private per-worktree file (lives in the worktree's own git dir, so the
+ *  candidate's `git status` never shows it and `worktree remove` deletes it). */
+const BASELINE_FILE = 'dsh-va-baseline.json'
+
+async function gitRoot(cwd: string): Promise<string | null> {
+  const top = await execWide('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], cwd)
+  return top.code === 0 && top.out.trim() ? path.resolve(top.out.trim()) : null
+}
+
+/** Every tracked path whose worktree bytes differ from HEAD plus every
+ *  non-ignored untracked path, ROOT-relative, with content digests. Both git
+ *  listings run at the root: `diff --name-only` is root-relative while
+ *  `ls-files --others` is cwd-relative, and mixing the two from a subdirectory
+ *  cwd hashed the wrong files (review R3, found in the R2 fingerprint). */
+async function workspaceEntries(root: string): Promise<WorkspaceEntry[] | null> {
+  const changed = await execWide('git', ['-C', root, 'diff', ...RAW_DIFF, '--no-renames', '--name-only', '-z', 'HEAD'], root)
+  if (changed.code !== 0) return null
+  const others = await execWide('git', ['-C', root, 'ls-files', '--others', '--exclude-standard', '-z'], root)
+  const tracked = new Set(nulList(changed.out))
+  const untracked = others.code === 0 ? nulList(others.out) : []
+  const paths = [...new Set([...tracked, ...untracked])].sort().slice(0, FINGERPRINT_MAX_PATHS)
+  const budget = { left: FINGERPRINT_CONTENT_BUDGET }
+  const entries: WorkspaceEntry[] = []
+  for (const rel of paths) entries.push({ path: rel, digest: await contentDigest(path.join(root, rel), budget), tracked: tracked.has(rel) })
+  return entries
+}
+
+async function baselinePath(root: string): Promise<string | null> {
+  const dir = await execWide('git', ['-C', root, 'rev-parse', '--absolute-git-dir'], root)
+  return dir.code === 0 && dir.out.trim() ? path.join(dir.out.trim(), BASELINE_FILE) : null
+}
+
+/** Record what the candidate STARTED with: `prepare()` mirrors the source's
+ *  uncommitted edits into the worktree without committing them, so `git diff
+ *  HEAD` alone attributes the user's work-in-progress to every candidate
+ *  (review R3 3.7: a candidate that did nothing passed the has-work gate in
+ *  any dirty repository). Returns the number of inherited paths, or null when
+ *  the workspace is not a git worktree. */
+export async function captureWorkspaceBaseline(cwd: string): Promise<number | null> {
+  const root = await gitRoot(cwd)
+  if (!root) return null
+  const entries = await workspaceEntries(root)
+  const file = await baselinePath(root)
+  if (!entries || !file) return null
+  await writeFile(file, JSON.stringify({ version: 1, entries: Object.fromEntries(entries.map((e) => [e.path, e.digest])) }))
+  return entries.length
+}
+
+async function readBaseline(root: string): Promise<Map<string, string> | null> {
+  const file = await baselinePath(root)
+  if (!file) return null
+  try {
+    const parsed = JSON.parse(await readFile(file, 'utf8')) as { version?: number; entries?: Record<string, string> }
+    if (parsed.version !== 1 || !parsed.entries || typeof parsed.entries !== 'object') return null
+    return new Map(Object.entries(parsed.entries).filter((pair): pair is [string, string] => typeof pair[1] === 'string'))
+  } catch {
+    return null
+  }
+}
+
+export interface OwnChanges {
+  root: string
+  /** False when no start baseline exists (manual workspaces, legacy
+   *  worktrees): every change relative to HEAD then counts as the candidate's. */
+  hasBaseline: boolean
+  /** Full current deliverable (inherited + own). */
+  entries: WorkspaceEntry[]
+  /** Paths whose content differs from what the candidate started with.
+   *  digest 'head' = the candidate restored an inherited path to HEAD. */
+  own: WorkspaceEntry[]
+  /** Inherited source edits the candidate left untouched. */
+  inherited: number
+}
+
+export async function candidateOwnChanges(cwd: string): Promise<OwnChanges | null> {
+  const root = await gitRoot(cwd)
+  if (!root) return null
+  const head = await execWide('git', ['-C', root, 'rev-parse', '--verify', 'HEAD'], root)
+  if (head.code !== 0) return null
+  const entries = await workspaceEntries(root)
+  if (!entries) return null
+  const baseline = await readBaseline(root)
+  if (!baseline) return { root, hasBaseline: false, entries, own: entries, inherited: 0 }
+  const current = new Set(entries.map((e) => e.path))
+  const own = entries.filter((e) => baseline.get(e.path) !== e.digest)
+  for (const inheritedPath of baseline.keys()) {
+    if (!current.has(inheritedPath)) own.push({ path: inheritedPath, digest: 'head', tracked: true })
+  }
+  return { root, hasBaseline: true, entries, own, inherited: entries.length - entries.filter((e) => baseline.get(e.path) !== e.digest).length }
+}
 
 /** Objective work evidence for one candidate workspace (ruling K.5 / J.4).
  *  Returns null when the workspace is not a git worktree (manual blank
  *  workspaces) — the caller then relies on tool-call evidence alone. */
 export async function gitDiffStat(cwd: string): Promise<DiffStatLite | null> {
   try {
-    const head = await execWide('git', ['-C', cwd, 'rev-parse', '--verify', 'HEAD'], cwd)
-    if (head.code !== 0) return null
-    const numstat = await execWide('git', ['-C', cwd, 'diff', '--numstat', 'HEAD'], cwd)
-    if (numstat.code !== 0) return null
-    let files = 0
+    const changes = await candidateOwnChanges(cwd)
+    if (!changes) return null
+    const ownTracked = new Set(changes.own.filter((e) => e.tracked).map((e) => e.path))
     let insertions = 0
     let deletions = 0
-    const numLines: string[] = []
-    for (const line of numstat.out.split(/\r?\n/)) {
-      const parts = line.split('\t')
-      if (parts.length < 3) continue
-      files += 1
-      insertions += parts[0] === '-' ? 0 : Number(parts[0]) || 0
-      deletions += parts[1] === '-' ? 0 : Number(parts[1]) || 0
-      numLines.push(line)
-    }
-    const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard'], cwd)
-    const untrackedEntries: string[] = []
-    if (others.code === 0) {
-      for (const rel of others.out.split(/\r?\n/).filter(Boolean).slice(0, 5000)) {
-        let size = -1
-        try { size = statSync(path.join(cwd, rel)).size } catch { /* raced away */ }
-        untrackedEntries.push(rel + ':' + size)
+    const numstat = await execWide('git', ['-C', changes.root, 'diff', ...RAW_DIFF, '--no-renames', '--numstat', '-z', 'HEAD'], changes.root)
+    if (numstat.code === 0) {
+      for (const record of nulList(numstat.out)) {
+        const parts = record.replace(/^\n+/, '').split('\t')
+        if (parts.length < 3 || !ownTracked.has(parts.slice(2).join('\t'))) continue
+        insertions += parts[0] === '-' ? 0 : Number(parts[0]) || 0
+        deletions += parts[1] === '-' ? 0 : Number(parts[1]) || 0
       }
     }
-    untrackedEntries.sort()
-    const fingerprint = createHash('sha256')
-      .update(numLines.join('\n'))
-      .update('\n--UNTRACKED--\n')
-      .update(untrackedEntries.join('\n'))
-      .digest('hex')
-      .slice(0, 16)
-    return { files, insertions, deletions, untracked: untrackedEntries.length, fingerprint }
+    const hash = createHash('sha256')
+    for (const entry of changes.entries) hash.update(entry.path).update(String.fromCharCode(0)).update(entry.digest).update('\n')
+    return {
+      files: ownTracked.size,
+      insertions,
+      deletions,
+      untracked: changes.own.filter((e) => !e.tracked).length,
+      fingerprint: hash.digest('hex').slice(0, 16),
+      ...(changes.hasBaseline ? { inherited: changes.inherited } : {}),
+    }
+  } catch {
+    return null
+  }
+}
+
+/** Which of the candidate's OWN changes now exist byte-for-byte in the source
+ *  worktree (review R3 3.3). This is the attributable integration signal: a
+ *  HEAD move or a dirty tree says the source changed, not that it took
+ *  anything from the relayed candidate. */
+export async function adoptionOf(candidateCwd: string, sourceCwd: string): Promise<{ total: number; adopted: string[] } | null> {
+  try {
+    const changes = await candidateOwnChanges(candidateCwd)
+    const sourceRoot = await gitRoot(sourceCwd)
+    if (!changes || !sourceRoot) return null
+    const comparable = changes.own.filter((e) => e.digest !== 'head' && e.digest !== 'other' && !e.digest.includes('size:'))
+    const budget = { left: FINGERPRINT_CONTENT_BUDGET }
+    const adopted: string[] = []
+    for (const entry of comparable) {
+      if (await contentDigest(path.join(sourceRoot, entry.path), budget) === entry.digest) adopted.push(entry.path)
+    }
+    return { total: comparable.length, adopted }
   } catch {
     return null
   }
@@ -591,7 +802,19 @@ export interface DiffFull {
   truncated: boolean
   /** Untracked (non-ignored) file names — the typical brand-new deliverable. */
   untrackedFiles: string[]
+  /** 'own': only paths the candidate changed since its start baseline (review
+   *  R5 5.6); 'head': everything vs HEAD (no baseline, or too many own paths
+   *  to pass as pathspecs). Absent on records written before R5. */
+  scope?: 'own' | 'head'
+  /** Inherited source edits left out of an 'own' patch: the user's
+   *  work-in-progress, not candidate work. */
+  inheritedExcluded?: number
 }
+
+/** Pathspec budget for an own-paths patch; beyond it the patch falls back to
+ *  scope 'head' rather than risk the platform's command-line limit. */
+const OWN_PATCH_MAX_PATHS = 400
+const OWN_PATCH_MAX_CHARS = 16_000
 
 /** Full diff evidence for the audit pack (ruling I.5): what the candidate
  *  actually changed, captured BEFORE the workspace can be reclaimed. */
@@ -610,11 +833,32 @@ export async function gitDiffFull(cwd: string, patchCap = 262144): Promise<DiffF
     try { await cp(path.resolve(cwd, indexPath.out.trim()), scratchIndex) } catch { /* no index yet: git starts from an empty one */ }
     const scratchEnv = { ...process.env, GIT_INDEX_FILE: scratchIndex }
     await execWide('git', ['-C', cwd, 'add', '-N', '.'], cwd, scratchEnv)
-    const diff = await exec('git', ['-C', cwd, 'diff', 'HEAD', '--', '.'], { cwd, cap: patchCap, keep: 'head', env: scratchEnv })
-    if (diff.code !== 0) return null
-    const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard'], cwd)
-    const untrackedFiles = others.code === 0 ? others.out.split(/\r?\n/).filter(Boolean) : []
-    return { patch: diff.out, truncated: diff.out.length >= patchCap, untrackedFiles }
+    // Review R5 5.6: a patch vs HEAD also carried the source edits the
+    // candidate inherited at start (prepare mirrors the user's uncommitted
+    // work): the audit pack then showed the user's work as candidate work and
+    // shipped it to disk with every candidate. With a start baseline, limit
+    // the patch to the paths the candidate itself changed.
+    const changes = await candidateOwnChanges(cwd)
+    const ownPaths = changes?.hasBaseline ? changes.own.map((entry) => entry.path) : null
+    const ownSpecs = ownPaths ? ownPaths.map((rel) => ':(top,literal)' + rel) : null
+    const ownFits = ownSpecs !== null && ownSpecs.length <= OWN_PATCH_MAX_PATHS && ownSpecs.reduce((n, spec) => n + spec.length + 1, 0) <= OWN_PATCH_MAX_CHARS
+    const scope: 'own' | 'head' = ownFits ? 'own' : 'head'
+    let patch = ''
+    if (scope === 'head' || (ownSpecs && ownSpecs.length > 0)) {
+      const diff = await exec('git', ['-C', cwd, 'diff', ...RAW_DIFF, 'HEAD', '--', ...(scope === 'own' ? ownSpecs! : ['.'])], { cwd, cap: patchCap, keep: 'head', env: scratchEnv })
+      if (diff.code !== 0) return null
+      patch = diff.out
+    }
+    const others = await execWide('git', ['-C', cwd, 'ls-files', '--others', '--exclude-standard', '--full-name'], cwd)
+    const ownSet = scope === 'own' ? new Set(ownPaths) : null
+    const untrackedFiles = (others.code === 0 ? others.out.split(/\r?\n/).filter(Boolean) : []).filter((rel) => !ownSet || ownSet.has(rel))
+    return {
+      patch,
+      truncated: patch.length >= patchCap,
+      untrackedFiles,
+      scope,
+      ...(scope === 'own' && changes ? { inheritedExcluded: changes.inherited } : {}),
+    }
   } catch {
     return null
   } finally {

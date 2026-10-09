@@ -1,0 +1,11 @@
+{
+  "src/api.ts": 2,
+  "src/client/index.ts": 8,
+  "src/host.ts": 1,
+  "src/selection/autopilot.ts": 1,
+  "src/selection/bridge.ts": 1,
+  "src/selection/candidates.ts": 2,
+  "src/selection/host.ts": 3,
+  "src/selection/live.ts": 5,
+  "src/selection/trajectory.ts": 1
+}

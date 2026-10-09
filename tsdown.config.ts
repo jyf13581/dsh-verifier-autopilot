@@ -1,17 +1,12 @@
-import { fileURLToPath } from 'node:url'
 import type { UserConfig } from 'tsdown'
-
-const PLUGIN_ID = "@dsh-external/dsh-verifier-autopilot"
-
-const CLIENT_EXTERNALS = [
-  'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client',
-  'cordis',
-  '@deepseek-ai/dsh-client-ui-slots',
-  '@deepseek-ai/dsh-client-runtime/client',
-]
+// Entry, externals and wrapper are shared with scripts/build.sh's esbuild
+// fallback (review R6 6.2); edit them in scripts/client-bundle.mjs.
+import {
+  CLIENT_ENTRY, CLIENT_EXTERNALS, WRAPPER_BANNER, WRAPPER_FOOTER, WRAPPER_INTRO,
+} from './scripts/client-bundle.mjs'
 
 const clientBundle: UserConfig = {
-  entry: { client: 'src/client/index.ts' },
+  entry: { client: CLIENT_ENTRY },
   outDir: 'lib',
   format: 'cjs',
   platform: 'browser',
@@ -27,9 +22,9 @@ const clientBundle: UserConfig = {
   },
   outputOptions: {
     entryFileNames: 'client.js',
-    banner: 'window.__ModuleLoader__.load({ id: ' + JSON.stringify(PLUGIN_ID) + ', factory: (require) => {',
-    footer: 'return module.exports; } });',
-    intro: 'var module = { exports: {} }; var exports = module.exports;',
+    banner: WRAPPER_BANNER,
+    footer: WRAPPER_FOOTER,
+    intro: WRAPPER_INTRO,
     codeSplitting: false,
   },
 }

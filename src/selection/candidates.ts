@@ -14,16 +14,21 @@
  *   survivor-subset index.
  */
 
+import { describeMismatch, lookupMarginCalibration, type MarginCalibration, type UncalibratedMarginPolicy } from './calibration.js'
 import { randomUUID } from 'node:crypto'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from '../diagnostics.js'
 import { rmdir } from 'node:fs/promises'
 import path from 'node:path'
-import { DEFAULT_SELECTION_MARGIN_THRESHOLD } from '../constants.js'
+import {
+  DEFAULT_CANDIDATE_TIMEOUT_MS, DEFAULT_SELECTION_EVALUATIONS, DEFAULT_SELECTION_MARGIN_THRESHOLD, DEFAULT_SELECTION_PIVOTS,
+  DEFAULT_SELECTION_TIMEOUT_MS, SELECTION_TIMEOUT_MAX_MS,
+} from '../constants.js'
+import { makeRedactor } from '../util.js'
 import { read, readString } from '../payload.js'
 import { boundCandidateHandoff, renderTrajectory, type TrajectoryEvent } from './trajectory.js'
 import { runChecks, type CheckResult, type ObjectiveCheck } from './checks.js'
 export type { CheckResult, ObjectiveCheck } from './checks.js'
-import { BridgeError, type BridgeProgressRequest, type BridgeProgressResult, type BridgeSelectRequest, type BridgeSelectResult, type BridgeUsage } from './bridge.js'
+import { BridgeError, type BridgeProgressRequest, type BridgeProgressResult, type BridgeSelectRequest, type BridgeSelectResult, type BridgeUsage, type ScoreExtraction } from './bridge.js'
 import { retryTransientBridge, type RetrySleep } from './retry.js'
 
 export type CandidateStatus =
@@ -37,6 +42,10 @@ export interface DiffStatLite {
   deletions: number
   untracked: number
   fingerprint: string
+  /** Source work-in-progress mirrored into the workspace at start and left
+   *  untouched; excluded from files/untracked (review R3 3.7). Absent when
+   *  no start baseline exists. */
+  inherited?: number
 }
 
 export interface CandidateRecord {
@@ -51,7 +60,8 @@ export interface CandidateRecord {
   toolCalls?: number
   /** Execution-class tool calls (meta/discovery tools excluded, ruling K.4-1). */
   execToolCalls?: number
-  /** Worktree diff vs source HEAD; null when the workspace is not git. */
+  /** Candidate's own worktree changes (vs its start baseline, else HEAD);
+   *  null when the workspace is not git. */
   diffStat?: DiffStatLite | null
   /** Objective-evidence tier: pass = caller checks all ok; none = no checks,
    *  checks invalid, or never ran. A candidate eliminated by a genuine check
@@ -72,7 +82,7 @@ export interface CandidateRecord {
  *  `outcome` first. */
 export type SelectionOutcome =
   | 'ranked_winner'             // margin above threshold; verifier preference
-  | 'objective_only_result'     // verifier absent; strict deterministic order
+  | 'objective_only_result'     // LEGACY, never produced since review R2 2.3 (unreachable: see ranking catch); kept so old ledger rows still type-check and relay
   | 'single_candidate_fallback' // exactly one survivor; never compared
   | 'insufficient_evidence'     // survivors produced no verifiable work
   | 'abstain'                   // margin inside the provisional calibrated noise band
@@ -115,6 +125,10 @@ export interface SelectionRecord {
   /** All survivors shared one diff fingerprint — deduped before the verifier
    *  (ruling F3); the record is a fallback, never a ranking claim. */
   noSearchSpace?: boolean
+  /** Original indices removed before ranking because their workspace was
+   *  byte-identical to a lower-index survivor (review R2 2.1). Each carries
+   *  eliminatedBy ['duplicate-diff:c<kept>']. */
+  dedupedCandidates?: number[]
   /** No candidate carried deterministic objective evidence (checks pass); any
    *  ranking on this record was LLM-only. */
   llmOnly?: boolean
@@ -122,6 +136,17 @@ export interface SelectionRecord {
   margin?: number
   marginThreshold?: number
   marginCondition?: string
+  /** Review R3 3.1: whether the gate's noise band was measured for this
+   *  exact condition (see selection/calibration.ts). */
+  marginCalibration?: MarginCalibration
+  /** Review R3 3.4: usage.calls != nComparisons x criteria x evaluations on a
+   *  successful ranking (scheduler/counter regression or tie-swallowing). */
+  verifierCallsAnomaly?: { expected: number; observed: number | null }
+  /** Review R3 3.5: how the verifier scores behind this ranking were read.
+   *  Any `default` means at least one score was the neutral 0.5 the upstream
+   *  extractor substitutes for an unparseable reply, which can manufacture a
+   *  preference when only one slot defaulted. */
+  scoreExtraction?: ScoreExtraction
   /** Threshold remains provisional until the graduation invoice clears (I.4). */
   marginProvisional?: boolean
   /** At least one candidate's checks were shell-level failures (B-10). */
@@ -130,6 +155,9 @@ export interface SelectionRecord {
   configSnapshot?: Record<string, unknown>
   sourceModel?: string | null
   sourceHeadAtStart?: string | null
+  /** Review R4 4.2: every candidate's starting state came from one seed
+   *  snapshot; `consistent:false` = the source kept changing under it. */
+  workspaceSeed?: WorkspaceSeedReport
   /** Free-text note carrying an abstain/fallback reason for the ledger. */
   note?: string
   /**
@@ -137,8 +165,27 @@ export interface SelectionRecord {
    * winner/fallback cleanup time. `delivered` is granted only when the audit
    * observed integration evidence; un-audited stays `unknown` forever.
    */
+  /** Source state when the relay was sent (review R3 3.3): the audit's
+   *  baseline. `concurrent` = captured alongside a recovery relay rather than
+   *  strictly before it. */
+  sourceAtRelay?: {
+    at: number
+    head: string | null
+    worktreeFingerprint: string | null
+    /** Retained-candidate files already byte-identical in the source. */
+    adoptedPaths: string[] | null
+    candidateFiles: number | null
+    concurrent?: boolean
+    error?: string
+  }
   delivery?: {
     audited: boolean
+    /** relay-adoption = attributable (R3); start-baseline = legacy. */
+    basis?: 'relay-adoption' | 'start-baseline'
+    changedSinceRelay?: boolean | null
+    /** Retained-candidate files that appeared in the source after the relay. */
+    adoptedFiles?: string[]
+    candidateFiles?: number | null
     headBefore?: string | null
     headAfter?: string | null
     headChanged?: boolean | null
@@ -165,6 +212,18 @@ export interface SelectionRecord {
   verifierModel?: string
 }
 
+/** The part of DSH's `AgentCancelCause` this plugin emits. DSH's agent loop
+ *  (dsh-agent-loop >= 0.1.7-rc.1) maps the abort reason of an ending turn
+ *  through an exhaustive switch on `cause.kind`; a cause-less `cancel()`
+ *  leaves the platform AbortError there, the switch throws, and the turn ends
+ *  with `turn/end` reason undefined and the driver failing (review R6 6.6).
+ *  `hook` carries a reason, so the session log says why the plugin stopped
+ *  the candidate. */
+export type CandidateCancelCause = { readonly kind: 'hook'; readonly reason: string }
+
+export const CANCEL_CANDIDATE_TIMEOUT: CandidateCancelCause = Object.freeze({ kind: 'hook', reason: 'dsh-verifier-autopilot: candidate window elapsed' })
+export const CANCEL_PROGRESS_GUARD: CandidateCancelCause = Object.freeze({ kind: 'hook', reason: 'dsh-verifier-autopilot: progress guard abandoned a hopeless rollout' })
+
 export interface SelectionAgentHandle {
   agent: {
     id: string
@@ -176,7 +235,7 @@ export interface SelectionAgentHandle {
       source: { kind: 'user' }
     }): void | Promise<void>
     whenIdle(): Promise<void>
-    cancel?: () => void
+    cancel?: (cause: CandidateCancelCause) => void
   }
   dispose(): Promise<void>
 }
@@ -210,6 +269,21 @@ export interface CandidateFactory {
   create(spec: CandidateSpec): Promise<SelectionAgentHandle>
 }
 
+/** Review R4 4.2: how a selection's candidates were seeded from the source. */
+export interface WorkspaceSeedReport {
+  /** Candidate whose workspace was cut from the live source; every other
+   *  candidate was copied from it, so all start from the same bytes. */
+  seedIndex: number
+  /** The commit every candidate worktree was created at. */
+  head: string
+  /** Seed snapshots taken (a retry follows a source change mid-snapshot). */
+  attempts: number
+  /** true: the source was unchanged across the final snapshot; false: it kept
+   *  changing (the seed may mix states the source passed through); null: the
+   *  source could not be fingerprinted. */
+  consistent: boolean | null
+}
+
 export interface WorkspaceManager {
   prepare(sel: { selectionId: string; index: number; sourceCwd?: string; strictSnapshot?: boolean }): Promise<string>
   remove(path: string): Promise<void>
@@ -222,6 +296,9 @@ export interface WorkspaceManager {
    *  lists disposed losers as dead sessions pointing at deleted workspaces
    *  (the "目录损坏" ghosts counted 25 orphaned entries on 2026-08-30). */
   purgeSessionRecord?(candidateWorkspace: string): Promise<void>
+  /** Review R4 4.2: how the selection's candidates were seeded (absent for
+   *  managers that do not snapshot a source). */
+  seedReport?(selectionId: string): WorkspaceSeedReport | undefined
 }
 
 export interface SelectionRunnerDeps {
@@ -238,7 +315,7 @@ export interface SelectionRunnerDeps {
   diffStat?: (cwd: string) => Promise<DiffStatLite | null>
   /** Full patch capture for the audit pack (ruling I.5). Runs right after the
    *  per-candidate accounting pass, before any workspace disposal. */
-  diffFull?: (cwd: string) => Promise<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null>
+  diffFull?: (cwd: string) => Promise<{ patch: string; truncated: boolean; untrackedFiles: string[]; scope?: 'own' | 'head'; inheritedExcluded?: number } | null>
   /** Test seam for bounded verifier backoff; production uses abort-aware timers. */
   sleep?: RetrySleep
   now?: () => number
@@ -277,6 +354,9 @@ export interface SelectionRunInput {
   /** Provisional top-2 margin gate; below it the outcome is abstain, not a
    *  verifier winner (ruling I.1/I.4). Recorded per run with its condition. */
   marginThreshold?: number
+  /** What the gate does when this run's condition has no calibrated noise
+   *  band (review R3 3.1). Default 'flag'. */
+  uncalibratedMarginPolicy?: UncalibratedMarginPolicy
   /** Extra fields merged into the record at creation (config snapshot, source
    *  attribution). Runner-controlled keys always win. */
   recordSeed?: Partial<SelectionRecord>
@@ -287,6 +367,9 @@ export interface SelectionRunInput {
   algorithmSeed?: number
   selectionId?: string
   candidateTimeoutMs?: number
+  /** How long after candidateTimeoutMs a cancelled candidate may take to go
+   *  idle before the runner stops waiting (review R2 2.5). Default 30 s. */
+  cancelGraceMs?: number
   selectTimeoutMs?: number
   verifier: {
     model: string
@@ -313,7 +396,7 @@ export interface SelectionRunResult {
    *  (.data/selection-artifacts/<id>/) by the host at settle time. */
   artifacts?: {
     traces: Array<string | null>
-    diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null>
+    diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[]; scope?: 'own' | 'head'; inheritedExcluded?: number } | null>
   }
 }
 
@@ -329,23 +412,48 @@ export function evaluateDelivery(input: {
   dirtyEntries: number | null
   testsConfigured: boolean
   testsExit?: number | null
-}): { delivered: 'yes' | 'no' | 'unknown'; note: string } {
-  if (!input.audited) return { delivered: 'unknown', note: 'audit did not run' }
-  const integrated = input.headChanged === true || (input.dirtyEntries !== null && (input.dirtyEntries ?? 0) > 0)
-  if (!integrated) return { delivered: 'no', note: 'no HEAD advance and clean worktree at audit time' }
-  if (!input.testsConfigured) {
-    return { delivered: 'unknown', note: 'integration evidence observed; no test command configured (selectionPostAuditTestCommand) so verification is unresolved' }
+  /** Relay-time attribution (review R3 3.3). When present, integration means
+   *  "files the retained candidate changed now exist byte-for-byte in the
+   *  source and did not before the relay". Absent = legacy start-baseline
+   *  semantics, which cannot separate the relay from the source turn's own
+   *  concurrent work or from edits the user already had uncommitted. */
+  attribution?: { changedSinceRelay: boolean | null; adoptedNew: number | null; candidateFiles: number | null }
+}): { delivered: 'yes' | 'no' | 'unknown'; note: string; basis: 'relay-adoption' | 'start-baseline' } {
+  const tested = (integratedNote: string, basis: 'relay-adoption' | 'start-baseline') => {
+    if (!input.testsConfigured) {
+      return { delivered: 'unknown' as const, basis, note: integratedNote + '; no test command configured (selectionPostAuditTestCommand) so verification is unresolved' }
+    }
+    if (input.testsExit === 0) return { delivered: 'yes' as const, basis, note: integratedNote + ' and the configured test command exited 0' }
+    return { delivered: 'no' as const, basis, note: integratedNote + ' but the configured test command failed (exit ' + (input.testsExit ?? 'n/a') + ')' }
   }
-  if (input.testsExit === 0) return { delivered: 'yes', note: 'HEAD/advanced worktree integrated and the configured test command exited 0' }
-  return { delivered: 'no', note: 'integration evidence present but the configured test command failed (exit ' + (input.testsExit ?? 'n/a') + ')' }
+  const a = input.attribution
+  if (a) {
+    if (!input.audited) return { delivered: 'unknown', basis: 'relay-adoption', note: 'audit did not run' }
+    if (a.adoptedNew !== null && a.adoptedNew > 0) {
+      return tested(a.adoptedNew + ' of ' + (a.candidateFiles ?? '?') + " retained-candidate files appeared in the source after the relay", 'relay-adoption')
+    }
+    if (a.changedSinceRelay === false) return { delivered: 'no', basis: 'relay-adoption', note: 'source unchanged since the relay' }
+    return {
+      delivered: 'unknown',
+      basis: 'relay-adoption',
+      note: a.adoptedNew === null
+        ? 'adoption could not be measured; source change since relay: ' + String(a.changedSinceRelay)
+        : 'source changed after the relay but none of the ' + (a.candidateFiles ?? 0) + ' retained-candidate files appear in it (re-implemented or unrelated work; not attributable)',
+    }
+  }
+  if (!input.audited) return { delivered: 'unknown', basis: 'start-baseline', note: 'audit did not run' }
+  const integrated = input.headChanged === true || (input.dirtyEntries !== null && (input.dirtyEntries ?? 0) > 0)
+  if (!integrated) return { delivered: 'no', basis: 'start-baseline', note: 'no HEAD advance and clean worktree at audit time' }
+  return tested('HEAD advanced or worktree dirty since selection start (start-time baseline: not attributable to the relay)', 'start-baseline')
 }
 
-/** Ruling I.1: provisional margin gate. 2026-09-08 calibration round 1 (C0,
- *  24 reps × 2 seeds, minimax-m3@low, eval/calibration/run.mjs): identical-
- *  candidate noise q95 = 0.0123, max = 0.0135, positional bias ≈ 0, no 0.5
- *  pinning; oracle-separated pairs land at margin 0.31..0.46 with 12/12
- *  correct signs. 0.03 = 2.2× the observed noise ceiling. Stays provisional
- *  until the multi-fixture replication (≥5 fixtures) confirms stability. */
+/** Ruling I.1: provisional margin gate. Evidence: invoice rounds 2-5
+ *  (kimi-k3@low, N=2, C=1, K=1, P=0, synthetic short fixtures), 240 C0
+ *  self-comparison frames, max noise 0.01377, so 0.03 is 2.17x the observed
+ *  ceiling (the round-1 minimax-m3 numbers were voided). Only that condition
+ *  is calibrated; every other run is labelled via selection/calibration.ts
+ *  (review R3 3.1). Stays provisional until docs/MARGIN-GRADUATION-INVOICE.md
+ *  clears. */
 export const PROVISIONAL_MARGIN_THRESHOLD = DEFAULT_SELECTION_MARGIN_THRESHOLD
 
 function clampCandidateCount(n: number): number {
@@ -368,10 +476,13 @@ function invalidSelectionResult(detail: string): BridgeError {
 function deterministicPreface(cand: CandidateRecord, taskKind: string | undefined): string {
   const lines = ['[DETERMINISTIC EVIDENCE — collected by the runner, not claimed by the candidate]']
   lines.push('Task kind: ' + (taskKind ?? 'unknown'))
-  lines.push('Execution-class tool calls: ' + String(cand.execToolCalls ?? 0) + ' (catalog/meta tools excluded; raw tool-call count ' + (cand.toolCalls ?? cand.execToolCalls ?? 0) + ')')
+  lines.push('Execution-class tool calls: ' + String(cand.execToolCalls ?? 0) + ' (catalog/meta and read-only tools excluded; raw tool-call count ' + (cand.toolCalls ?? cand.execToolCalls ?? 0) + ')')
   const d = cand.diffStat
   lines.push(d
-    ? 'Worktree diff vs source HEAD: ' + d.files + ' files changed (+' + d.insertions + ' / -' + d.deletions + '), ' + d.untracked + ' untracked files'
+    ? (d.inherited === undefined
+      ? 'Worktree diff vs source HEAD: ' + d.files + ' files changed (+' + d.insertions + ' / -' + d.deletions + '), ' + d.untracked + ' untracked files'
+      : 'Worktree changes made by this candidate: ' + d.files + ' files changed (+' + d.insertions + ' / -' + d.deletions + ' vs HEAD), ' + d.untracked + ' new files'
+        + (d.inherited > 0 ? '; ' + d.inherited + ' uncommitted source edits were inherited at start and are NOT counted' : ''))
     : 'Worktree diff: unavailable (non-git or unreadable workspace)')
   if (cand.checks && cand.checks.length > 0) {
     for (const c of cand.checks) {
@@ -453,13 +564,25 @@ export class SelectionRunner {
       verifierModel: input.verifier.model,
     }
     const diag = this.deps.diagnostics ?? defaultDiagnostics
+    // Review R5 5.1: every text this run sends to the verifier, records,
+    // writes to the audit pack, or relays to the source session passes one
+    // redactor (the verifier key plus every credential-named env value, then
+    // the shared token patterns), as the legacy lane prompt always did. A
+    // candidate that ran `env` must not ship the user's keys to a third-party
+    // verifier endpoint, the ledger, /state, or the source conversation.
+    const redact = makeRedactor([input.verifier.apiKey])
+    const redactCriteria = (criteria: BridgeSelectRequest['criteria']): BridgeSelectRequest['criteria'] => Array.isArray(criteria)
+      ? criteria.map((c) => ({ ...c, name: redact(c.name), description: redact(c.description) }))
+      : Object.fromEntries(Object.entries(criteria ?? {}).map(([k, v]) => [k, redact(v)]))
+    const failureText = (e: unknown) => redact(errText(e))
     const publish = () => { try { input.onUpdate?.(record) } catch { diag.count('selection.observer_error') } }
     publish()
     const handles: Array<SelectionAgentHandle | null> = new Array(n).fill(null)
     const trajectories: Array<string | null> = new Array(n).fill(null)
-    const diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[] } | null> = new Array(n).fill(null)
+    const diffPatches: Array<{ patch: string; truncated: boolean; untrackedFiles: string[]; scope?: 'own' | 'head'; inheritedExcluded?: number } | null> = new Array(n).fill(null)
     const seed = input.seed && input.seed.length > 0 ? input.seed : undefined
-    const candidateTimeout = input.candidateTimeoutMs ?? 600000
+    const candidateTimeout = input.candidateTimeoutMs ?? DEFAULT_CANDIDATE_TIMEOUT_MS
+    const cancelGrace = Math.max(0, input.cancelGraceMs ?? 30_000)
     // A signal that is already aborted never fires 'abort' again: a run that
     // starts after its host was disposed/cancelled must still see it, or it
     // would provision worktrees and spawn agents for a dead selection.
@@ -475,6 +598,13 @@ export class SelectionRunner {
     // finds its own sample still pending is skipped (a sample is a best-effort
     // observation, not a scheduled obligation).
     let progressChain: Promise<void> = Promise.resolve()
+    // Review R4 4.6: progress samples share the sidecar's serial pipe with the
+    // ranking request, and a timeout/abort tears the whole child down. Samples
+    // therefore run on their own signal, and the runner cancels and drains
+    // them before ranking, so an advisory sample can never take the decisive
+    // select down with it.
+    const progressAbort = new AbortController()
+    const progressSignal = input.signal ? AbortSignal.any([input.signal, progressAbort.signal]) : progressAbort.signal
     const progressPending = new Set<number>()
     const enqueueProgressSample = (index: number, sample: () => Promise<void>): void => {
       if (progressPending.has(index)) return
@@ -519,6 +649,11 @@ export class SelectionRunner {
         }
         record.candidates[i] = { index: i, sessionId: null, workspace, status: 'created' }
       }
+      const workspaceSeed = this.deps.workspaces.seedReport?.(selectionId)
+      if (workspaceSeed) {
+        record.workspaceSeed = workspaceSeed
+        if (workspaceSeed.consistent === false) diag.warn('workspace.seed_torn', 'the source changed during every seed snapshot attempt; candidates share one seed, but it may mix source states', { selectionId, attempts: workspaceSeed.attempts })
+      }
       if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted before agent creation', false)
       record.stage = 'preflight'
       publish()
@@ -555,7 +690,7 @@ export class SelectionRunner {
           }
         } catch (e) {
           cand.status = 'failed'
-          cand.error = 'agent-create: ' + errText(e)
+          cand.error = 'agent-create: ' + failureText(e)
         }
       }))
       if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted during agent creation', false)
@@ -572,9 +707,11 @@ export class SelectionRunner {
         // seed events must not be mistaken for candidate failures.
         const preRunCount = agent.session.events.length
         let timedOut = false
+        let cancelIgnored = false
+        let hardStop: ReturnType<typeof setTimeout> | null = null
         const timer = setTimeout(() => {
           timedOut = true
-          try { agent.cancel?.() } catch { /* no-op */ }
+          try { agent.cancel?.(CANCEL_CANDIDATE_TIMEOUT) } catch { /* no-op */ }
         }, candidateTimeout)
         // Opt-in online hopeless-rollout abandonment (progressGuard): sample
         // the candidate's live trajectory through the verifier's progress
@@ -608,16 +745,17 @@ export class SelectionRunner {
                 const rendered = renderTrajectory(agent.session.events.slice(preRunCount))
                 if (rendered.text.trim()) {
                   const r = await progressFn({
-                    problem: input.problem,
-                    steps: [rendered.text.slice(-12000)],
+                    problem: redact(input.problem),
+                    steps: [redact(rendered.text).slice(-12000)],
                     model: input.verifier.model,
                     baseUrl: input.verifier.baseUrl,
                     apiKey: input.verifier.apiKey,
                     apiKeyEnv: input.verifier.apiKeyEnv,
                     effort: input.verifier.effort,
                     nEvaluations: 1,
-                    // A run abort must not leave a sample occupying the pipe.
-                    signal: input.signal,
+                    // A run abort, or the pre-ranking drain, must not leave a
+                    // sample occupying the pipe.
+                    signal: progressSignal,
                   })
                   score = r.score
                 }
@@ -628,7 +766,7 @@ export class SelectionRunner {
                 // bridge already recorded the per-request detail (timeout text,
                 // stderr tail); here the stable code keeps one entry per outage
                 // instead of one per tick.
-                if (!input.signal?.aborted) diag.warn('progress.sample', error instanceof BridgeError ? 'sidecar ' + error.code : error, { selectionId: record.selectionId })
+                if (!progressSignal.aborted) diag.warn('progress.sample', error instanceof BridgeError ? 'sidecar ' + error.code : error, { selectionId: record.selectionId })
               }
               if (score !== null) {
                 pgLastScore = score
@@ -642,7 +780,7 @@ export class SelectionRunner {
               lastEvidence = evidence
               if (lowStreak >= grace) {
                 pgCancelled = true
-                try { agent.cancel?.() } catch { /* no-op */ }
+                try { agent.cancel?.(CANCEL_PROGRESS_GUARD) } catch { /* no-op */ }
               }
               if (monitor && (pgCancelled || samples >= maxChecks)) {
                 clearInterval(monitor)
@@ -670,8 +808,16 @@ export class SelectionRunner {
             if (input.signal.aborted) onSig()
             else input.signal.addEventListener('abort', onSig, { once: true })
           }
+          // Hard stop (review R2 2.5): cancel() is advisory. A candidate that
+          // ignores it must not pin the whole selection (and the one active
+          // slot) forever; after the grace the runner stops waiting and the
+          // loser pass disposes the handle.
+          const hardStopP = new Promise<'hard-stop'>((resolve) => {
+            hardStop = setTimeout(() => resolve('hard-stop'), candidateTimeout + cancelGrace)
+          })
           try {
-            await Promise.race([agent.whenIdle(), abortP])
+            const settledBy = await Promise.race([agent.whenIdle().then(() => 'idle' as const), abortP, hardStopP])
+            if (settledBy === 'hard-stop') { timedOut = true; cancelIgnored = true }
           } finally {
             input.signal?.removeEventListener('abort', onSig)
           }
@@ -681,7 +827,7 @@ export class SelectionRunner {
             cand.error = 'progress-abandoned (lastScore=' + (pgLastScore === null ? 'n/a' : pgLastScore.toFixed(3)) + ')'
           } else if (timedOut) {
             cand.status = 'failed'
-            cand.error = 'candidate-timeout'
+            cand.error = cancelIgnored ? 'candidate-timeout (cancel not acknowledged within ' + cancelGrace + 'ms)' : 'candidate-timeout'
           } else {
             // A turn that ended in error (e.g. prompt assembly failure) is a
             // failed candidate, not a finished one — never feed it to the
@@ -691,16 +837,17 @@ export class SelectionRunner {
             if (bad.length > 0) {
               cand.status = 'failed'
               const reason = readString(bad[bad.length - 1].data, 'reason', 'error', 'message')
-              cand.error = 'turn-error' + (reason ? ': ' + reason.slice(0, 160) : '')
+              cand.error = 'turn-error' + (reason ? ': ' + redact(reason).slice(0, 160) : '')
             } else {
               cand.status = 'finished'
             }
           }
         } catch (e) {
           cand.status = 'failed'
-          cand.error = errText(e)
+          cand.error = failureText(e)
         } finally {
           clearTimeout(timer)
+          if (hardStop) clearTimeout(hardStop)
           // The progress monitor must die with the candidate on EVERY exit
           // path: after an abort or a followup failure the interval used to
           // keep ticking (each tick returned early on status, so it never
@@ -721,7 +868,7 @@ export class SelectionRunner {
           cand.toolCalls = r.toolCalls
           cand.execToolCalls = r.execToolCalls
           cand.trajectoryChars = r.totalChars
-          trajectories[cand.index] = r.text
+          trajectories[cand.index] = redact(r.text)
         } catch (error) { diag.warn('evidence.render', error, { selectionId: record.selectionId, candidate: cand.index }) }
         // Objective diff evidence (ruling I.5): the workspace's git surface is
         // the has-work gate's primary trust anchor. Best-effort; a non-git
@@ -732,10 +879,18 @@ export class SelectionRunner {
         // Full patch capture for the artifact pack — BEFORE any cleanup could
         // delete the worktree (loser disposal runs later).
         if (this.deps.diffFull) {
-          try { diffPatches[cand.index] = await this.deps.diffFull(cand.workspace) } catch (error) { diffPatches[cand.index] = null; diag.warn('evidence.diff', error, { selectionId: record.selectionId, candidate: cand.index }) }
+          try {
+            const full = await this.deps.diffFull(cand.workspace)
+            diffPatches[cand.index] = full ? { ...full, patch: redact(full.patch), untrackedFiles: full.untrackedFiles.map(redact) } : full
+          } catch (error) { diffPatches[cand.index] = null; diag.warn('evidence.diff', error, { selectionId: record.selectionId, candidate: cand.index }) }
         }
         publish()
       }))
+      // Every candidate has settled: no further samples are useful. Cancel the
+      // one possibly in flight and wait for the queue, so ranking starts on a
+      // pipe nothing else is using (review R4 4.6).
+      progressAbort.abort()
+      await progressChain
       if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted after candidate runs', false)
 
       record.stage = 'checks'
@@ -747,7 +902,8 @@ export class SelectionRunner {
       for (const cand of record.candidates) {
         if (cand.status !== 'finished') continue
         if (!input.checks || input.checks.length === 0) { cand.objectiveEvidence = 'none'; continue }
-        cand.checks = await runChecks(cand.workspace, input.checks, { signal: input.signal })
+        cand.checks = (await runChecks(cand.workspace, input.checks, { signal: input.signal, secretEnvNames: input.verifier.apiKeyEnv ? [input.verifier.apiKeyEnv] : [] }))
+          .map((check) => ({ ...check, outputTail: redact(check.outputTail) }))
         const failed = cand.checks.filter((c) => !c.ok)
         if (failed.length > 0 && failed.every((c) => c.harnessError)) {
           cand.checksInvalid = true
@@ -812,13 +968,27 @@ export class SelectionRunner {
           record.nComparisons = 0
           record.fallback = { index: sole.index, sessionId: sole.sessionId, workspace: sole.workspace }
         } else {
-          // Identical diff surfaces = zero search space: dedupe BEFORE paying
-          // the tournament (ruling F3). Applies only when git evidence exists
-          // for every survivor; otherwise the verifier decides.
-          const fingerprints = survivors.map((c) => c.diffStat?.fingerprint)
-          if (requiresWork
-            && fingerprints.every((fp) => typeof fp === 'string')
-            && new Set(fingerprints).size === 1) {
+          // Identical workspaces = no search space between them: dedupe BEFORE
+          // paying the tournament (ruling F3), per fingerprint rather than
+          // all-or-nothing (review R2 2.1). Two byte-identical twins among
+          // three survivors used to reach the verifier as a near-zero-margin
+          // top-2 and force an abstain on what is one solution. Empty diffs
+          // never dedupe: candidates that changed nothing differ only in their
+          // answers, which is exactly what the verifier compares.
+          if (requiresWork) {
+            const keptByFingerprint = new Map<string, CandidateRecord>()
+            for (const cand of survivors) {
+              const diff = cand.diffStat
+              if (!diff || (diff.files === 0 && diff.untracked === 0) || typeof diff.fingerprint !== 'string') continue
+              const kept = keptByFingerprint.get(diff.fingerprint)
+              if (!kept) { keptByFingerprint.set(diff.fingerprint, cand); continue }
+              cand.status = 'eliminated'
+              cand.eliminatedBy = [...(cand.eliminatedBy ?? []), 'duplicate-diff:c' + kept.index]
+              ;(record.dedupedCandidates ??= []).push(cand.index)
+            }
+            survivors = record.candidates.filter((c) => c.status === 'finished')
+          }
+          if (survivors.length === 1) {
             const kept = survivors[0]
             record.noSearchSpace = true
             record.outcome = 'single_candidate_fallback'
@@ -828,22 +998,20 @@ export class SelectionRunner {
             record.ranking = [kept.index]
             record.nComparisons = 0
             record.fallback = { index: kept.index, sessionId: kept.sessionId, workspace: kept.workspace }
-            record.note = 'all survivors produced identical diff surfaces; deduped before verifier (no-search-space)'
+            record.note = 'all survivors produced byte-identical workspaces; deduped before verifier (no-search-space)'
           } else {
             if (aborted) throw new BridgeError('bridge_aborted', 'selection aborted before verifier select', false)
-            // Ceiling matches host.ts MAX_SELECTION_TIMEOUT_MS (600s since
-            // 2026-09-05): max-effort verifiers need >300s for even two beats.
-            const rankingBudgetMs = Math.max(1, Math.min(600_000, Math.floor(input.selectTimeoutMs ?? 180_000)))
+            const rankingBudgetMs = Math.max(1, Math.min(SELECTION_TIMEOUT_MAX_MS, Math.floor(input.selectTimeoutMs ?? DEFAULT_SELECTION_TIMEOUT_MS)))
             const rankingDeadlineAt = now() + rankingBudgetMs
-            const nEvaluations = Math.max(1, Math.min(8, Math.floor(input.nEvaluations ?? 2)))
-            const pivots = Math.max(0, Math.min(survivors.length, Math.floor(input.pivots ?? 1)))
+            const nEvaluations = Math.max(1, Math.min(8, Math.floor(input.nEvaluations ?? DEFAULT_SELECTION_EVALUATIONS)))
+            const pivots = Math.max(0, Math.min(survivors.length, Math.floor(input.pivots ?? DEFAULT_SELECTION_PIVOTS)))
             let selectResult: BridgeSelectResult | null = null
             try {
               selectResult = await retryTransientBridge((attempt) => this.deps.bridge.select({
-                problem: input.problem,
+                problem: redact(input.problem),
                 candidates: survivors.map((c) => deterministicPreface(c, record.taskKind ?? input.taskKind) + '\n\n' + (trajectories[c.index] ?? '')),
-                criteria: input.criteria,
-                groundTruthNote: input.groundTruthNote ?? null,
+                criteria: redactCriteria(input.criteria),
+                groundTruthNote: input.groundTruthNote ? redact(input.groundTruthNote) : null,
                 nEvaluations,
                 pivots,
                 seed: input.algorithmSeed ?? 0,
@@ -878,25 +1046,11 @@ export class SelectionRunner {
               if (!survivors.every((c) => c.objectiveEvidence === 'pass')) throw bridgeFailure
               record.outcome = 'verifier_unavailable'
               diag.warn('verifier.unavailable', bridgeFailure, { selectionId: record.selectionId })
-              record.note = 'ranking failed after retries: ' + errText(bridgeFailure)
-              const passCounts = survivors.map((c) => (c.checks ?? []).filter((x) => x.ok).length)
-              if (new Set(passCounts).size === passCounts.length) {
-                // A strictly ordered deterministic signal exists: report it as
-                // an objective-only result, explicitly not a verifier ranking.
-                const ordered = [...survivors].sort((a, b) => {
-                  const pa = (a.checks ?? []).filter((x) => x.ok).length
-                  const pb = (b.checks ?? []).filter((x) => x.ok).length
-                  return pb - pa || a.index - b.index
-                })
-                const lead = ordered[0]
-                record.outcome = 'objective_only_result'
-                record.winnerBasis = 'objective-check-only'
-                record.ranking = ordered.map((c) => c.index)
-                record.scores = record.candidates.map(() => null)
-                record.nComparisons = 0
-                retainedIdx = lead.index
-                record.fallback = { index: lead.index, sessionId: lead.sessionId, workspace: lead.workspace }
-              }
+              record.note = 'ranking failed after retries: ' + failureText(bridgeFailure)
+              // No objective-only ordering exists here (review R2 2.3): this
+              // branch is reached only when EVERY survivor passed EVERY check,
+              // so pass counts are equal by construction. The former
+              // objective_only_result path was unreachable and never tested.
             }
             if (selectResult) {
               validateSelectionResult(selectResult, survivors.length)
@@ -911,6 +1065,18 @@ export class SelectionRunner {
               const criteriaCount = Array.isArray(input.criteria) ? input.criteria.length : Object.keys(input.criteria ?? {}).length
               record.criteriaCount = criteriaCount
               record.expectedVerifierCalls = selectResult.nComparisons * criteriaCount * nEvaluations
+              // The identity is exact on this path: on_error='raise' means every
+              // scheduled call succeeded, and USAGE counts successful responses
+              // only (429 retries happen inside one counted call).
+              const observedCalls = typeof selectResult.usage?.calls === 'number' ? selectResult.usage.calls : null
+              if (observedCalls !== record.expectedVerifierCalls) {
+                record.verifierCallsAnomaly = { expected: record.expectedVerifierCalls, observed: observedCalls }
+                diag.count('verifier.calls_identity_violated')
+              }
+              if (selectResult.extraction) {
+                record.scoreExtraction = selectResult.extraction
+                if (selectResult.extraction.default > 0) diag.count('verifier.score_defaulted')
+              }
               // Margin gate (ruling I.1/I.4, B-8): a verifier preference inside
               // the provisional calibrated noise band — exact ties included — abstains.
               // Evidence base (rounds 1-5, two model families): the measured
@@ -927,9 +1093,24 @@ export class SelectionRunner {
               record.marginThreshold = threshold
               record.marginProvisional = true
               record.marginCondition = input.verifier.model + '@' + (input.verifier.effort ?? 'default')
+              const calibration = lookupMarginCalibration({
+                verifier: record.marginCondition,
+                survivors: survivors.length,
+                criteria: criteriaCount,
+                evaluations: nEvaluations,
+                pivots,
+                // Runner inputs are always preface + real trajectory; the
+                // calibration harness feeds the sidecar synthetic fixtures.
+                inputs: 'production-trajectory',
+              }, input.uncalibratedMarginPolicy ?? 'flag', threshold)
+              record.marginCalibration = calibration
               if (margin < threshold) {
                 record.outcome = 'abstain'
                 record.note = 'top-2 margin ' + margin.toFixed(6) + ' inside provisional noise band < ' + threshold + ' (' + record.marginCondition + ')'
+              } else if (calibration.status === 'uncalibrated' && calibration.policy === 'abstain') {
+                calibration.forcedAbstain = true
+                record.outcome = 'abstain'
+                record.note = 'top-2 margin ' + margin.toFixed(6) + ' cleared ' + threshold + ' but the gate is not calibrated for this condition (' + describeMismatch(calibration) + '); policy abstain'
               } else {
                 record.outcome = 'ranked_winner'
                 record.winnerBasis = 'verifier'
@@ -979,7 +1160,7 @@ export class SelectionRunner {
     } catch (e) {
       const isAbort = aborted || (e instanceof BridgeError && e.code === 'bridge_aborted')
       record.status = isAbort ? 'aborted' : 'failed'
-      record.error = errText(e)
+      record.error = failureText(e)
       record.finishedAt = now()
       record.stage = 'settled'
       publish()

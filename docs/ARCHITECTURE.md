@@ -35,7 +35,7 @@ implementation code.
 | `src/config.ts` | Config schema, schema-derived defaults, validation, settings-source hooks, and config-owned policy primitives. No selection/runtime lifecycle dependency. |
 | `src/protocol.ts` | Canonical Host/client wire types, structural web transport types, API prefix, and model catalog. |
 | `src/util.ts` | Dependency-light boundary helpers: credentials, API-key resolution, base-URL normalization, and secret redaction. |
-| `src/ledger.ts` | Shared versioned JSONL reading/appending/compaction and same-directory atomic replacement. |
+| `src/ledger.ts` | Shared versioned JSONL reading/appending/compaction and same-directory atomic replacement; appends are fdatasync'd and torn-tail safe, replacements fsync before rename, newer-version rows survive compaction (power-loss semantics in the file header). |
 | `src/diagnostics.ts` | Bounded, redacted degradation ledger (warnings ring + counters). Every layer reports its best-effort failures here; the snapshot rides in `/state`. Leaf: imports only `util`. |
 | `src/dsh-context.ts` | Runtime-checked views of the DSH/cordis contexts the plugin is handed: the hook surface (`on`), an agent's scoped context (`get`, session append), and the one `create` call into the agent registry. Type predicates, no casts. Leaf: imports nothing. |
 | `src/payload.ts` | Checked readers for schemaless JSON (`read`, `readArray`, `readString`, `isRecord`) and the one declared session-event shape (`EventRecord`, `data?: unknown`) that evidence, coordinator, and selection trajectories share. Every read is total and returns `unknown`; no payload field is ever reached through `any`. Leaf: imports nothing. |
@@ -60,7 +60,7 @@ implementation code.
 | `src/selection/live.ts` | Live DSH candidate adapters and isolated Git-worktree management (prepare, remove, enumerate). |
 | `src/selection/proc.ts` | Bounded child-process runner shared by the Git helpers and the check harness: capped output (head or tail), timeout/abort with kill escalation, flush-bounded completion, spawn failure distinct from exit. Leaf: imports Node only. |
 | `src/selection/trajectory.ts` | Candidate trajectory rendering plus shared context/handoff bounding. The candidate runner depends here rather than back on autopilot orchestration. |
-| `src/selection/checks.ts` | Objective check execution and normalization. Resolves one shell per process from a platform chain (`pwsh`, then Windows PowerShell or `/bin/sh`); a shell that cannot start is a harness error, never evidence against a candidate. |
+| `src/selection/checks.ts` | Objective check execution and normalization. Resolves one shell per process from a platform chain (`pwsh`, then Windows PowerShell or `/bin/sh`); a shell that cannot start, a command it cannot parse (parse-only probe in a temp dir), or a leading program that does not resolve is a harness error, never evidence against a candidate; output text is never classified (review R2 2.2). |
 | `src/selection/bridge.ts` | Framed subprocess client for the Python verifier sidecar, and the only place a sidecar frame becomes a typed value: `parseHealthResult` / `parseSelectResult` / `parseProgressResult` / `parseErrorFrame` (malformed shape → `bridge_protocol`). |
 | `src/selection/retry.ts` | Bounded retry policy for transient bridge failures. |
 | `src/selection/probe.ts` | Availability/capability probing. |
@@ -71,7 +71,8 @@ implementation code.
 | Module | Responsibility |
 | --- | --- |
 | `src/client/index.ts` | UI, API calls, SSE refresh, and operator actions. Shared state/selection/model types come from `src/protocol.ts`; no duplicate handwritten wire models belong here. |
-| `tsdown.config.ts` | Browser bundle wrapper and external dependency policy. |
+| `scripts/client-bundle.mjs` | The one browser-bundle spec (entry, externals, DSH loader wrapper) shared by `tsdown.config.ts` and the `scripts/build.sh` esbuild fallback (review R6 6.2). |
+| `tsdown.config.ts` | CI/release client build; reads `scripts/client-bundle.mjs`. |
 
 ## 3. Dependency rules
 
@@ -182,7 +183,10 @@ boundary helper to `util.ts`, or a persistence primitive to `ledger.ts` rather
 than introducing a reciprocal import. `npm run check:architecture` parses the
 TypeScript module graph, rejects runtime **and type-only** cycles, enforces
 these layer restrictions, and rejects blind casts and explicit `any` (rule 11)
-in CI.
+in CI. A type-aware pass also counts assertions applied to `unknown`/`any`
+operands per file and compares them exactly with `scripts/untyped-casts.json`
+(review R6 6.4): a new site fails with its location; a removed one fails until
+the baseline is lowered (`npm run check:architecture -- --update-cast-baseline`).
 
 ## 4. Evidence boundary: verification is not selection
 
@@ -397,7 +401,12 @@ values do not. Resolve them at the last responsible moment through
 `resolveKey()`. Pass normalized provider URLs through `normalizeBaseUrl()` and
 sanitize operator-visible errors with `redactSecrets()`. Logs, API errors,
 records, audit packs, tests, and fixtures must contain neither live keys nor
-internal endpoint credentials. On the transport, every unexpected failure
+internal endpoint credentials. Candidate tools inherit the host environment, so the
+selection runner builds one redactor per run (`makeRedactor`: the verifier key
+plus the values of credential-named env vars, then the shared patterns) and
+passes every trajectory, check tail, patch, error, and the task text through it
+before anything reaches the verifier, the record, the audit pack, or the relay
+(review R5 5.1). On the transport, every unexpected failure
 leaves through one helper (`internalFailure`): a JSON 500 whose message is
 redacted and bounded. Routes answer with typed codes for expected conditions
 and never forward a raw `error.message`.
@@ -444,6 +453,7 @@ lock with `--force`:
 ```sh
 npm ci --force --ignore-scripts
 npm run check:architecture
+npm run check:contract
 npm run typecheck
 npm run build:host
 npm run build:client
@@ -457,6 +467,11 @@ What each gate covers:
 - `check:architecture`: parses project imports, enforces allowed layer
   directions, rejects runtime or type-only module cycles, and rejects blind
   casts (`as never`, `as unknown as`) and explicit `any` anywhere in `src/`.
+  It also runs the untyped-assertion ratchet described in §3.
+- `check:contract`: type-checks the plugin's hand-declared DSH agent views
+  (`scripts/contract/dsh-agent.contract.ts`) against the installed
+  `@deepseek-ai/dsh-agent` declarations. It is what gives that peer dependency
+  meaning, and what found the cause-less `cancel()` (review R6 6.6a).
 - `typecheck`: strict Host and client TypeScript checking without emit.
 - `build:host`: emits Node modules, source maps, and declarations to `lib/`.
 - `build:client`: bundles `src/client/index.ts` as the DSH browser module in
@@ -495,10 +510,21 @@ scripts/tests/
   process-checks.test.mjs    bounded process runner, check shell chain, portability
   diagnostics.test.mjs       degradation sink, redaction, /events, leaf boundary
   payload.test.mjs           checked JSON readers: total reads, array/string narrowing
+  trust-boundary.test.mjs    review R1: sandbox/approval defaults, egress, check env
+  selection-correctness.test.mjs  review R2: fingerprints, dedupe, winner gate
+  evidence-validity.test.mjs review R3: inherited state, adoption, calibration registry
+  lifecycle.test.mjs         review R4: relay consumption, seed snapshot, process groups
+  egress-persistence.test.mjs review R5: redaction exits, ledger durability, protocol
+  build-contract.test.mjs    review R6: one build, DSH cancel contract, defaults, /select numbers
+  coverage-gaps.test.mjs     review R6: child setup injection, retry abort, Windows paths, autocrlf
+  product-defaults.test.mjs  review R7: opt-in defaults, auto admission profile, per-turn spend
+  doc-truth.test.mjs         review R7: generated README defaults, authoritative-doc drift lint
+  p1-metrics.test.mjs        review R7: preregistered P1 metrics and decision rules (eval/p1)
   helpers/                   harness (timing, rejection collector), provider (mocked
                              verifier), host (fake DSH context), selection (fake
                              factories/bridges, real workspaces), sidecar, git
   fixtures/stub_sidecar.py   protocol-conformant stub sidecar (answers from the fixtures)
+  fixtures/admission-corpus.mjs  labelled first messages for the admission profile
 ```
 
 Helpers are plain functions with no registration side effects, with two
@@ -521,10 +547,18 @@ A protocol change is therefore made in the fixture and the document first, and
 each side of the pipe fails until it follows.
 
 Some regression fixtures invoke PowerShell and require `pwsh`. Run the complete
-suite on the Ubuntu CI image when a local environment lacks it. The historical
-`scripts/build.sh` remains the installed DSH packaging path and may depend on
-host-specific dependency locations; use `build:host` plus `build:client` for a
-portable repository build.
+suite in CI when a local environment lacks it: the `test` job (Ubuntu, gating)
+and the `test-windows` job (`windows-latest`, pwsh, Git for Windows defaults;
+observational until it has stayed green, see
+`docs/reviews/R6-ARCHITECTURE-BUILD.md` §6).
+
+There is one build (review R6 6.2). `scripts/build.sh` runs exactly
+`build:host` + `build:client` whenever the lockfile toolchain is installed, so
+a release ships what CI tested. Only a machine without `node_modules` (the
+installed-DSH operator setup) takes its fallback, which links the host's
+runtime packages, never replaces npm-installed ones, and bundles the client
+with esbuild from the same `scripts/client-bundle.mjs`. CI exercises that
+fallback with `DSH_BUILD_FORCE_INSTALLED=1`.
 
 Generated `lib/`, `node_modules/`, Python bytecode/cache directories, `.data/`,
 selection workspaces, and transient sidecar output are not source artifacts and
@@ -552,6 +586,7 @@ must remain untracked.
 | Browser presentation only | `src/client/index.ts` | Client build; no server-domain import |
 | Public package surface | `src/index.ts` | Declaration build and compatibility review |
 | Build or dependency policy | `package.json`, lockfile, CI | Architecture/README when workflow changes |
+| Config default, range, or new key | `src/config.ts`, then `npm run docs:facts` (a new key also needs a line in `NOTES` in `scripts/doc-facts.mjs`) | README generated block (`doc-truth` fails while stale); `product-defaults` for the spending switches |
 
 Before merging, inspect `git status --short` and the staged file list. A normal
 architecture change must not include secrets, internal addresses, `.data`,

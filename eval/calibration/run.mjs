@@ -1,46 +1,49 @@
 /**
  * Margin calibration driver (ruling I.4 / plan P-A).
  *
- * Round 2: C0 fans out over five different trajectory fixtures; C1 and C2 each
- * run three oracle-known pairs in both orders. Every call is logged to
- * .data/calibration/<condition>.jsonl; the summary compares the current q95
- * against the previous saved summary for the same condition when one exists,
- * because the threshold may only leave "provisional" once two independent
- * rounds agree within 20% (ruling I.4 acceptance).
+ * C0 fans out over five different trajectory fixtures (self-comparison, the
+ * null hypothesis); C1 and C2 each run three oracle-known pairs in both
+ * orders. Every call is logged to .data/calibration/<condition>.jsonl and one
+ * summary per round is written next to it. Graduation is judged offline by
+ * eval/calibration/graduate.mjs against docs/MARGIN-GRADUATION-INVOICE.md
+ * (cumulative C0 frames, per-round max, days, bias); the old "two rounds'
+ * q95 within 20%" rule was retired there and is no longer computed here.
+ *
+ * Measured condition: verifier model@effort, N=2, C=1 (task_fidelity), K=1,
+ * P=0, synthetic short fixtures. That is exactly one entry shape of
+ * src/selection/calibration.ts; production runs differ at least in inputs.
  *
  *   node eval/calibration/run.mjs
- *   env knobs: CAL_MODEL, CAL_EFFORT (default low), KIMI_BASE_URL, CAL_LABEL
+ *   env knobs: CAL_MODEL (default kimi-k3), CAL_EFFORT (default low),
+ *   CAL_C0_REPS, CAL_C3_REPS (default 0: C3 off), CAL_LABEL,
+ *   KIMI_BASE_URL (default: the plugin's baseURL),
+ *   KIMI_API_KEY or DSH_CREDENTIALS (default ~/.dsh/.credentials.yaml)
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync } from "node:fs"
+import { mkdirSync, readFileSync, readdirSync, writeFileSync, appendFileSync } from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { VerifierBridge } from "../../lib/selection/bridge.js"
 import { defaultPythonPath, defaultSidecarPath } from "../../lib/selection/host.js"
+import { marginConditionKey } from "../../lib/selection/calibration.js"
+import { resolveSecret, verifierBaseURL } from "../lib/env.mjs"
+import { estimateSigmaGamma } from "./null-model.mjs"
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..")
 const outDir = path.join(repoRoot, ".data", "calibration")
 mkdirSync(outDir, { recursive: true })
 
-const model = process.env.CAL_MODEL ?? "minimaxai/minimax-m3"
+// kimi-k3@low is the only condition accruing graduation evidence (the
+// minimax-m3 round-1 numbers were voided).
+const model = process.env.CAL_MODEL ?? "kimi-k3"
 const effort = process.env.CAL_EFFORT ?? "low"
-const baseURL = process.env.KIMI_BASE_URL ?? "https://chat.holisthoom.top/v1"
+const baseURL = verifierBaseURL()
 const condition = `${model.replace(/[^\w.\-]+/g, "_")}@${effort}`
 const label = process.env.CAL_LABEL ?? new Date().toISOString().replace(/[:.]/g, "-")
 // Reps per fixture; 8 yields ~40 C0 frames, 12 yields 60. Tail quantiles need
 // the larger batch before the graduation criterion can be judged.
 const c0Reps = Math.max(2, Math.floor(Number(process.env.CAL_C0_REPS ?? 8)))
 
-function resolveApiKey() {
-  if (process.env.KIMI_API_KEY) return process.env.KIMI_API_KEY
-  const credPath = process.env.DSH_CREDENTIALS ?? "C:/Users/Admin/.dsh/.credentials.yaml"
-  if (existsSync(credPath)) {
-    const text = readFileSync(credPath, "utf8")
-    const m = /KIMI_API_KEY["']?\s*[:=]\s*["']?([^\s"']+)/.exec(text)
-    if (m) return m[1]
-  }
-  throw new Error("KIMI_API_KEY not found in env or " + credPath)
-}
-const apiKey = resolveApiKey()
+const apiKey = resolveSecret("KIMI_API_KEY")
 
 // ---- C0 fixtures: five DIFFERENT realistic completed-task trajectories -----
 
@@ -159,6 +162,51 @@ const C2_PAIRS = [
 
 const CRITERIA = { task_fidelity: "The candidate satisfies the actual request and provides concrete tool/test evidence for its claims. Unsupported claims and missing evidence lose." }
 
+// C3 (review R3 3.2, opt-in via CAL_C3_REPS): two DIFFERENT texts with the
+// same evidence and outcome (a paraphrase that keeps every tool call and
+// result). C0 compares a text with itself, so its (A,B) and (B,A) prompts are
+// the same prompt and it cannot see order effects between different texts;
+// C3 can. Its excess spread over C0 bounds the "order quirk" term sigmaGamma
+// of eval/calibration/null-model.mjs (upper bound: any residual quality
+// difference between the paraphrases is folded in).
+const C3_PAIRS = [
+  [
+    F1,
+    [
+      "[E01] USER: Add addMoney(a, b) in cents to utils.js and run the existing test suite.",
+      "[E02] ASSISTANT: Implementing addMoney now; I will confirm with the existing tests.",
+      '[E03] TOOL CALL edit: {"file_path": "utils.js", ...}',
+      "[E04] TOOL RESULT: utils.js updated (12 insertions)",
+      '[E05] TOOL CALL pwsh: {"command": "node --test"}',
+      "[E06] TOOL RESULT: # pass 8 # fail 0",
+      "[E07] ASSISTANT: Done: addMoney works in integer cents, and all 8 existing tests pass.",
+    ].join("\n"),
+  ],
+  [
+    F2,
+    [
+      "[E01] USER: Read package.json and tell me the package name and its test script.",
+      '[E02] TOOL CALL read: {"file_path": "package.json"}',
+      '[E03] TOOL RESULT: {"name": "acme-widgets", "scripts": {"test": "node --test"}}',
+      '[E04] ASSISTANT: Its test script is `node --test`, and the package name is "acme-widgets".',
+    ].join("\n"),
+  ],
+  [
+    F4,
+    [
+      "[E01] USER: Investigate why summary.json was empty yesterday and summarize the cause.",
+      '[E02] TOOL CALL pwsh: {"command": "Get-Content summary.json"}',
+      "[E03] TOOL RESULT: (0 bytes)",
+      '[E04] TOOL CALL pwsh: {"command": "Get-Item summary.json | Select LastWriteTime"}',
+      "[E05] TOOL RESULT: LastWriteTime 2026-09-03 23:59:58",
+      '[E06] TOOL CALL pwsh: {"command": "Get-EventLog -LogName Application -Newest 3"}',
+      "[E07] TOOL RESULT: AcmeWriter E1005 disk full at 23:59:58",
+      "[E08] ASSISTANT: Event log entry E1005 shows AcmeWriter ran out of disk at 23:59:58, which is why summary.json was left empty.",
+    ].join("\n"),
+  ],
+]
+const c3Reps = Math.max(0, Math.floor(Number(process.env.CAL_C3_REPS ?? 0)))
+
 // ---- driver -----------------------------------------------------------------
 
 const bridge = new VerifierBridge({ pythonPath: defaultPythonPath(), scriptPath: defaultSidecarPath() })
@@ -241,6 +289,16 @@ async function main() {
     }
   }
 
+  // C3: equal-evidence paraphrase pairs, both orders (opt-in).
+  for (let p = 0; p < (c3Reps > 0 ? C3_PAIRS.length : 0); p += 1) {
+    for (let rep = 0; rep < c3Reps; rep += 1) {
+      await oneCall("C3", "pair" + p, "AB", C3_PAIRS[p][0], C3_PAIRS[p][1], 0, rep)
+      await sleep(800)
+      await oneCall("C3", "pair" + p, "BA", C3_PAIRS[p][1], C3_PAIRS[p][0], 0, rep)
+      await sleep(800)
+    }
+  }
+
   // ---- summary ---------------------------------------------------------------
   const okRows = rows.filter((r) => !r.error)
   const quantile = (xs, q) => {
@@ -268,30 +326,45 @@ async function main() {
   const c2 = okRows.filter((r) => r.group === "C2")
   const c2Correct = c2.filter((r) => (r.order === "AB" ? r.scores[0] > r.scores[1] : r.scores[1] > r.scores[0]))
 
+  // sigmaGamma bound (estimator validated in scripts/tests against the null
+  // model): signed margin = score of the first listed text minus the second.
+  const c3Summary = () => {
+    const signed = (r) => (r.order === "AB" ? 1 : -1) * (r.scores[0] - r.scores[1])
+    const c0Signed = okRows.filter((r) => r.group === "C0").map((r) => r.scores[0] - r.scores[1])
+    const perPairRows = C3_PAIRS.map((_, p) => okRows.filter((r) => r.group === "C3" && r.fixture === "pair" + p))
+    return {
+      perPair: perPairRows.map((list, p) => ({ pair: "pair" + p, n: list.length, meanSigned: list.length ? list.map(signed).reduce((a, b) => a + b, 0) / list.length : null, marginMax: list.length ? Math.max(...list.map((r) => r.margin)) : null })),
+      ...estimateSigmaGamma(c0Signed, perPairRows.map((list) => list.map(signed))),
+      falseWinnerCheck: "node eval/calibration/null-model.mjs",
+    }
+  }
   const summary = {
     condition, label, model, effort, baseURL: new URL(baseURL).host,
+    conditionKey: marginConditionKey({ verifier: model + "@" + effort, survivors: 2, criteria: Object.keys(CRITERIA).length, evaluations: 1, pivots: 0, inputs: "synthetic-short" }),
     startedAt: new Date(startedAt).toISOString(),
     finishedAt: new Date().toISOString(),
     calls: rows.length, failures,
     c0: groupStats("C0"),
     c1: { ...groupStats("C1"), correctDirection: `${c1Correct.length}/${c1.length}` },
     c2: { ...groupStats("C2"), correctDirection: `${c2Correct.length}/${c2.length}` },
+    ...(c3Reps > 0 ? { c3: c3Summary() } : {}),
     perFixtureC0: Object.fromEntries(C0_FIXTURES.map((_, f) => ["F" + (f + 1), (() => { const l = okRows.filter((r) => r.group === "C0" && r.fixture === "F" + (f + 1)); return { n: l.length, q95: quantile(l.map((r) => r.margin), 0.95), max: l.length ? Math.max(...l.map((r) => r.margin)) : null } })()])),
   }
 
-  // Cross-round stability: the threshold may only leave "provisional" when two
-  // rounds of the same condition agree within 20% on the C0 q95.
+  // Cross-round context only (the invoice's per-round ceiling is C0 max <=
+  // 0.02). q95 at n=40..100 is a tail order statistic and swung 59-311%
+  // between rounds, which is why the 20% q95 agreement rule was retired.
   const previousSummaries = readdirSync(outDir)
     .filter((f) => f.startsWith(condition + ".summary.") && f.endsWith(".json"))
     .map((f) => { try { return JSON.parse(readFileSync(path.join(outDir, f), "utf8")) } catch { return null } })
     .filter(Boolean)
-  const previousC0 = previousSummaries
-    .map((s) => s?.c0?.marginQ95 ?? s?.groups?.C0?.marginQ95)
-    .filter((v) => typeof v === "number")
-  if (previousC0.length > 0 && summary.c0.marginQ95 !== null) {
-    const prev = previousC0[previousC0.length - 1]
-    const rel = prev > 0 ? Math.abs(summary.c0.marginQ95 - prev) / prev : null
-    summary.crossRound = { previousQ95: prev, thisQ95: summary.c0.marginQ95, relativeDiff: rel, stableUnder20Percent: rel !== null && rel < 0.2 }
+  const previousMax = previousSummaries.map((s) => s?.c0?.marginMax).filter((v) => typeof v === "number")
+  summary.crossRound = {
+    previousRounds: previousSummaries.length,
+    previousMaxes: previousMax,
+    thisMax: summary.c0.marginMax,
+    withinPerRoundCeiling: summary.c0.marginMax !== null && summary.c0.marginMax <= 0.02,
+    judge: "node eval/calibration/graduate.mjs " + condition,
   }
 
   writeFileSync(path.join(outDir, `${condition}.summary.${label}.json`), JSON.stringify(summary, null, 2) + "\n")

@@ -21,7 +21,7 @@
  * Dependency-light by design: only `util.ts` (redaction) may be imported.
  */
 
-import { redactSecrets } from './util.js'
+import { redactWithEnvSecrets } from './util.js'
 
 export const DIAGNOSTICS_LIMIT = 200
 /** No single scope may hold more than this share of the ring: a flapping
@@ -87,7 +87,7 @@ export class Diagnostics {
   /** Record a degradation the caller decided to survive. Never throws. */
   warn(scope: string, cause: unknown, detail?: DiagnosticDetail): void {
     try {
-      const message = redactSecrets(describeCause(cause)).slice(0, MESSAGE_LIMIT)
+      const message = redactWithEnvSecrets(describeCause(cause)).slice(0, MESSAGE_LIMIT)
       const cleanDetail = this.cleanDetail(detail)
       const at = this.now()
       const newest = this.entries[0]
@@ -141,7 +141,7 @@ export class Diagnostics {
     const out: Record<string, string | number | boolean> = {}
     for (const [key, value] of Object.entries(detail)) {
       if (value === null || value === undefined) continue
-      out[key] = typeof value === 'string' ? redactSecrets(value).slice(0, DETAIL_LIMIT) : value
+      out[key] = typeof value === 'string' ? redactWithEnvSecrets(value).slice(0, DETAIL_LIMIT) : value
     }
     return Object.keys(out).length > 0 ? out : undefined
   }

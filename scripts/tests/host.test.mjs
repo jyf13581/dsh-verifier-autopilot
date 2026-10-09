@@ -543,7 +543,13 @@ test("phase2: persistence is opt-in — embedded/test hosts without recordsFile 
   const { VerifierHost } = await import("../../lib/index.js")
   const fs = await import("node:fs")
   const os = await import("node:os")
-  const before = fs.readdirSync(os.tmpdir()).filter(name => name.startsWith("dsh-va-")).length
+  // os.tmpdir() is shared with test files running in parallel: gitDiffFull's
+  // scratch index (dsh-va-index-*) and workspaces.test.mjs temp dirs
+  // (dsh-va-difffull-*) come and go there. Only a new name that is neither can
+  // be a leaked records file (CI flake on 6bdd021).
+  const transient = (name) => name.startsWith("dsh-va-index-") || name.startsWith("dsh-va-difffull-")
+  const ours = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith("dsh-va-") && !transient(name))
+  const before = new Set(ours())
   const server = mockLaneServer()
   try {
     server.enqueueBody(laneSuccessBody())
@@ -554,8 +560,8 @@ test("phase2: persistence is opt-in — embedded/test hosts without recordsFile 
     ctx.emit("agent/created", { agent })
     fireIdle(agent)
     await quiesce(40)
-    const after = fs.readdirSync(os.tmpdir()).filter(name => name.startsWith("dsh-va-")).length
-    assert.equal(after, before, "no records file appears without explicit recordsFile")
+    const appeared = ours().filter(name => !before.has(name))
+    assert.deepEqual(appeared, [], "no records file appears without explicit recordsFile")
     assert.equal(host.snapshot().records.length, 1, "in-memory behavior unchanged")
   } finally { server.restore() }
 })

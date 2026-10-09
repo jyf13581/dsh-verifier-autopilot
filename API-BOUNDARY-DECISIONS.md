@@ -31,7 +31,10 @@ Autopilot does not call HTTP POST /select. It calls the same SelectionHost inter
 
 ## Authentication and Admission
 
-- If DSH_VA_API_TOKEN is set, provider-spending and mutating POST requests require Authorization: Bearer <token>. The token is optional in the current local deployment.
+- If DSH_VA_API_TOKEN is set, provider-spending and mutating POST requests require Authorization: Bearer <token>. The token is optional in the current local deployment. The panel prompts for it on the first 403 and keeps it in that browser's localStorage (review R1 1.3).
+- Every POST route shares one admission gate: authorization, then `Sec-Fetch-Site: cross-site` → 403 `cross-site-request`, then a non-JSON content type → 415 `json-required`. No POST route can be driven as a cross-site simple request (review R1 1.6).
+- Privileged config fields over HTTP (review R1 1.4/1.5): `selectionPostAuditTestCommand` (non-empty) and any `baseURL`/`apiKeyEnv` tuple outside the shipped endpoint presets fail with 403 `privileged-config-field:*` unless DSH_VA_API_TOKEN is configured and presented. The DSH settings service remains the trusted channel for these fields.
+- Manual /select validates `sourceCwd` (existing absolute directory), `agentPreset`, `groundTruthNote`, `algorithmSeed`, `candidateProvider`/`candidateModel`, check `timeoutMs`, and criteria size (≤ 8 entries) before admission (review R1 1.7).
 - One selection may be active per Host. A concurrent start fails with selection-busy (429).
 - /select uses a sliding-window 12 admitted starts/hour limiter. Busy, malformed route, missing credential, and other pre-admission failures do not consume a start.
 - Manual /select rejects the internal orchestration fields trigger, policy, and taskKind (`reserved-selection-field`); callers cannot opt into autopilot sandbox or retention/relay behavior.
@@ -45,7 +48,8 @@ Autopilot does not call HTTP POST /select. It calls the same SelectionHost inter
 - The bridge starts the Python child with only the selected key copied into the child environment under apiKeyEnv.
 - JSONL frames carry model, base_url, and api_key_env name, never the key value.
 - Sidecar stderr is diagnostics-only; full trajectories and keys must not be logged.
-- Endpoint validation and egress redaction remain part of the legacy and selector boundary. This local plugin does not implement an allowed-host list or multi-user source authorization.
+- Endpoint validation and egress redaction remain part of the legacy and selector boundary. Unauthenticated HTTP callers are limited to the shipped endpoint tuples (see above); the settings service and token-authorized callers may configure any http(s) endpoint. There is no multi-user source authorization.
+- Objective checks and the post-audit command run with credential-shaped environment variables (`*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `*_CREDENTIALS`, `*_AUTH*`) and the configured `apiKeyEnv` withheld (review R1 1.2). Candidate agents themselves run inside the DSH runtime and inherit its environment; see docs/reviews/R1-TRUST-BOUNDARY.md for that residual risk.
 
 ## Selection Boundary
 
@@ -73,7 +77,7 @@ The bridge is lazy and long-lived: it starts on first request, restarts after re
 - Manual diagnostics may run in a fresh empty non-Git workspace, but that mode does not mirror source files and must not be presented as autopilot fidelity.
 - Candidate workspaces never share one mutable cwd. Git worktree preparation is sequential; child rollouts are parallel.
 - Unknown ignored source/config input, path escape, unsafe symlink, or special untracked file fails strict snapshot.
-- Objective checks run caller-supplied pwsh in the candidate cwd. They are not a command allowlist sandbox; commands must remain self-contained and candidate-local.
+- Objective checks run caller-supplied commands through the check-shell chain (pwsh when installed, else Windows PowerShell or /bin/sh) in the candidate cwd, with credential variables withheld. They are not a command allowlist sandbox; commands must remain self-contained and candidate-local.
 
 ## Result and Ranking Boundary
 
