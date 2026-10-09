@@ -10,12 +10,11 @@
 import { cp, lstat, mkdir, readdir, readFile, readlink, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import os from 'node:os'
 import path from 'node:path'
 import type { CandidateFactory, CandidateSpec, DiffStatLite, SelectionAgentHandle, WorkspaceManager } from './candidates.js'
 import type { TrajectoryEvent } from './trajectory.js'
-import { runProcess } from './proc.js'
+import { runProcess, runProcessCapture } from './proc.js'
 import { isAgentScope, type AgentCreate } from '../dsh-context.js'
 
 interface LiveAgentLike {
@@ -112,7 +111,12 @@ export async function resolveAutopilotSourceCwd(task: string, sessionCwd: string
 
 interface CaptureResult { code: number; out: Buffer; error: string; truncated: boolean }
 
-function execCapture(
+/** Byte-exact git plumbing call on the shared spawn core (review R4 4.7):
+ *  same kill escalation, process-group reclamation, flush grace, and EPIPE
+ *  containment as every other child. `code` is -2 when stdout exceeded
+ *  `maxOutputBytes` (the child was stopped), -1 when there is no honest exit
+ *  code (spawn failure, timeout, abort). */
+async function execCapture(
   cmd: string,
   args: string[],
   cwd?: string,
@@ -120,35 +124,11 @@ function execCapture(
   maxOutputBytes = 8 * 1024 * 1024,
   input?: Buffer,
 ): Promise<CaptureResult> {
-  return new Promise((resolve) => {
-    const chunks: Buffer[] = []
-    let total = 0
-    let error = ''
-    let truncated = false
-    let settled = false
-    const child = spawn(cmd, args, { cwd, windowsHide: true })
-    const finish = (code: number) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve({ code, out: Buffer.concat(chunks), error, truncated })
-    }
-    child.stdout?.on('data', (value: Buffer | string) => {
-      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value)
-      total += chunk.length
-      if (total > maxOutputBytes) {
-        truncated = true
-        try { child.kill() } catch { /* gone */ }
-        return
-      }
-      chunks.push(chunk)
-    })
-    child.stderr?.on('data', (value: Buffer | string) => { error = (error + String(value)).slice(-4000) })
-    child.on('error', () => finish(-1))
-    child.on('close', (code) => finish(truncated ? -2 : (code ?? -1)))
-    const timer = setTimeout(() => { error = (error + ' command timed out').trim(); try { child.kill() } catch { /* gone */ } }, timeoutMs)
-    child.stdin?.end(input)
-  })
+  const result = await runProcessCapture(cmd, args, { cwd, timeoutMs, maxOutputBytes, input })
+  const truncated = result.end === 'overflow'
+  const code = truncated ? -2 : result.end === 'exit' ? (result.code ?? -1) : -1
+  const error = result.end === 'timeout' ? (result.error + ' command timed out').trim() : result.error
+  return { code, out: result.out, error, truncated }
 }
 
 const ALLOWED_IGNORED_SNAPSHOT_PREFIXES = ['node_modules/', 'lib/', '.data/', 'eval/results/']

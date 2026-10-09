@@ -32,7 +32,18 @@ import { adoptionOf, gitDiffStat, gitRepoState, resolveAutopilotSourceCwd } from
 import { createModelProber, type ModelProber } from './selection/probe.js'
 
 export type { Credentials } from './util.js'
-export type Agent = { id: string; session: { events: readonly EventRecord[]; header?: { cwd?: string; parentSession?: string } }; ctx: Context; followup: (message: UserMessage) => void | Promise<void> }
+export type Agent = {
+  id: string
+  session: { events: readonly EventRecord[]; header?: { cwd?: string; parentSession?: string } }
+  ctx: Context
+  followup: (message: UserMessage) => void | Promise<void>
+  /** DSH mirrors every `agent/status` transition here; optional so embedded
+   *  hosts and older runtimes without it keep the idle-trigger behavior. */
+  readonly status?: string
+  /** DSH's pending-input projection (review R4 4.1): a relay still listed
+   *  here has not been consumed by any turn yet. */
+  readonly inbox?: { readonly nextTurn?: readonly { id?: unknown }[]; readonly nextStep?: readonly { id?: unknown }[] }
+}
 export type { WebRoute } from './protocol.js'
 /** What the plugin needs from DSH's agent registry: enumeration and lookup
  *  of live agents (legacy verification) plus child creation (best-of-N
@@ -158,6 +169,10 @@ export class VerifierHost {
    *  two passes raced the same post-audit (running the configured test command
    *  twice in the user's repository) and the same worktree removal. */
   private readonly autopilotCleanupInFlight = new Map<string, { promise: Promise<void>; rerun: boolean }>()
+  /** Review R4 4.1: the DSH message id of each selection's relay, so cleanup
+   *  can tell whether a turn has consumed it yet. In memory only; a reload
+   *  re-relays (recoverAutopilotRelays) and records the new id. */
+  private readonly relayMessageIds = new Map<string, string>()
 
   /** Candidate-model liveness prober, memoized per (baseURL, key) pair so
    *  config churn never keeps a stale credential around. */
@@ -368,10 +383,7 @@ export class VerifierHost {
         // Ledger + artifact must see relayedAt now, not at some later discard:
         // a hot reload between relay and cleanup would otherwise erase the mark.
         this.selections.pubRecord(record)
-        void Promise.resolve(agent.followup(createUserMessage({
-          source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
-          content: [{ type: 'text', text: buildAutopilotRelay(record) }],
-        }))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId }))
+        void Promise.resolve(agent.followup(this.relayMessage(record))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId }))
       }).catch((error: unknown) => {
         const current = this.autopilotActive.get(sourceId)
         current?.delete(selectionId as string)
@@ -414,6 +426,31 @@ export class VerifierHost {
     return entry.promise
   }
 
+  /** The relay followup, with its message id remembered for cleanup gating. */
+  private relayMessage(record: SelectionRecord): UserMessage {
+    const message = createUserMessage({
+      source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
+      content: [{ type: 'text', text: buildAutopilotRelay(record) }],
+    })
+    if (typeof message.id === 'string') this.relayMessageIds.set(record.selectionId, message.id)
+    return message
+  }
+
+  /** Review R4 4.1: a retained winner may be audited and removed only once
+   *  the turn that reads its relay has finished. A cleanup trigger is just an
+   *  idle that happened at some point; by the time a coalesced re-run or a
+   *  cancel-convergence idle reaches a slot, the relay may still be queued or
+   *  its turn may be running. So decide from the agent's state NOW: the
+   *  source must not be running and the relay must no longer be pending in
+   *  its inbox (consumed, or discarded by a cancel — either way final). */
+  private relayStillOutstanding(agent: Agent, selectionId: string): boolean {
+    if (agent.status === 'running') return true
+    const relayId = this.relayMessageIds.get(selectionId)
+    if (!relayId || !agent.inbox) return false
+    const queued = [...(agent.inbox.nextTurn ?? []), ...(agent.inbox.nextStep ?? [])]
+    return queued.some((message) => message?.id === relayId)
+  }
+
   /** Review R3 3.3: capture what the delivery audit is compared against —
    *  source HEAD, a content fingerprint of its worktree, and which of the
    *  retained candidate's own files the source already contains. */
@@ -441,7 +478,19 @@ export class VerifierHost {
   private async cleanupAutopilotWinnersOnce(sourceSessionId: string): Promise<void> {
     const pending = this.autopilotCleanup.get(sourceSessionId)
     if (!pending) return
+    // A source that is gone (agent/disposed, host dispose) can never read the
+    // relay: everything it retains is cleaned unconditionally.
+    // Read the agent's state after the triggering emit has fully returned:
+    // the runtime documents `status` as mirrored on each transition but not
+    // whether the mirror is written before or after the event fires.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const live = this.disposed ? undefined : this.agents.get(sourceSessionId)
     for (const selectionId of [...pending]) {
+      if (live && this.relayStillOutstanding(live, selectionId)) {
+        // The next idle after the relay turn retries; the slot stays retained.
+        this.diagnostics.count('autopilot.cleanup_deferred')
+        continue
+      }
       try {
         // G-4 post-audit BEFORE discard: compare the source repo state against
         // the start-time snapshot. Audited-but-unevidenced integration reports
@@ -528,7 +577,10 @@ export class VerifierHost {
         const removed = await this.selections.discardWinner(selectionId)
         const after = this.selections.getSelection(selectionId)
         const slotAfter = after ? (after.winner ?? after.fallback) : undefined
-        if (removed || !slotAfter || slotAfter.discardedAt !== undefined) pending.delete(selectionId)
+        if (removed || !slotAfter || slotAfter.discardedAt !== undefined) {
+          pending.delete(selectionId)
+          this.relayMessageIds.delete(selectionId)
+        }
       } catch (error) {
         // Keep it queued for the next idle/dispose retry — visibly.
         this.diagnostics.warn('autopilot.cleanup', error, { selectionId })
@@ -608,10 +660,7 @@ export class VerifierHost {
       record.timing = { ...(record.timing ?? {}), relayedAt: Date.now() }
       this.selections.pubRecord(record)
       this.diagnostics.count('autopilot.relay_recovered')
-      void Promise.resolve(agent.followup(createUserMessage({
-        source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
-        content: [{ type: 'text', text: buildAutopilotRelay(record) }],
-      }))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId: record.selectionId, recovered: true }))
+      void Promise.resolve(agent.followup(this.relayMessage(record))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId: record.selectionId, recovered: true }))
     }
   }
 

@@ -264,10 +264,13 @@ async function runOne(cwd: string, check: ObjectiveCheck, shell: CheckShell, opt
       shell: shell.name,
     }
   }
-  // kill() terminates the shell only; grandchildren spawned INSIDE the check
-  // command survive a timeout on Windows (no job-object kill here). Accepted
-  // boundary — keep check commands self-contained in the candidate workspace.
+  // Review R4 4.4: on POSIX the check runs in its own process group; a
+  // timeout or abort kills the whole group, and reapGroup also kills anything
+  // the command left running after it exited (a server started with `&`).
+  // Windows: taskkill /T reaches the tree only while the shell is alive;
+  // processes it orphaned before exiting survive (no job objects here).
   const result = await runProcess(shell.file, [...shell.args, check.command], {
+    reapGroup: true,
     cwd,
     env: scrubSecretEnv(options.secretEnvNames),
     timeoutMs: check.timeoutMs ?? options.defaultTimeoutMs ?? 60000,
