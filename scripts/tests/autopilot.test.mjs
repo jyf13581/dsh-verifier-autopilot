@@ -349,6 +349,10 @@ test("autopilot cleanup: idle, a second idle, and agent/disposed racing on one s
     fireIdle(source)
     fireIdle(source)
     ctx.emit("agent/disposed", { agent: source })
+    // The removal follows the delivery audit, which runs real git processes:
+    // wait for it to start rather than assuming git finishes inside a fixed
+    // sleep (CI flake on e9197ca), then give any duplicate the same window.
+    await waitFor(() => removed.length > 0)
     await quiesce(40)
     assert.deepEqual(removed, [winnerWs], "three triggers, one in-flight removal")
     assert.equal(discardCalls, 1, "the post-audit + discard pass runs once; later triggers join it")
