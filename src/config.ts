@@ -97,7 +97,13 @@ export interface Config {
 }
 
 export const Config = z.object({
-  enabled: z.boolean().default(true),
+  // Review R7 (owner decision, 2026-10-09): both spending paths are opt-in.
+  // The five-lane idle verifier made 5 calls per gated turn whose result
+  // reached no agent while autoFeedback stays off, and autopilot admitted pure
+  // questions and trivial edits (2 full rollouts + 6 ranking calls each) with
+  // no measured quality gain yet. docs/reviews/R7-DOCS-PRODUCT-DIRECTION.md
+  // names the fixed-set evidence that would justify turning either back on.
+  enabled: z.boolean().default(false),
   // Feedback is opt-in by default: verifier findings are often useful only
   // after they point to independent tool evidence, while an unsolicited
   // follow-up can interrupt a perfectly good source turn.
@@ -124,7 +130,7 @@ export const Config = z.object({
   divergenceGuardMedian: z.number().min(0).max(1).default(0.75),
   skipStatusContinuation: z.boolean().default(true),
   selectionNotify: z.boolean().default(true),
-  selectionMode: z.union(['off', 'auto', 'always']).default('auto'),
+  selectionMode: z.union(['off', 'auto', 'always']).default('off'),
   selectionModelStrategy: z.union(['quality-first', 'exploration']).default('quality-first'),
   selectionProvider: z.string().default('kimi'),
   // Default candidate route: strictly protocol-proven and ~6s per call, so the

@@ -247,7 +247,7 @@ function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsSco
   }
 
   const config = hostState?.config
-  const mode = config?.selectionMode ?? 'auto'
+  const mode = config?.selectionMode ?? 'off'
   const modelStrategy = config?.selectionModelStrategy ?? 'quality-first'
   const selectionRows = (data?.selections ?? []).slice(0, 8).map((selection) => {
     const candidateLine = (selection.candidates ?? []).map((candidate) => {
@@ -348,7 +348,7 @@ function SelectionPanel(props: { sessionId?: string; settingsScope?: SettingsSco
 
 function VerifierPanel(props: { sessionId?: string; settingsScope?: SettingsScope }): VNode {
   const [state, setState] = useState<State | null>(null)
-  const [enabled, setEnabled] = useState(true)
+  const [enabled, setEnabled] = useState(false)
   const [autoFeedback, setAutoFeedback] = useState(false)
   const [busy, setBusy] = useState(false)
   const [saving, setSaving] = useState(false)

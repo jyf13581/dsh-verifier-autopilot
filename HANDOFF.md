@@ -1,5 +1,10 @@
 # dsh-verifier-autopilot 交接说明
 
+> **本文件的地位（review R7，2026-10-09）**：这是作者本机安装的**运维日志与交接记录**（operator journal），不是仓库的权威文档。
+> - 当前默认值以 README.md 中由 `scripts/doc-facts.mjs` 从代码生成的表为准；测试数以 CI 输出为准；模块与门禁以 docs/ARCHITECTURE.md 为准（文档地图见 README.md「Documentation Map」）。
+> - 本文的 §2「当前生产契约」被代码注释引用（`HANDOFF §2.x`），R7 已按代码核对并修正其中与代码矛盾之处；其余各节（快照、live 事件、ledger 统计、本机路径 `D:/…`、`C:/Users/…`、门禁计数）是**写下当天**的记录，不代表现状，不再逐条维护。
+> - 下方 2026-09-16/17 快照内部有一处矛盾：第一段说 `enabled=false/selectionMode=off` 是既定 live 态，第二段说 settings.yaml 持久层为 `selectionMode=always、effort=max、autoFeedback=true`。两者都未经 R7 核实，以 live `/state` 为准。R7 起源码默认已改为 `enabled=false`、`selectionMode=off`（显式 opt-in），持久层中已设的值不受影响。
+
 > 当前权威快照：2026-09-17 午后（HEAD=文档提交，verifier-autopilot 代码自 f4d20f3 未动：8bb15f7 候选控制加固 + f4d20f3 中转号池执行模式 + HANDOFF 文档提交链，enabled=false/selectionMode=off 为既定 live 态；另有 dsh-llm-retry-settings **0.2.3** 主模型侧扩展，**已首次 git 版本化**：1b3a69f→1302747→4b1494e，见下方 2026-09-17 批次）。实现仓库：D:/tools/dsh-plugins/dsh-verifier-autopilot。参考目录：D:/tools/llm-as-a-verifier-main，只用于理解上游算法；该目录当前不是 Git checkout，不能当作生产实现或当前事实。
 >
 > 当前修复摘要（源码默认 + live /state 双口径）：verifier nvidia/nemotron-3-super-120b-a12b（2026-09-13 严格协议实测：HTTP 200 + score tags + logprobs，约 6s；GLM-5.3-Flash 因 effort=max 思考过长已撤下默认）；候选池 nvidia/nemotron-3-super-120b-a12b 优先；quality-first + 探活剔除死项；模型 ID 由 operator 自由配置，provider catalog 仅作发现信息，自定义 ID 也会直接探活；源码默认 selectionMode=auto、standard N=2/K=1/P=0、deep N=3/K>=2、verifier effort=low、autoFeedback=false；**settings.yaml 持久层当前压过源码默认：selectionMode=always、P=0、effort=max、autoFeedback=true、model 与 selectionModels=moonshotai/kimi-k3**（operator 既有嗜好，未经确认不回滚；2026-09-16 实测回读：P 已由 1 改 0；verifier 与候选池当前均为 operator 自选的 kimi-k3 单点，与源码默认 nemotron 不同，见 §4 表）；margin gate=0.03 仍 provisional（毕业改走 max-with-margin 条件单 docs/MARGIN-GRADUATION-INVOICE.md，q95 跨轮 20% 准则已按统计诊断退役）；candidate timeout 默认 600s（2026-09-10 抬界裁决，commit 9927986）；自动 selection 后台运行；winner/fallback 在 source idle/detach/dispose 时回收；审计包在清理前落盘；verifier 调度恒等式 `calls = nComparisons × criteriaCount × K` 已入档 docs/VERIFIER-SCHEDULER.md，新 record 带 criteriaCount/expectedVerifierCalls 遥测（commit 32a67ed）。
@@ -164,7 +169,7 @@
 - source cwd 必须解析到唯一可用 Git repository。解析失败时回到 source agent，不猜 workspace。
 - 上下文只取最多 8 条近期 USER/ASSISTANT 内容，每条有界；current task 标为最高权威，历史上下文标为非指令。
 - autopilot 不复制 raw session seed，候选只接收 bounded context packet；manual /select 可继承最多 600 events 的完整 turn 边界 seed。
-- selectionMode=auto 只接 actionable task；always 仍受安全和可执行边界约束。
+- selectionMode 源码默认 `off`（R7 起显式 opt-in）。auto 只接 actionable task，但 actionable 是关键词/长度启发式：R7 的 40 条标注语料中，auto 接纳了 5/10 条纯提问和 6/10 条小改动（`scripts/tests/product-defaults.test.mjs`）；always 仍受安全和可执行边界约束。
 
 ### 2.2 Workspace 快照与隔离
 
@@ -191,21 +196,15 @@
 - 多幸存者必须有真实 ranking 且 verifier 结果经过严格校验：winner index、有限 0..1 scores、完整唯一 ranking permutation、分数降序、index tie-break、winner/ranking 一致性、nComparisons>0；任何一项失败 fail-closed。
 - preflight 在 worktree 准备后、candidate agent 创建前运行；用一组明显非对称 pair 检查真实比较数和严格顺序，并按 baseURL/model/apiKeyEnv/key 值指纹/effort memoize，成功结果只信任 30 分钟（review R4 4.5：轮换 key 或中转丢失 logprobs 后会重新验证）。
 - preflight 与 ranking 使用相同的归一化 timeout 值，但各自创建独立绝对 deadline；不是从 preflight 开始共享一个跨阶段总 deadline。因此最坏总墙钟还包括 workspace、preflight、candidate 和 ranking 各阶段。
-- selection timeout 默认 600000ms，归一化范围 30000..600000ms（2026-09-05 从 300s 上限抬升至 600s：effort=max 下单次 minimax-m3 比较 70..100s，最小锦标赛已逼近 300s；host normalize、runner budget、autopilot clamp 三处同步）。preflight 和 ranking 各自最多 2 次 attempt，只重试 retriable BridgeError，backoff 和 attempt 共用该阶段 deadline。
-- Kimi verifier maxWorkers=1，避免并发撞 relay pending/concurrency 限制；候选 rollout 仍可并行。
-- 当前自动运行默认是可用优先的标准档 N=2/K=1/P=0，deep 为 N=3 且 K 至少 2；verifier 思考强度为 low。N/K/P/effort 可在 GUI 或配置中提高；K 未传值时 config、runner 与 bridge 直接调用统一回落到 `DEFAULT_SELECTION_EVALUATIONS`=1（review R5 5.4；此前 runner 回落 2、bridge 回落 4）；P 缺省时（极少路径）fallback 为 1。
+- selection timeout 默认 600000ms，归一化范围 30000..600000ms（2026-09-05 自 300s 上限抬升；2026-09-08 起 manual /select 省略 selectTimeoutMs 时跟随 config，不再回落硬编码 180s）。preflight 和 ranking 各自最多 2 次 attempt，只重试 retriable BridgeError，backoff 和 attempt 共用该阶段 deadline。
+- tournament 并发由 `selectionVerifierWorkers` 决定（0=auto，即 `AUTO_VERIFIER_WORKERS`=4；2026-09-16 起，中转按请求轮询分号，并发请求落在不同账号上）。此前的 "maxWorkers=1" 已不成立。候选 rollout 并行。
+- 当前自动运行默认是可用优先的标准档 N=2/K=1/P=0，deep 为 N=3 且 K 至少 2；verifier 思考强度为 low。N/K/P/effort 可在 GUI 或配置中提高；K 未传值时 config、runner 与 bridge 直接调用统一回落到 `DEFAULT_SELECTION_EVALUATIONS`=1（review R5 5.4；此前 runner 回落 2、bridge 回落 4）；P 未传值时同样统一回落到 `DEFAULT_SELECTION_PIVOTS`=0（review R6 6.3；此前 runner 与 bridge 回落 1）。
 - 思考强度（verifierEffort，off/low/high/max）同时作用于两条 verifier 路径：五路 lane 在 chat body 里附带 thinking/reasoning_effort 字段（off 显式 thinking:disabled）；selection 侧的 effort 字段经 bridge frame 直达 sidecar，由其在请求作用域内设置 DEEPSEEK_EFFORT（调用结束后还原，不会污染 health 或下一个请求）。preflight 的 memoize tuple 包含 effort，切换强度会重新预检。
 - 多幸存者必须过三道门才可能成为 winner（2026-09-08 起）：(1) has-work —— code/file 型任务要求候选有执行类工具调用（`tool_search`/`tool_slimmer_catalog`/`tool_call` 等元工具不计）或非空 worktree diff，否则记 `insufficient-evidence` 淘汰；全灭则 `outcome=insufficient_evidence`，不 relay winner。(2) noSearchSpace —— 幸存候选 git diff 指纹全等时去重为 single_candidate_fallback，绝不花 verifier 配额（R2 起：指纹按文件内容哈希；按指纹分组只留最小编号，部分重复也去重，记 `dedupedCandidates`；空 diff 不去重；只读工具 read/grep/ls 等不计 has-work）。(3) margin gate —— verifier 返回通过严格校验后，top-2 margin < `selectionMarginThreshold`（当前 **0.03**，首轮 C0 校准噪声上限 2.2×，仍标 provisional；record 留存 `margin/marginThreshold/marginCondition/marginProvisional`）或完全平分时 `outcome=abstain`，不设 winner、不写 winnerBasis。
 - **ranking 输入可靠性（2026-09-08 补强）**：每个幸存者轨迹前会前置 `[DETERMINISTIC EVIDENCE]` 块（taskKind、执行类调用数、diff 统计、checks 逐条 exit 码、harness-error 标注），ranker 不再只依赖 24000 字符截断后的轨迹尾部。
 - **模型探活（2026-09-08 起）**：`selectionProbeEnabled` 默认开；autopilot 在规划前按 (baseURL,key) 对每个 preferred∩catalog 候选做 1-token 探活，死模型（kimi-k3 式窗口）从当次候选池剔除；结果按模型缓存、死模型 120 秒 cool-down 后复探；policy.probes 落进 ledger。
 - **source 后置审计增强**：交付判定改走 `evaluateDelivery()`；新增可选配置 `selectionPostAuditTestCommand`——仅当显式配置时 cleanup 会在 source cwd 跑一次测试命令（120s 上限），全部满足（HEAD 前进/有改动 + 测试退出码 0）才记 `delivered=yes`；缺省/未配置只记 `unknown`/`no`。record 另带 `timing.{relayedAt,auditedAt}` 供 B-9 判读回放。
 - **`outcome` 状态机六值**（每个 settled record 恰一）：`ranked_winner` / `objective_only_result`（历史值：R2 2.3 证明不可达，已不再产生，只为旧 ledger 保留）/ `single_candidate_fallback`（唯一幸存者，未比较，relay 明示）/ `insufficient_evidence` / `abstain` / `verifier_unavailable`（基础设施故障且全员 checks 通过——不再整条 `failed`；`error`/`note` 保留原因字段）。`winnerBasis` 收窄兼容：`verifier` 仅与 `ranked_winner` 同时出现。读 ledger 的消费者必须先读 `outcome`。
-- preflight 在 worktree 准备后、candidate agent 创建前运行；用一组明显非对称 pair 检查真实比较数和严格顺序，并按 baseURL/model/apiKeyEnv/key 值指纹/effort memoize，成功结果只信任 30 分钟（review R4 4.5：轮换 key 或中转丢失 logprobs 后会重新验证）。
-- preflight 与 ranking 使用相同的归一化 timeout 值，但各自创建独立绝对 deadline；不是从 preflight 开始共享一个跨阶段总 deadline。因此最坏总墙钟还包括 workspace、preflight、candidate 和 ranking 各阶段。
-- selection timeout 默认 600000ms，归一化范围 30000..600000ms（2026-09-05 自 300s 上限抬升；2026-09-08 起 manual /select 省略 selectTimeoutMs 时跟随 config，不再回落硬编码 180s）。preflight 和 ranking 各自最多 2 次 attempt，只重试 retriable BridgeError，backoff 和 attempt 共用该阶段 deadline。
-- Kimi verifier maxWorkers=1，避免并发撞 relay pending/concurrency 限制；候选 rollout 仍可并行。
-- 当前自动运行默认是可用优先的标准档 N=2/K=1/P=0，deep 为 N=3 且 K 至少 2；verifier 思考强度为 low。N/K/P/effort 可在 GUI 或配置中提高；K 未传值时 config、runner 与 bridge 直接调用统一回落到 `DEFAULT_SELECTION_EVALUATIONS`=1（review R5 5.4；此前 runner 回落 2、bridge 回落 4）；P 缺省时（极少路径）fallback 为 1。
-- 思考强度（verifierEffort，off/low/high/max）同时作用于两条 verifier 路径：五路 lane 在 chat body 里附带 thinking/reasoning_effort 字段（off 显式 thinking:disabled）；selection 侧的 effort 字段经 bridge frame 直达 sidecar，由其在请求作用域内设置 DEEPSEEK_EFFORT（调用结束后还原，不会污染 health 或下一个请求）。preflight 的 memoize tuple 包含 effort，切换强度会重新预检。
 - 单幸存者只可标 objective-check-only 或 single-candidate（`outcome=single_candidate_fallback`），score 为 null，不能冒充 verifier winner。
 - 任务类型在准入阶段由确定性分类器定（`classifyTaskKind`），写入 policy.taskKind；「已收口/全部通过/汇总如下」类完成汇报直接拒收（K.4-7，sel-1c8d28ef 教训），候选/LLM 不自报类型。analysis-text 任务不做 has-work 淘汰，全程 `llmOnly=true`，永不 verified。
 - ranking score 是候选池内相对强度，不是校准概率；`margin` 同在 record 里。verifier 不可用时若全员 checks 通过则 `verifier_unavailable`（不 retain），否则整轮 `failed`——基础设施故障不是裁决（R2 2.6 确认此语义）。
@@ -213,7 +212,7 @@
 ### 2.5 Finalizer 与 lifecycle
 
 - buildAutopilotRelay 最多携带两个 finalist 的有界轨迹摘录，并明确要求 source agent 检查 winner workspace、保护用户编辑、集成、测试和交付。
-- 该 finalizer contract 是 prompt-level contract，不是插件自动 merge/test enforcement；当前没有后置审计器证明 source turn 已履约。
+- 该 finalizer contract 是 prompt-level contract，不是插件自动 merge/test enforcement。后置审计（G-4，见下）只**记录** HEAD/工作区变化和字节级采纳（R3 3.3），不强制履约；只有配置了 `selectionPostAuditTestCommand` 时才会跑测试。
 - runner 保留 winner、回收 loser。manual winner 的 live handle 在 finishRun 立即 dispose，但 session/workspace 保留；generic [Selection 结算] notice 只用于非-autopilot。
 - autopilot pre-step 只同步完成准入和 selection start，随后立即返回原始 source decision；后台 waiter 在 winner 完成后追加 relay。autopilot winner handle 在 relay 后暂时保留，source agent idle、detach 或插件 dispose 时自动 discard session/workspace；autopilot 不发送 generic settlement notice。source abort/detach 会取消在途 selection，但不会等待慢 provider 的完整结算。
 - /selections/release 只释放 live handle并保留 session/workspace；没有 handle 时返回 not-retained。它不是“幂等删除”。
@@ -250,30 +249,15 @@ API prefix：/@dsh-external/dsh-verifier-autopilot/api
 
 ## 4. 默认值、预算与 provider 约束
 
-| 配置/路径 | 当前值 |
+**默认值、取值范围和运行限额以 README.md「Current Defaults」为准**：该表由 `scripts/doc-facts.mjs` 从配置 schema 和导出常量生成，`npm test` 在它过期时失败。此处原有的手写表已移除（R7 核对时它与代码有多处不一致，例如 lane maxTokens 写作 8192，代码为 64000），原表保存在本文件的 git 历史中（`c32aa59`）。
+
+只与作者本机有关、不进入默认值表的事实：
+
+| 项 | 说明 |
 |---|---|
-| baseURL / model / apiKeyEnv | https://chat.holisthoom.top/v1 / nvidia/nemotron-3-super-120b-a12b（源码默认）／moonshotai/kimi-k3（2026-09-16 持久层+live 实测，operator 自选） / KIMI_API_KEY |
-| selectionMode | 源码默认 auto；当前持久层 always |
-| selectionProvider | kimi |
-| selectionModelStrategy | quality-first（默认）；exploration 显式 opt-in |
-| selectionModels | nvidia/nemotron-3-super-120b-a12b（源码默认；质量顺序完全由 operator 编辑，不在 provider `/models` 中的自定义 ID 也会直接探活）／当前持久层+live 实测：moonshotai/kimi-k3（单点，2026-09-16） |
-| standard / deep candidates | 2 / 3，配置范围均为 2..5 |
-| selectionEvaluations（K，评估轮数） | 1，范围 1..8；deep 至少 2 |
-| selectionPivots（P，枢轴迭代数，O(N·P)） | 源码默认 0；当前持久层 0（2026-09-16 实测，已由 09-10 的 1 改回）；范围 0..5，按幸存者数收敛 |
-| verifierEffort（思考强度，lane + tournament 共享） | 源码默认 low；当前持久层 max；off/low/high/max |
-| verifierMinIntervalMs（发送平滑） | 0=关（源码默认）；令牌桶间隔 ms，lanes 与锦标赛 sidecar 共享，防突发打满限额 |
-| verifierSmallModel（分层小模型） | ''=关（源码默认）；会话验证机械 lane（completion/evidence）改用小模型（如 nvidia/nemotron-3-ultra-550b-a55b），难 lane 与锦标赛仍用主模型 |
-| lane timeoutMs / maxTokens | 180000ms / 8192（已拉满；思考从输出预算中扣除） |
-| autopilot candidate timeout | 600000ms，范围 30000..1800000 |
-| manual omitted candidate timeout | 跟随 config.selectionCandidateTimeoutMs（默认 600000ms）；仅当 Host 未接线时才回落到 runner 600000ms 防御值 |
-| manual omitted K / P | 跟随 config.selectionEvaluations / selectionPivots（Host 级默认值接线） |
-| selection timeout | 600000ms，范围 30000..600000（2026-09-05 自 300s 抬升） |
-| verifier workers | 配置化：selectionVerifierWorkers（0=auto 4；1..16 显式，99 钳 16）。中转站按请求轮询分号，并发请求摊到不同账号；调用数恒等式不变，只改墙钟时间 |
-| retry | maxAttempts=2，阶段绝对 deadline，abort-aware backoff |
-| selection workspace | .data/selection-workspaces |
-| selection ledger | .data/selections.jsonl |
-| legacy ledger | .data/records.jsonl |
-| Python | `DSH_VA_PYTHON` 优先；未设置时若 D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe 存在则用它，否则回退 PATH 上的 `python`（win32）/`python3` |
+| 持久层覆盖 | 作者机器的 settings.yaml 曾覆盖多个源码默认值（2026-09-16 记录：`selectionMode=always`、`verifierEffort=max`、`autoFeedback=true`、模型 `moonshotai/kimi-k3`）。以 live `/state` 为准 |
+| Python | `DSH_VA_PYTHON` 优先；未设置时若 `D:/tools/pyvenvs/llm-verifier-bridge/Scripts/python.exe` 存在则用它（`OPERATOR_BRIDGE_VENV_PYTHON`，R6 6.3b 待负责人决定是否移除），否则回退 PATH 上的 `python`（win32）/`python3` |
+| 存储位置 | `.data/selection-workspaces`、`.data/selections.jsonl`（selection ledger）、`.data/records.jsonl`（legacy ledger） |
 
 provider 注意事项：candidateOptions 必须能补成完整 provider+model；半路由或未知模型 fail-fast（catalog 不再是 allowlist——2026-09-13/16 改造后 `availableModels = preferred ∪ catalog`，不在 `/models` 里的 operator 自定义 ID 也会被直接探活，由探活决定去留）。selectionModels 是按质量排序的优先列表。quality-first 会把全部 N 个候选压到探活后的第一名可用模型；exploration 才会轮换已有模型。因此 standard N=2 出现两个同模型候选是默认行为，不是记录错误。
 
