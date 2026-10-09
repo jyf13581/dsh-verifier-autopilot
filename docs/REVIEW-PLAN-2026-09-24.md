@@ -13,7 +13,7 @@
 | R1 信任边界与执行安全 | ✅ 已完成（1.1 沙箱和 1.9 默认中转待负责人决策） | `docs/reviews/R1-TRUST-BOUNDARY.md` | `scripts/tests/trust-boundary.test.mjs` |
 | R2 选择判定链正确性 | ✅ 已完成（2.1–2.5、2.7 已修复；2.6 维持 K.5 语义并写入决策表；新发现的部分重复去重问题 2.1c 已修复） | `docs/reviews/R2-SELECTION-CORRECTNESS.md` | `scripts/tests/selection-correctness.test.mjs` |
 | R3 证据与度量有效性 | ✅ 已完成（3.3 按 relay 快照做字节级采纳归因；3.1 采用条件注册表加 `flag`/`abstain` 策略，默认改为强制 abstain 待负责人决策；新发现的 3.7 继承脏状态、3.7b 子目录指纹、3.8 relay 重复发送已修复；σγ 需要跑一轮 C3 实测） | `docs/reviews/R3-EVIDENCE-VALIDITY.md` | `scripts/tests/evidence-validity.test.mjs` |
-| R4 并发、生命周期与资源回收 | ✅ 已完成（4.1 按 agent 状态和 inbox 判定 relay 是否已消费；4.4 POSIX 进程组回收；4.2 单一 seed 快照；4.5 key 值指纹加 30 分钟 TTL；4.6 ranking 前排空采样；4.7 合并 spawn 实现；新发现的 4.7b stdin EPIPE 可致宿主崩溃已修复；4.3 只做可观测，会话内通知待负责人决策；Windows 孙进程仍是残余风险） | `docs/reviews/R4-LIFECYCLE.md` | `scripts/tests/lifecycle.test.mjs` |
+| R4 并发、生命周期与资源回收 | ✅ 已完成（4.1 按 agent 状态和 inbox 判定 relay 是否已消费；4.4 POSIX 进程组回收；4.2 单一 seed 快照；4.5 key 值指纹加 30 分钟 TTL；4.6 ranking 前排空采样；4.7 合并 spawn 实现；新发现的 4.7b stdin EPIPE 可致宿主崩溃、4.2b 用户 diff 配置让 seed 快照失败，均已修复；4.3 只做可观测，会话内通知待负责人决策；Windows 孙进程仍是残余风险） | `docs/reviews/R4-LIFECYCLE.md` | `scripts/tests/lifecycle.test.mjs` |
 | R5 持久化、审计包、脱敏与协议 | ⏳ | | |
 | R6 架构与构建/发布链 | ⏳ | | |
 | R7 文档真实性与产品方向 | ⏳ | | |
@@ -146,7 +146,7 @@ HTTP 控制面: /state /config /select /selections/* /verify /probe /eval /event
 
 验收：4.1、4.4 有回归测试并修复；其余给出决策。
 
-结果：全部 7 条线索都已修复或给出决策，另新增 4.7b；R4 测试文件在基线上 1/14，修复后 14/14。详见 `docs/reviews/R4-LIFECYCLE.md`。
+结果：全部 7 条线索都已修复或给出决策，另新增 4.7b、4.2b；R4 测试文件在基线上 1/15，修复后 15/15。详见 `docs/reviews/R4-LIFECYCLE.md`。
 
 ## R5 持久化、审计包、脱敏与协议契约
 
