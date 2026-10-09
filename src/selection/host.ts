@@ -1004,8 +1004,13 @@ export class SelectionHost {
 
   /** Audit pack (ruling I.5/G, F6): one directory per selection, written at
    *  settle BEFORE any workspace cleanup can free the evidence it holds —
-   *  record.json plus raw per-candidate materials. discard rewrites only the
-   *  record so settlement attribution stays immutable. */
+   *  record.json plus per-candidate materials (redacted at the runner, review
+   *  R5 5.1). Later writes (relay, delivery audit, discard) rewrite only
+   *  record.json and touch only lifecycle fields — timing.relayedAt/auditedAt,
+   *  sourceAtRelay, delivery, discardedAt — never the verdict, finalists,
+   *  ranking, or settlement attribution (review R5 5.2; pinned by
+   *  egress-persistence.test.mjs). The ledger is last-row-wins per
+   *  selectionId under the same rule. */
   private artifactDir(): string | null {
     return this.deps.artifactsDir ?? null
   }

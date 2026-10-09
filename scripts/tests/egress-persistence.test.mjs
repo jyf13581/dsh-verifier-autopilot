@@ -6,7 +6,7 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import { VerifierHost, redactSecrets } from "../../lib/index.js"
@@ -14,7 +14,7 @@ import { SelectionRunner } from "../../lib/selection/candidates.js"
 import { IsolatedWorkspaceManager, gitDiffFull } from "../../lib/selection/live.js"
 import { buildAutopilotRelay } from "../../lib/selection/autopilot.js"
 import { appendJsonlLedger, compactJsonlLedger, readJsonlLedger } from "../../lib/ledger.js"
-import { makeGitRepo, runGit } from "./helpers/git.mjs"
+import { makeGitRepo } from "./helpers/git.mjs"
 import { completedTurnEvents, fakeAgent, fakeContext, fireIdle, hostOverrides } from "./helpers/host.mjs"
 import { fakeBridge, makeFakeFactory, realWorkspaces, selInput, SEL_TMP } from "./helpers/selection.mjs"
 import { mkBridge, bridgeReq, STUB_SIDECAR } from "./helpers/sidecar.mjs"
@@ -166,6 +166,52 @@ test("R5 5.3: compaction keeps rows from a newer ledger version instead of delet
     const text = readFileSync(file, "utf8")
     assert.ok(text.includes(future), "old code: compaction rewrote the file from known rows only")
     assert.deepEqual(readJsonlLedger(file, ledgerOpts()).map((r) => r.id), ["old"])
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+test("R5 5.3: ledger fuzz — torn tails, garbage, duplicates, dropped and future rows never break load, append or compaction", () => {
+  // Seeded so a failure names a reproducible iteration.
+  let seed = 0x5eed5
+  const rand = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296 }
+  const pick = (n) => Math.floor(rand() * n)
+  const dir = mkdtempSync(path.join(tmpdir(), "r5-fuzz-"))
+  try {
+    for (let iter = 0; iter < 300; iter++) {
+      const file = path.join(dir, `l${iter}.jsonl`)
+      let lines = Array.from({ length: 1 + pick(12) }, (_, seq) => JSON.stringify({ id: "abcde"[pick(5)], seq, v: 1, text: "x".repeat(pick(40)) }))
+      for (let m = pick(4); m > 0; m--) {
+        const at = pick(lines.length + 1)
+        switch (pick(5)) {
+          case 0: lines.splice(at, 0, ["{", "not json", "[]", "null", '"str"', '{"seq":1}'][pick(6)]); break
+          case 1: lines.splice(at, 0, JSON.stringify({ id: "future", v: 2 })); break
+          case 2: if (lines.length) lines.splice(at, 0, lines[pick(lines.length)]); break
+          case 3: if (lines.length > 1) lines.splice(pick(lines.length), 1); break
+          default: break
+        }
+      }
+      let text = lines.join("\n") + "\n"
+      if (rand() < 0.5) text = text.slice(0, pick(text.length + 1)) // crash mid-write
+      writeFileSync(file, text)
+      const where = `iteration ${iter}`
+      // Expected: the newest surviving valid v1 row per id (loader contract).
+      const expected = new Map()
+      for (const line of text.split("\n")) {
+        let row; try { row = JSON.parse(line) } catch { continue }
+        if (row && typeof row === "object" && !Array.isArray(row) && typeof row.id === "string" && (row.v === undefined || row.v === 1)) expected.set(row.id, row)
+      }
+      const loaded = readJsonlLedger(file, ledgerOpts())
+      assert.deepEqual(new Map(loaded.map((r) => [r.id, { ...r, v: 1 }])), new Map([...expected].map(([id, r]) => [id, { ...r, v: 1 }])), where + ": load = newest surviving row per id, nothing invented")
+      appendJsonlLedger(file, { id: "z", seq: -1 })
+      const after = readJsonlLedger(file, ledgerOpts())
+      assert.ok(after.some((r) => r.id === "z"), where + ": an append after any corruption reads back")
+      assert.equal(after.length, loaded.length + 1, where + ": and loses no earlier record")
+      // Only rows that parse are carried over; a torn `{"id":"future","v":2` is just a torn row.
+      const parsedFuture = () => readFileSync(file, "utf8").split("\n").filter((l) => { try { return JSON.parse(l)?.v === 2 } catch { return false } }).length
+      const futureRows = parsedFuture()
+      compactJsonlLedger(file, after)
+      assert.deepEqual(readJsonlLedger(file, ledgerOpts()).map((r) => r.id).sort(), after.map((r) => r.id).sort(), where + ": compaction round-trips")
+      assert.equal(parsedFuture(), futureRows, where + ": newer-version rows survive compaction")
+    }
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 

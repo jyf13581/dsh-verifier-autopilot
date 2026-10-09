@@ -1,6 +1,6 @@
 import type { Config } from './config.js'
 import { read, readArray, readString } from './payload.js'
-import { normalizeBaseUrl, redactSecrets, resolveKey, type Credentials } from './util.js'
+import { makeRedactor, normalizeBaseUrl, resolveKey, type Credentials } from './util.js'
 
 export { normalizeBaseUrl, redactSecrets, resolveKey } from './util.js'
 export type { Credentials } from './util.js'
@@ -233,7 +233,7 @@ async function verifyRouteOnce(config: Config, credentials: Credentials | undefi
       headers: { 'content-type': 'application/json', authorization: 'Bearer ' + key },
       body: JSON.stringify({
         model: options?.modelOverride ?? config.model,
-        messages: [{ role: 'user', content: redactSecrets(prompt, [key]) + '\n\nThis is verifier lane ' + route + ' of ' + config.routes + ', focused on ' + laneFor(route).name + '. ' + laneFor(route).instruction + ' Make this judgment independently and report only evidence from the supplied trajectory.' }],
+        messages: [{ role: 'user', content: makeRedactor([key])(prompt) + '\n\nThis is verifier lane ' + route + ' of ' + config.routes + ', focused on ' + laneFor(route).name + '. ' + laneFor(route).instruction + ' Make this judgment independently and report only evidence from the supplied trajectory.' }],
         max_tokens: config.maxTokens,
         temperature: config.temperature,
         seed: route,

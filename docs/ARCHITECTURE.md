@@ -35,7 +35,7 @@ implementation code.
 | `src/config.ts` | Config schema, schema-derived defaults, validation, settings-source hooks, and config-owned policy primitives. No selection/runtime lifecycle dependency. |
 | `src/protocol.ts` | Canonical Host/client wire types, structural web transport types, API prefix, and model catalog. |
 | `src/util.ts` | Dependency-light boundary helpers: credentials, API-key resolution, base-URL normalization, and secret redaction. |
-| `src/ledger.ts` | Shared versioned JSONL reading/appending/compaction and same-directory atomic replacement. |
+| `src/ledger.ts` | Shared versioned JSONL reading/appending/compaction and same-directory atomic replacement; appends are fdatasync'd and torn-tail safe, replacements fsync before rename, newer-version rows survive compaction (power-loss semantics in the file header). |
 | `src/diagnostics.ts` | Bounded, redacted degradation ledger (warnings ring + counters). Every layer reports its best-effort failures here; the snapshot rides in `/state`. Leaf: imports only `util`. |
 | `src/dsh-context.ts` | Runtime-checked views of the DSH/cordis contexts the plugin is handed: the hook surface (`on`), an agent's scoped context (`get`, session append), and the one `create` call into the agent registry. Type predicates, no casts. Leaf: imports nothing. |
 | `src/payload.ts` | Checked readers for schemaless JSON (`read`, `readArray`, `readString`, `isRecord`) and the one declared session-event shape (`EventRecord`, `data?: unknown`) that evidence, coordinator, and selection trajectories share. Every read is total and returns `unknown`; no payload field is ever reached through `any`. Leaf: imports nothing. |
@@ -397,7 +397,12 @@ values do not. Resolve them at the last responsible moment through
 `resolveKey()`. Pass normalized provider URLs through `normalizeBaseUrl()` and
 sanitize operator-visible errors with `redactSecrets()`. Logs, API errors,
 records, audit packs, tests, and fixtures must contain neither live keys nor
-internal endpoint credentials. On the transport, every unexpected failure
+internal endpoint credentials. Candidate tools inherit the host environment, so the
+selection runner builds one redactor per run (`makeRedactor`: the verifier key
+plus the values of credential-named env vars, then the shared patterns) and
+passes every trajectory, check tail, patch, error, and the task text through it
+before anything reaches the verifier, the record, the audit pack, or the relay
+(review R5 5.1). On the transport, every unexpected failure
 leaves through one helper (`internalFailure`): a JSON 500 whose message is
 redacted and bounded. Routes answer with typed codes for expected conditions
 and never forward a raw `error.message`.
