@@ -3,7 +3,11 @@
 // They pin CURRENT behavior so the 6.1 module split cannot change it silently.
 import test from "node:test"
 import assert from "node:assert/strict"
-import { makeLiveCandidateFactory } from "../../lib/selection/live.js"
+import { mkdtempSync, rmSync, symlinkSync, readFileSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import path from "node:path"
+import { IsolatedWorkspaceManager, makeLiveCandidateFactory } from "../../lib/selection/live.js"
+import { makeGitRepo } from "./helpers/git.mjs"
 import { abortableRetrySleep } from "../../lib/selection/retry.js"
 
 // A child agent's scoped context as DSH hands it to `setup`.
@@ -97,4 +101,27 @@ test("R6 6.5: an abort during a verifier retry back-off rejects at once and does
   const pre = new AbortController(); pre.abort()
   await assert.rejects(abortableRetrySleep(60_000, pre.signal), (e) => e.code === "bridge_aborted")
   await abortableRetrySleep(5) // no signal: plain delay
+})
+
+// Windows paths (6.5): the first windows-latest run refused every selection
+// whose source lived under os.tmpdir() -- C:\Users\RUNNER~1\..., an 8.3 alias
+// of the long path git prints -- as source-cwd-outside-git-root. A junction
+// (a plain symlink on POSIX) is the same defect reachable on every OS: two
+// spellings of one directory.
+test("R6 6.5: prepare accepts an aliased spelling of the source repository (8.3 name, junction, symlink)", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r6-alias-"))
+  const manager = new IsolatedWorkspaceManager(path.join(base, "ws"))
+  let cwd = null
+  try {
+    const repo = makeGitRepo(base, "real")
+    writeFileSync(path.join(repo, "tracked.txt"), "tracked-base\nuncommitted\n")
+    const alias = path.join(base, "alias")
+    symlinkSync(repo, alias, "junction")
+    cwd = await manager.prepare({ selectionId: "sel-r6alias", index: 0, sourceCwd: path.join(alias, "src"), strictSnapshot: true })
+    assert.equal(path.basename(cwd), "src", "the subdirectory is mapped into the worktree (old code: source-cwd-outside-git-root)")
+    assert.equal(readFileSync(path.join(path.dirname(cwd), "tracked.txt"), "utf8").replace(/\r\n/g, "\n"), "tracked-base\nuncommitted\n", "the uncommitted edit is mirrored")
+  } finally {
+    if (cwd) await manager.remove(path.dirname(cwd)).catch(() => {})
+    rmSync(base, { recursive: true, force: true })
+  }
 })

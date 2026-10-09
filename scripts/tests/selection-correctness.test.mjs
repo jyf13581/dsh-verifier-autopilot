@@ -140,7 +140,9 @@ test("R2 2.1: equal line counts with different content no longer collide; identi
     writeFileSync(path.join(c, "f.js"), "x = 2\n")
     const [sa, sb, sc] = await Promise.all([a, b, c].map(gitDiffStat))
     assert.deepEqual([sa.files, sa.insertions, sa.deletions], [sb.files, sb.insertions, sb.deletions], "same numstat shape")
-    assert.notEqual(sa.fingerprint, sb.fingerprint, "different solutions are different deliverables")
+    // The stats ride along in the message: CI logs are not always reachable,
+    // annotations are (the first windows-latest run failed here, R6 6.5).
+    assert.notEqual(sa.fingerprint, sb.fingerprint, "different solutions are different deliverables " + JSON.stringify({ sa, sb, sc }))
     assert.equal(sa.fingerprint, sc.fingerprint, "byte-identical deliverables still dedupe")
   } finally {
     rmSync(root, { recursive: true, force: true })

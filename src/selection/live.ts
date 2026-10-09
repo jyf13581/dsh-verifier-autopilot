@@ -7,7 +7,7 @@
  * and this file is typechecked + smoke-tested against the live host.
  */
 
-import { cp, lstat, mkdir, readdir, readFile, readlink, rm, rmdir, writeFile } from 'node:fs/promises'
+import { cp, lstat, mkdir, readdir, readFile, readlink, realpath, rm, rmdir, writeFile } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import os from 'node:os'
@@ -64,6 +64,12 @@ async function existingAncestor(input: string): Promise<string | undefined> {
       current = parent
     }
   }
+}
+
+/** One spelling per directory: realpath (libuv's native realpath, which on
+ *  Windows expands 8.3 names and resolves junctions), else the lexical form. */
+async function canonicalDir(input: string): Promise<string> {
+  try { return await realpath(path.resolve(input)) } catch { return path.resolve(input) }
 }
 
 async function gitRootOf(input: string): Promise<string | undefined> {
@@ -481,8 +487,15 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
     if (sel.sourceCwd) {
       const root = await exec('git', ['-C', sel.sourceCwd, 'rev-parse', '--show-toplevel'])
       if (root.code === 0 && root.out.trim()) {
-        const sourceRoot = path.resolve(root.out.trim())
-        const sourceCwd = path.resolve(sel.sourceCwd)
+        // Compare canonical spellings. git prints its toplevel resolved
+        // (long names, symlinks and junctions followed) while the caller's
+        // cwd may be an alias of the same directory: a Windows 8.3 short
+        // name such as C:\Users\RUNNER~1\... (os.tmpdir() on GitHub's
+        // runners), a junction, or a symlinked checkout. path.relative on two
+        // spellings is '..\..\...' and every selection there was refused as
+        // source-cwd-outside-git-root (review R6 6.5, first windows-latest run).
+        const sourceRoot = await canonicalDir(root.out.trim())
+        const sourceCwd = await canonicalDir(sel.sourceCwd)
         const relativeCwd = path.relative(sourceRoot, sourceCwd)
         if (path.isAbsolute(relativeCwd) || relativeCwd.split(/[\\/]/).includes('..')) throw new Error('source-cwd-outside-git-root')
         const candidateCwd = path.join(worktreeRoot, relativeCwd)
