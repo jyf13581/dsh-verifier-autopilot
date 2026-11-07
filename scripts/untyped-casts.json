@@ -6,6 +6,6 @@
   "src/selection/bridge.ts": 1,
   "src/selection/candidates.ts": 2,
   "src/selection/host.ts": 3,
-  "src/selection/live.ts": 5,
+  "src/selection/live.ts": 4,
   "src/selection/trajectory.ts": 1
 }

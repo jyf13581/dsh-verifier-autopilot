@@ -108,11 +108,15 @@ test("phase0: 429 rate limits stay transient and retry once", async () => {
 
 test("phase1: redactSecrets strips credentials from provider-bound text without touching normal lines", async () => {
   const { redactSecrets } = await import("../../lib/verifier.js")
+  const { makeRedactor } = await import("../../lib/util.js")
   const literal = "sk-live-9f8e7d6c5b4a3210fedcba"
+  const shortLiteral = "k7x"
   const out = redactSecrets("export KIMI_API_KEY=" + literal + LF + "[E03] TOOL RESULT: pwsh npm test -> tests 5 passed", [literal])
   assert.ok(!out.includes(literal), "explicit credential literals must vanish")
   assert.ok(out.includes("[REDACTED]"))
   assert.ok(out.includes("[E03] TOOL RESULT: pwsh npm test -> tests 5 passed"), "normal trajectory lines survive verbatim")
+  assert.equal(redactSecrets("credential=" + shortLiteral, [shortLiteral]), "credential=[REDACTED]", "explicit short credentials must vanish")
+  assert.equal(makeRedactor([shortLiteral])("credential=" + shortLiteral), "credential=[REDACTED]", "the shared redactor must retain short explicit credentials")
 
   assert.ok(!redactSecrets("key sk-abcdef1234567890abcdef12").includes("sk-abcdef1234567890"), "openai-style keys are pattern-redacted")
   assert.ok(!redactSecrets("key sk-proj-9f8e7d6c5b4a3210").includes("sk-proj-"), "hyphenated key shapes are pattern-redacted too")

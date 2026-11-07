@@ -31,7 +31,7 @@ export const SECRET_ENV_NAME = /(?:^|_)(?:API_?KEYS?|KEYS?|TOKENS?|SECRETS?|PASS
 export function redactSecrets(text: string, extraLiterals: readonly string[] = []): string {
   let out = text
   for (const literal of extraLiterals) {
-    if (typeof literal === 'string' && literal.length >= SECRET_LITERAL_MIN_LENGTH) {
+    if (typeof literal === 'string' && literal.length > 0) {
       out = out.split(literal).join('[REDACTED]')
     }
   }
@@ -75,7 +75,9 @@ export function scrubSecretEnv(extraNames: readonly string[] = [], env: NodeJS.P
  *  contains another is replaced whole. */
 export function secretLiterals(explicit: ReadonlyArray<string | undefined | null>, env: NodeJS.ProcessEnv = process.env): string[] {
   const out = new Set<string>()
-  for (const value of explicit) if (typeof value === 'string' && value.length >= SECRET_LITERAL_MIN_LENGTH) out.add(value)
+  // Explicit values are known credentials; inferred environment values keep a
+  // minimum length to avoid replacing ordinary short process variables.
+  for (const value of explicit) if (typeof value === 'string' && value.length > 0) out.add(value)
   for (const [name, value] of Object.entries(env)) {
     if (typeof value === 'string' && value.length >= SECRET_LITERAL_MIN_LENGTH && SECRET_ENV_NAME.test(name)) out.add(value)
   }

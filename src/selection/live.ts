@@ -7,7 +7,7 @@
  * and this file is typechecked + smoke-tested against the live host.
  */
 
-import { cp, lstat, mkdir, readdir, readFile, readlink, realpath, rm, rmdir, writeFile } from 'node:fs/promises'
+import { cp, lstat, mkdir, readdir, readlink, realpath, rm, rmdir } from 'node:fs/promises'
 import { createReadStream } from 'node:fs'
 import { createHash, randomUUID } from 'node:crypto'
 import os from 'node:os'
@@ -474,6 +474,7 @@ export class IsolatedWorkspaceManager implements WorkspaceManager {
       if (pruned.code !== 0) throw new Error('workspace-worktree-prune-failed: ' + pruned.out)
     }
     this.worktrees.delete(lease.candidateCwd)
+    workspaceBaselines.delete(path.resolve(lease.worktreeRoot))
     try { await rmdir(path.dirname(lease.worktreeRoot)) } catch { /* other candidates still exist */ }
   }
 
@@ -647,9 +648,12 @@ interface WorkspaceEntry {
   tracked: boolean
 }
 
-/** Private per-worktree file (lives in the worktree's own git dir, so the
- *  candidate's `git status` never shows it and `worktree remove` deletes it). */
-const BASELINE_FILE = 'dsh-va-baseline.json'
+/** Host-owned baseline metadata. Candidate agents can mutate their worktree and
+ * linked-worktree git dir, so a file there cannot decide what counts as their own
+ * evidence. This process-local map is populated before candidate execution and
+ * never exposed to candidate tools. Missing metadata conservatively falls back to
+ * HEAD-relative evidence, preserving legacy/manual workspace behavior. */
+const workspaceBaselines = new Map<string, Map<string, string>>()
 
 async function gitRoot(cwd: string): Promise<string | null> {
   const top = await execWide('git', ['-C', cwd, 'rev-parse', '--show-toplevel'], cwd)
@@ -674,37 +678,25 @@ async function workspaceEntries(root: string): Promise<WorkspaceEntry[] | null> 
   return entries
 }
 
-async function baselinePath(root: string): Promise<string | null> {
-  const dir = await execWide('git', ['-C', root, 'rev-parse', '--absolute-git-dir'], root)
-  return dir.code === 0 && dir.out.trim() ? path.join(dir.out.trim(), BASELINE_FILE) : null
-}
-
 /** Record what the candidate STARTED with: `prepare()` mirrors the source's
- *  uncommitted edits into the worktree without committing them, so `git diff
- *  HEAD` alone attributes the user's work-in-progress to every candidate
- *  (review R3 3.7: a candidate that did nothing passed the has-work gate in
- *  any dirty repository). Returns the number of inherited paths, or null when
- *  the workspace is not a git worktree. */
+ * uncommitted edits into the worktree without committing them, so `git diff
+ * HEAD` alone attributes the user's work-in-progress to every candidate
+ * (review R3 3.7: a candidate that did nothing passed the has-work gate in
+ * any dirty repository). Returns the number of inherited paths, or null when
+ * the workspace is not a git worktree. */
 export async function captureWorkspaceBaseline(cwd: string): Promise<number | null> {
   const root = await gitRoot(cwd)
   if (!root) return null
   const entries = await workspaceEntries(root)
-  const file = await baselinePath(root)
-  if (!entries || !file) return null
-  await writeFile(file, JSON.stringify({ version: 1, entries: Object.fromEntries(entries.map((e) => [e.path, e.digest])) }))
+  if (!entries) return null
+  // Keep this metadata outside the candidate worktree and its linked-worktree
+  // git dir. Candidate tools can rewrite both, but cannot mutate this map.
+  workspaceBaselines.set(path.resolve(root), new Map(entries.map((e) => [e.path, e.digest])))
   return entries.length
 }
 
 async function readBaseline(root: string): Promise<Map<string, string> | null> {
-  const file = await baselinePath(root)
-  if (!file) return null
-  try {
-    const parsed = JSON.parse(await readFile(file, 'utf8')) as { version?: number; entries?: Record<string, string> }
-    if (parsed.version !== 1 || !parsed.entries || typeof parsed.entries !== 'object') return null
-    return new Map(Object.entries(parsed.entries).filter((pair): pair is [string, string] => typeof pair[1] === 'string'))
-  } catch {
-    return null
-  }
+  return workspaceBaselines.get(path.resolve(root)) ?? null
 }
 
 export interface OwnChanges {

@@ -337,7 +337,8 @@ test("R3 3.5: the sidecar classifies every upstream score extraction, including 
   const fake = fileURLToPath(new URL("./fixtures/fake_llm_verifier", import.meta.url))
   const bridgeDir = fileURLToPath(new URL("../../bridge", import.meta.url))
   const script = [
-    "import json, llm_verifier_sidecar as sc",
+    "import json, os, sys; sys.path.insert(0, os.environ['FAKE_LLV_PATH'])",
+    "import llm_verifier_sidecar as sc",
     "from llm_verifier import fine_grained_reward as fgr",
     "lp = lambda l: [(l, -0.1), ('B', -2.5)]",
     "toks = ['<score_A>', ' A', '</score_A>', '<score_B>', ' C', '</score_B>']",
@@ -353,7 +354,7 @@ test("R3 3.5: the sidecar classifies every upstream score extraction, including 
     "out['reset'] = sc.EXTRACTION.snapshot()",
     "print(json.dumps(out))",
   ].join("\n")
-  const run = spawnSync(BRIDGE_PY, ["-c", script], { cwd: bridgeDir, env: { ...process.env, PYTHONPATH: fake }, encoding: "utf8" })
+  const run = spawnSync(BRIDGE_PY, ["-c", script], { cwd: bridgeDir, env: { ...process.env, FAKE_LLV_PATH: fake }, encoding: "utf8" })
   if (run.error) { t.skip("python unavailable: " + run.error.message); return }
   assert.equal(run.status, 0, run.stderr)
   const out = JSON.parse(run.stdout.trim().split("\n").at(-1))
