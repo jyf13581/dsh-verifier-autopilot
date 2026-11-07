@@ -10,6 +10,9 @@ fixture changing too. Behaviors are driven by the select problem text:
              per candidate (TIE, or a base_url containing "tie", scores every
              candidate 1.0); the api key env must have been injected.
 
+STUB_HEALTH_PROTOCOL overrides the health frame's protocol version ("absent"
+drops the field), for the bridge's version check.
+
 When STUB_ECHO_FILE is set, every request frame received is appended to that
 file as one JSON line, so a test can assert the exact wire frame the bridge
 emitted.
@@ -63,7 +66,13 @@ for line in sys.stdin:
     rid = req.get("id")
     t = req.get("type")
     if t == "health":
-        ok(rid, RESPONSES["health"]["result"])
+        health = dict(RESPONSES["health"]["result"])
+        override = os.environ.get("STUB_HEALTH_PROTOCOL")
+        if override == "absent":
+            health.pop("protocol", None)
+        elif override:
+            health["protocol"] = int(override)
+        ok(rid, health)
         continue
     if t == "shutdown":
         ok(rid, RESPONSES["shutdown"]["result"])
@@ -98,7 +107,8 @@ for line in sys.stdin:
                  "ranking": list(range(n)),
                  "n_comparisons": n,
                  "criteria": list(canonical["criteria"]),
-                 "usage": dict(canonical["usage"])})
+                 "usage": dict(canonical["usage"]),
+                 "extraction": dict(canonical["extraction"])})
         continue
     err(rid, "invalid_request", message="unknown type")
 sys.exit(0)

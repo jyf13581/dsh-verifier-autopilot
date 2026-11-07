@@ -19,7 +19,7 @@ import { waitFor } from "./helpers/harness.mjs"
 /** The canonical select result as the bridge must hand it to the runner. */
 function canonicalSelectResult() {
   const r = PROTOCOL.responses.select.result
-  return { index: r.index, bestPreview: r.best_preview, scores: r.scores, ranking: r.ranking, nComparisons: r.n_comparisons, criteria: r.criteria, usage: r.usage }
+  return { index: r.index, bestPreview: r.best_preview, scores: r.scores, ranking: r.ranking, nComparisons: r.n_comparisons, criteria: r.criteria, usage: r.usage, extraction: r.extraction }
 }
 
 // ---------- best-of-N selection bridge (Phase 1) ----------
@@ -108,8 +108,10 @@ test("bridge: PROTOCOL.md, the fixtures, and the TypeScript error union agree", 
   assert.deepEqual(Object.keys(PROTOCOL.requests.select).sort(), keysIn("### Select Request"), "select request keys")
   assert.deepEqual(Object.keys(PROTOCOL.requests.progress).sort(), keysIn("### Progress Request"), "progress request keys")
   const documentedResultKeys = keysIn("### Success Response").filter((k) => !["id", "ok", "result"].includes(k))
-  const fixtureResultKeys = [...Object.keys(PROTOCOL.responses.select.result), ...Object.keys(PROTOCOL.responses.select.result.usage)].sort()
-  assert.deepEqual(fixtureResultKeys, documentedResultKeys, "select success result keys (including usage)")
+  const fixtureResultKeys = [...Object.keys(PROTOCOL.responses.select.result), ...Object.keys(PROTOCOL.responses.select.result.usage), ...Object.keys(PROTOCOL.responses.select.result.extraction ?? {})].sort()
+  assert.deepEqual(fixtureResultKeys, documentedResultKeys, "select success result keys (including usage and extraction)")
+  const documentedHealthKeys = keysIn("### Health Response").filter((k) => !["id", "ok", "result"].includes(k))
+  assert.deepEqual(Object.keys(PROTOCOL.responses.health.result).sort(), documentedHealthKeys, "health result keys (review R5 5.4: the Health Response anchor used to point nowhere)")
 })
 
 test("bridge: real sidecar rejects empty candidates offline", async () => {

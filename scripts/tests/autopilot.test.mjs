@@ -271,7 +271,15 @@ test("autopilot pre-step: final accepted direct messages, step=1, and source idl
     const record = host.selections.listSelections()[0]
     assert.equal(record.trigger, "autopilot")
     await waitFor(() => host.selections.getSelection(record.selectionId).status !== "running")
+    // The relay follows the relay-time audit snapshot (review R3 3.3), so it
+    // lands a few git calls after settlement rather than in the same tick.
+    await waitFor(() => source.followups.some((message) => message.source.form === "relay"))
     assert.equal(source.followups.at(-1).source.form, "relay", "winner is relayed after background settlement")
+    assert.ok(host.selections.getSelection(record.selectionId).sourceAtRelay, "the audit baseline was captured before the relay")
+    // Regression (review R3): waitFor used to resolve on the placeholder that
+    // finishRun then replaced, so relayedAt never reached the stored record and
+    // a reload re-delivered the same relay.
+    assert.ok(host.selections.getSelection(record.selectionId).timing?.relayedAt, "relayedAt lands on the stored record")
     assert.deepEqual(host.selections.snapshot().retainedWinners, [record.selectionId])
     assert.ok(existsSync(record.winner.workspace), "winner survives while the source finalizer runs")
     fireIdle(source)
@@ -341,6 +349,10 @@ test("autopilot cleanup: idle, a second idle, and agent/disposed racing on one s
     fireIdle(source)
     fireIdle(source)
     ctx.emit("agent/disposed", { agent: source })
+    // The removal follows the delivery audit, which runs real git processes:
+    // wait for it to start rather than assuming git finishes inside a fixed
+    // sleep (CI flake on e9197ca), then give any duplicate the same window.
+    await waitFor(() => removed.length > 0)
     await quiesce(40)
     assert.deepEqual(removed, [winnerWs], "three triggers, one in-flight removal")
     assert.equal(discardCalls, 1, "the post-audit + discard pass runs once; later triggers join it")

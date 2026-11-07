@@ -1,0 +1,475 @@
+// Review R4: concurrency, lifecycle, and resource reclamation.
+//
+// Each test reproduces one finding from docs/reviews/R4-LIFECYCLE.md against
+// the real host/process code; the fakes model only the documented DSH
+// contracts (agent.status mirror, inbox projection) they stand in for.
+
+import test from "node:test"
+import assert from "node:assert/strict"
+import { chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { execFileSync } from "node:child_process"
+import { fileURLToPath } from "node:url"
+import { tmpdir } from "node:os"
+import path from "node:path"
+import { apiRoutes, VerifierHost } from "../../lib/index.js"
+import { PREFLIGHT_OK_TTL_MS } from "../../lib/selection/host.js"
+import { createModelProber } from "../../lib/selection/probe.js"
+import { BridgeError } from "../../lib/selection/bridge.js"
+import { makeGitRepo, runGit } from "./helpers/git.mjs"
+import { IsolatedWorkspaceManager, gitDiffFull, gitDiffStat } from "../../lib/selection/live.js"
+import { completedTurnEvents, fakeAgent, fakeContext, fakeReq, fakeRes, fireIdle, hostOverrides } from "./helpers/host.mjs"
+import { fakeBridge, fakeEvents, makeFakeFactory, realWorkspaces, selInput, SEL_TMP } from "./helpers/selection.mjs"
+import { SelectionRunner } from "../../lib/selection/candidates.js"
+import { runProcess, runProcessCapture } from "../../lib/selection/proc.js"
+import { runChecks } from "../../lib/selection/checks.js"
+import { quiesce, waitFor } from "./helpers/harness.mjs"
+
+/** A source agent with DSH's documented status mirror and inbox projection:
+ *  followup() queues the relay in inbox.nextTurn; `claim()` moves it into the
+ *  session (a turn started reading it). */
+function contractAgent(id, events) {
+  const agent = fakeAgent(id, events)
+  agent.status = "running"
+  agent.inbox = { nextTurn: [], nextStep: [] }
+  agent.followup = async (message) => {
+    agent.followups.push(message)
+    agent.inbox.nextTurn = [...agent.inbox.nextTurn, message]
+  }
+  agent.claim = () => {
+    const [message, ...rest] = agent.inbox.nextTurn
+    agent.inbox.nextTurn = rest
+    agent.session.events.push({ type: "user/message", seq: 1000 + agent.session.events.length, data: message })
+  }
+  return agent
+}
+
+test("R4 4.1: an idle that is not the relay turn's own end never removes the retained winner", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r4-relay-"))
+  try {
+    const repo = makeGitRepo(base, "source")
+    const ctx = fakeContext()
+    ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+    ctx.llm = { async listModels() { return [{ id: "kimi-k3" }, { id: "minimaxai/minimax-m3" }] } }
+    const host = new VerifierHost(ctx, hostOverrides({ enabled: false }), {
+      selectionsTesting: { factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge: fakeBridge() },
+    })
+    const source = ctx.spawnAgent(contractAgent("sess-r4-relay", completedTurnEvents(1)))
+    source.session.header = { cwd: repo }
+    host.start()
+    const direct = { id: "u1", role: "user", content: [{ type: "text", text: "Refactor src/entry.ts and run the lifecycle tests" }], source: { kind: "user" } }
+    await source.handlers.get("agent/pre-step")[0]({ messages: [direct], turn: 4, step: 1, signal: new AbortController().signal }, async () => ({ kind: "enter", messages: [direct] }))
+    const id = host.selections.listSelections()[0].selectionId
+    // The selection settles while the source's original turn is still running:
+    // the relay is queued behind it.
+    await waitFor(() => source.inbox.nextTurn.some((message) => message.source?.form === "relay"))
+    const workspace = host.selections.getSelection(id).winner.workspace
+
+    // (a) Cancel convergence: the aborted original turn reaches idle while the
+    // relay still waits in the inbox for its own turn.
+    source.status = "idle"
+    fireIdle(source)
+    await quiesce(60)
+    assert.ok(existsSync(workspace), "idle with the relay still queued must not remove the winner it points at")
+    assert.equal(host.selections.getSelection(id).delivery, undefined, "nor audit before the relay was read")
+
+    // (b) A stale trigger (e.g. a coalesced cleanup re-run from an earlier
+    // idle) lands while the relay turn is running.
+    source.status = "running"
+    source.claim()
+    fireIdle(source)
+    await quiesce(60)
+    assert.ok(existsSync(workspace), "the relay turn is reading the winner; cleanup waits for it to finish")
+
+    // (c) The relay turn ends: now the audit and removal run, exactly once.
+    source.status = "idle"
+    fireIdle(source)
+    await waitFor(() => host.selections.getSelection(id).winner.discardedAt)
+    assert.equal(existsSync(workspace), false)
+    assert.equal(host.selections.getSelection(id).delivery?.audited, true)
+    assert.ok((host.snapshot().diagnostics.counters["autopilot.cleanup_deferred"] ?? 0) >= 2, "each deferral is counted")
+    await host.dispose()
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+test("R4 4.1: a source that disappears with its relay still queued is cleaned unconditionally", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r4-gone-"))
+  try {
+    const repo = makeGitRepo(base, "source")
+    const ctx = fakeContext()
+    ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+    ctx.llm = { async listModels() { return [{ id: "kimi-k3" }, { id: "minimaxai/minimax-m3" }] } }
+    const host = new VerifierHost(ctx, hostOverrides({ enabled: false }), {
+      selectionsTesting: { factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge: fakeBridge() },
+    })
+    const source = ctx.spawnAgent(contractAgent("sess-r4-gone", completedTurnEvents(1)))
+    source.session.header = { cwd: repo }
+    host.start()
+    const direct = { id: "u1", role: "user", content: [{ type: "text", text: "Refactor src/entry.ts and run the lifecycle tests" }], source: { kind: "user" } }
+    await source.handlers.get("agent/pre-step")[0]({ messages: [direct], turn: 4, step: 1, signal: new AbortController().signal }, async () => ({ kind: "enter", messages: [direct] }))
+    const id = host.selections.listSelections()[0].selectionId
+    await waitFor(() => source.inbox.nextTurn.some((message) => message.source?.form === "relay"))
+    const workspace = host.selections.getSelection(id).winner.workspace
+    ctx.emit("agent/disposed", { agent: source })
+    await waitFor(() => host.selections.getSelection(id).winner.discardedAt)
+    assert.equal(existsSync(workspace), false, "nothing can read the relay any more, so nothing is retained for it")
+    await host.dispose()
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+// ---------- 4.4 / 4.7: one spawn core, whole-tree reclamation ----------
+
+const POSIX = process.platform !== "win32"
+
+/** PIDs of live `sleep <secs>` processes (exact argv match, no shell involved). */
+function sleepers(secs) {
+  const out = execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" })
+  return out.split("\n").map((line) => line.trim().match(/^(\d+)\s+(?:\/bin\/|\/usr\/bin\/)?sleep (\d+)$/)).filter((m) => m && m[2] === String(secs)).map((m) => Number(m[1]))
+}
+const reap = (pids) => { for (const pid of pids) { try { process.kill(pid, "SIGKILL") } catch { /* gone */ } } }
+// Distinct durations per test so concurrent suites never see each other's sleepers.
+const uniqueSecs = (offset) => 4000 + (process.pid % 500) * 4 + offset
+
+test("R4 4.4: a timed-out command's grandchildren die with it (POSIX process group)", { skip: !POSIX && "process groups are POSIX-only" }, async () => {
+  const secs = uniqueSecs(0)
+  try {
+    // `sleep; echo` forces the shell to fork instead of exec'ing sleep, so the
+    // sleeper is a grandchild of runProcess — exactly the npm test → node shape.
+    const result = await runProcess("sh", ["-c", `sleep ${secs}; echo after`], { timeoutMs: 300, cap: 200 })
+    assert.equal(result.end, "timeout")
+    await quiesce(150)
+    assert.deepEqual(sleepers(secs), [], "the shell's child must not outlive the timeout")
+  } finally { reap(sleepers(secs)) }
+})
+
+test("R4 4.4: an aborted check through the real check runner leaves no process behind", { skip: !POSIX && "process groups are POSIX-only" }, async () => {
+  const secs = uniqueSecs(1)
+  try {
+    const controller = new AbortController()
+    // /bin/sleep is a native program in both sh and pwsh (in pwsh `sleep` is
+    // an alias for the Start-Sleep cmdlet, which would not fork).
+    const pending = runChecks(SEL_TMP, [{ name: "slow", command: `/bin/sleep ${secs}; echo after`, timeoutMs: 30000 }], { signal: controller.signal })
+    await waitFor(() => sleepers(secs).length > 0, 15000)
+    controller.abort()
+    const [result] = await pending
+    assert.equal(result.ok, false)
+    await quiesce(150)
+    assert.deepEqual(sleepers(secs), [], "abort reclaims the whole check tree")
+  } finally { reap(sleepers(secs)) }
+})
+
+test("R4 4.4: reapGroup kills what a command left running after a normal exit; the default leaves it", { skip: !POSIX && "process groups are POSIX-only" }, async () => {
+  const kept = uniqueSecs(2)
+  const reaped = uniqueSecs(3)
+  try {
+    const plain = await runProcess("sh", ["-c", `sleep ${kept} >/dev/null 2>&1 & echo started`], { timeoutMs: 5000 })
+    assert.equal(plain.code, 0)
+    const swept = await runProcess("sh", ["-c", `sleep ${reaped} >/dev/null 2>&1 & echo started`], { timeoutMs: 5000, reapGroup: true })
+    assert.equal(swept.code, 0)
+    assert.match(swept.out, /started/)
+    await quiesce(150)
+    assert.equal(sleepers(kept).length, 1, "without reapGroup a deliberate background job is not touched (git plumbing never opts in)")
+    assert.deepEqual(sleepers(reaped), [], "with reapGroup nothing the command started survives it")
+  } finally { reap([...sleepers(kept), ...sleepers(reaped)]) }
+})
+
+test("R4 4.7b: a child that exits without reading its stdin cannot crash the host with EPIPE", async () => {
+  const node = process.execPath
+  const big = Buffer.alloc(4 * 1024 * 1024, 120)
+  // The pipe buffer (64 KiB) fills, the child exits unread: the pending write
+  // fails with EPIPE. Before R4 that error event was unhandled in execCapture.
+  const captured = await runProcessCapture(node, ["-e", "setTimeout(() => process.exit(3), 200)"], { input: big, timeoutMs: 10000 })
+  assert.equal(captured.end, "exit")
+  assert.equal(captured.code, 3)
+  const text = await runProcess(node, ["-e", "setTimeout(() => process.exit(4), 200)"], { input: big, timeoutMs: 10000 })
+  assert.equal(text.code, 4)
+})
+
+test("R4 4.7: stdin reaches EOF, capture is byte-exact, and overflow stops the child", async () => {
+  const node = process.execPath
+  // A command that reads stdin used to block until the timeout in runProcess.
+  const eof = await runProcess(node, ["-e", "process.stdin.resume(); process.stdin.on('end', () => { console.log('eof'); process.exit(0) })"], { timeoutMs: 5000 })
+  assert.equal(eof.end, "exit")
+  assert.match(eof.out, /eof/)
+  const echoed = await runProcessCapture(node, ["-e", "process.stdin.pipe(process.stdout)"], { input: Buffer.from([0, 1, 2, 255, 10, 0]), timeoutMs: 5000 })
+  assert.deepEqual([...echoed.out], [0, 1, 2, 255, 10, 0], "NUL-separated git listings survive unchanged")
+  const flood = await runProcessCapture(node, ["-e", "setInterval(() => process.stdout.write('x'.repeat(65536)), 1)"], { maxOutputBytes: 100000, timeoutMs: 10000 })
+  assert.equal(flood.end, "overflow")
+  assert.ok(flood.out.length <= 100000)
+  assert.ok(flood.durationMs < 5000, "overflow stops the child instead of waiting for the timeout")
+})
+
+test("R4 4.7: one spawn policy — only proc.ts (and the long-lived sidecar bridge) call spawn()", () => {
+  const dir = fileURLToPath(new URL("../../src", import.meta.url))
+  const offenders = []
+  const walk = (d) => {
+    for (const entry of readdirSync(d, { withFileTypes: true })) {
+      const full = path.join(d, entry.name)
+      if (entry.isDirectory()) { walk(full); continue }
+      if (!entry.name.endsWith(".ts")) continue
+      const rel = path.relative(dir, full).replaceAll("\\", "/")
+      if (rel === "selection/proc.ts" || rel === "selection/bridge.ts") continue
+      const text = readFileSync(full, "utf8")
+      if (/from 'node:child_process'|from "node:child_process"|require\(['"]child_process/.test(text)) offenders.push(rel)
+    }
+  }
+  walk(dir)
+  assert.deepEqual(offenders, [], "spawn outside proc.ts bypasses kill escalation, group reclamation, and EPIPE containment")
+})
+
+// ---------- 4.2: one seed snapshot per selection ----------
+
+function dirtyRepo(base) {
+  const repo = makeGitRepo(base, "source")
+  writeFileSync(path.join(repo, "tracked.txt"), "tracked-base\nuser edit v1\n")
+  writeFileSync(path.join(repo, "notes.md"), "user notes v1\n")
+  return repo
+}
+const read = (dir, file) => existsSync(path.join(dir, file)) ? readFileSync(path.join(dir, file), "utf8") : null
+
+test("R4 4.2: every candidate starts from the same snapshot even while the source keeps working", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r4-seed-"))
+  const manager = new IsolatedWorkspaceManager(path.join(base, "ws"))
+  const dirs = []
+  try {
+    const repo = dirtyRepo(base)
+    const headAtStart = runGit(repo, "rev-parse", "HEAD")
+    dirs.push(await manager.prepare({ selectionId: "sel-r4seed", index: 0, sourceCwd: repo, strictSnapshot: true }))
+    // The source agent is not paused by autopilot: between two prepares it
+    // edits a file, commits, and creates another.
+    writeFileSync(path.join(repo, "tracked.txt"), "tracked-base\nuser edit v2\n")
+    writeFileSync(path.join(repo, "src", "entry.ts"), "export const value = 2\n")
+    runGit(repo, "commit", "-qam", "source agent commit")
+    writeFileSync(path.join(repo, "late.txt"), "created after c0 was prepared\n")
+    dirs.push(await manager.prepare({ selectionId: "sel-r4seed", index: 1, sourceCwd: repo, strictSnapshot: true }))
+    for (const file of ["tracked.txt", "notes.md", "late.txt", "src/entry.ts"]) {
+      assert.equal(read(dirs[1], file), read(dirs[0], file), file + ": c1 must see exactly what c0 saw (old code: the live source)")
+    }
+    assert.equal(runGit(dirs[1], "rev-parse", "HEAD"), runGit(dirs[0], "rev-parse", "HEAD"), "same commit (old code: c1 at the source agent's new commit)")
+    assert.equal(runGit(dirs[0], "rev-parse", "HEAD"), headAtStart)
+    assert.equal(read(dirs[1], "tracked.txt"), "tracked-base\nuser edit v1\n")
+    const report = manager.seedReport("sel-r4seed")
+    assert.deepEqual(report, { seedIndex: 0, head: headAtStart, attempts: 1, consistent: true })
+    // Copies inherit the seed's state as their baseline: no candidate starts with "work".
+    const stat = await gitDiffStat(dirs[1])
+    assert.equal(stat.files + stat.untracked, 0, "the copy's inherited state is not candidate work")
+  } finally {
+    for (const dir of dirs) await manager.remove(dir).catch(() => {})
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test("R4 4.2: a source edit during the seed snapshot triggers a re-snapshot; endless churn is reported, not hidden", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r4-torn-"))
+  const dirs = []
+  let manager
+  try {
+    const repo = dirtyRepo(base)
+    // Edit lands mid-snapshot on the first attempt only: the retry is clean.
+    manager = new IsolatedWorkspaceManager(path.join(base, "ws"), undefined, {
+      onSeedMirrored: (attempt) => { if (attempt === 1) writeFileSync(path.join(repo, "notes.md"), "user notes v2\n") },
+    })
+    dirs.push(await manager.prepare({ selectionId: "sel-r4torn", index: 0, sourceCwd: repo, strictSnapshot: true }))
+    assert.equal(read(dirs[0], "notes.md"), "user notes v2\n", "the re-snapshot holds the settled state")
+    assert.deepEqual({ ...manager.seedReport("sel-r4torn"), head: "-" }, { seedIndex: 0, head: "-", attempts: 2, consistent: true })
+    await manager.remove(dirs.pop())
+    assert.equal(manager.seedReport("sel-r4torn"), undefined, "removing the seed forgets it")
+
+    // Source changes during every attempt: bounded, and flagged.
+    let n = 0
+    manager = new IsolatedWorkspaceManager(path.join(base, "ws2"), undefined, {
+      onSeedMirrored: () => { n += 1; writeFileSync(path.join(repo, "notes.md"), "churn " + n + "\n") },
+    })
+    dirs.push(await manager.prepare({ selectionId: "sel-r4churn", index: 0, sourceCwd: repo, strictSnapshot: true }))
+    const report = manager.seedReport("sel-r4churn")
+    assert.equal(report.attempts, 3)
+    assert.equal(report.consistent, false)
+  } finally {
+    for (const dir of dirs) await manager?.remove(dir).catch(() => {})
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+// ---------- 4.3: a busy slot is a visible skip, not a buried warning ----------
+
+test("R4 4.3: an autopilot turn that finds the selection slot taken is recorded as a skip in /state", async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r4-busy-"))
+  try {
+    const ctx = fakeContext()
+    ctx.setService("agentDefaultModel", { currentSelection: () => ({ provider: "kimi", model: "kimi-k3" }) })
+    ctx.llm = { async listModels() { return [{ id: "kimi-k3" }, { id: "minimaxai/minimax-m3" }] } }
+    // Candidates of the first selection hang: it holds the only slot.
+    const factory = makeFakeFactory({ scripts: [{ hang: true }, { hang: true }] })
+    const host = new VerifierHost(ctx, hostOverrides({ enabled: false }), {
+      selectionsTesting: { factory, workspaces: realWorkspaces, bridge: fakeBridge() },
+    })
+    const first = ctx.spawnAgent(fakeAgent("sess-r4-first", completedTurnEvents(1)))
+    first.session.header = { cwd: makeGitRepo(base, "a") }
+    const second = ctx.spawnAgent(fakeAgent("sess-r4-second", completedTurnEvents(1)))
+    second.session.header = { cwd: makeGitRepo(base, "b") }
+    host.start()
+    const direct = { id: "u1", role: "user", content: [{ type: "text", text: "Refactor src/entry.ts and run the lifecycle tests" }], source: { kind: "user" } }
+    const enter = async () => ({ kind: "enter", messages: [direct] })
+    await first.handlers.get("agent/pre-step")[0]({ messages: [direct], turn: 2, step: 1, signal: new AbortController().signal }, enter)
+    const holder = host.selections.activeSelectionId()
+    assert.ok(holder, "the first selection holds the slot")
+    const decision = await second.handlers.get("agent/pre-step")[0]({ messages: [direct], turn: 5, step: 1, signal: new AbortController().signal }, enter)
+    assert.equal(decision.kind, "enter", "the source turn itself is never blocked")
+    const state = host.snapshot()
+    assert.equal(state.autopilotSkipped.count, 1)
+    assert.deepEqual({ ...state.autopilotSkipped.recent[0], at: typeof state.autopilotSkipped.recent[0].at },
+      { at: "number", sourceSessionId: "sess-r4-second", reason: "busy", activeSelectionId: holder })
+    assert.equal(state.diagnostics.counters["autopilot.skipped_busy"], 1)
+    assert.equal(state.diagnostics.entries.filter((entry) => entry.scope === "autopilot.admission").length, 0,
+      "busy is a policy outcome, not an admission fault (old code: a generic autopilot.admission warning only)")
+    host.selections.cancel(holder)
+    await host.dispose()
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+// ---------- 4.5: readiness proofs expire and are bound to the key value ----------
+
+test("R4 4.5: a rotated key or an expired proof re-runs the verifier preflight", async () => {
+  const ctx = fakeContext()
+  let key = "key-one"
+  ctx.credentials = { resolve: async () => ({ value: key }) }
+  const bridge = fakeBridge()
+  const preflightKeys = []
+  bridge.preflight = async (request) => { preflightKeys.push(request.apiKey) }
+  const host = new VerifierHost(ctx, hostOverrides(), { selectionsTesting: { factory: makeFakeFactory({}), workspaces: realWorkspaces, bridge } })
+  let clock = 1_000_000
+  host.selections.now = () => clock
+  ctx.spawnAgent(fakeAgent("sess-A", completedTurnEvents(1)))
+  const selectRoute = apiRoutes(host).find((r) => r.path.endsWith("/select"))
+  const round = async () => {
+    const res = fakeRes()
+    await selectRoute.handler(fakeReq({ sourceSessionId: "sess-A", candidateCount: 2, selectTimeoutMs: 120000 }), res)
+    assert.equal(res.status, 202, res.bodyText)
+    const id = JSON.parse(res.bodyText).selection.selectionId
+    const final = await waitFor(() => { const s = host.selections.getSelection(id); return s && s.status !== "running" ? s : null })
+    assert.equal(final.status, "completed")
+    await host.selections.releaseWinner(id)
+  }
+  await round()
+  await round()
+  assert.deepEqual(preflightKeys, ["key-one"], "same key, fresh proof: memoized")
+  key = "key-two"
+  await round()
+  assert.deepEqual(preflightKeys, ["key-one", "key-two"], "a rotated key value proves itself (old code: same env name = still proven)")
+  clock += PREFLIGHT_OK_TTL_MS + 1
+  await round()
+  assert.equal(preflightKeys.length, 3, "a proof older than the TTL is re-established")
+  await host.selections.dispose()
+})
+
+test("R4 4.5: a model's ok probe verdict expires; an expired ok is re-probed, never reported dead", async () => {
+  let clock = 0
+  const calls = []
+  const prober = createModelProber({
+    baseURL: "http://mock.local/v1", apiKey: "k", now: () => clock, okTtlMs: 60_000, deadCooldownMs: 120_000,
+    fetchImpl: async (_url, init) => { calls.push(JSON.parse(init.body).model); return { ok: true, status: 200, body: null } },
+  })
+  assert.equal(await prober.probe("m"), true)
+  clock += 30_000
+  assert.equal(await prober.probe("m"), true)
+  assert.equal(calls.length, 1, "within the TTL the verdict is reused")
+  clock += 40_000
+  assert.equal(await prober.probe("m"), true, "past okTtl but inside the dead cooldown: still re-probed, not 'dead'")
+  assert.equal(calls.length, 2)
+})
+
+// ---------- 4.6: the decisive select never shares the pipe with a sample ----------
+
+/** Candidates that show partial work at once (so progress ticks have a
+ *  trajectory to score) and settle after 1.6 s. */
+function liveLookingFactory() {
+  const base = makeFakeFactory({ scripts: [{ idleDelay: 1600 }, { idleDelay: 1600 }] })
+  return {
+    ...base,
+    async create(spec) {
+      const handle = await base.create(spec)
+      const agent = handle.agent
+      const settle = agent.whenIdle.bind(agent)
+      agent.whenIdle = () => {
+        agent.session = { events: agent.session.events.concat(fakeEvents(0).map((ev, k) => ({ ...ev, seq: 900 + k }))) }
+        return settle()
+      }
+      return handle
+    },
+  }
+}
+
+test("R4 4.6: an in-flight progress sample is cancelled and drained before ranking", async () => {
+  let inFlight = 0
+  let progressCalls = 0
+  let inFlightAtSelect = null
+  const bridge = fakeBridge((req) => {
+    inFlightAtSelect = inFlight
+    return { index: 0, bestPreview: "", scores: req.candidates.map((_, i) => (i === 0 ? 0.9 : 0.4)), ranking: req.candidates.map((_, i) => i), nComparisons: req.candidates.length, criteria: ["c1"], usage: { calls: req.candidates.length, input_tokens: 1, cached_input_tokens: 0, uncached_input_tokens: 1, output_tokens: 1, reasoning_tokens: 0, cache_hit_rate: 0 } }
+  })
+  // A sample that never answers on its own — a slow provider. On the real
+  // bridge its eventual timeout tears the sidecar down, together with every
+  // request queued behind it on the serial pipe.
+  bridge.progress = (req) => new Promise((_resolve, reject) => {
+    progressCalls += 1
+    inFlight += 1
+    const stop = () => { inFlight -= 1; reject(new BridgeError("bridge_aborted", "sample aborted", false)) }
+    if (req.signal?.aborted) stop()
+    else req.signal?.addEventListener("abort", stop, { once: true })
+  })
+  const warnings = []
+  const diagnostics = { warn: (scope) => { warnings.push(scope) }, count: () => {} }
+  const stat = (fingerprint) => ({ files: 1, insertions: 1, deletions: 0, untracked: 0, fingerprint })
+  const runner = new SelectionRunner({
+    factory: liveLookingFactory(),
+    workspaces: realWorkspaces,
+    bridge,
+    diagnostics,
+    diffStat: async (cwd) => stat(path.basename(cwd) + "-fp"),
+  })
+  const { record } = await runner.run(selInput({ candidateCount: 2, nEvaluations: 1, pivots: 0, progressGuard: { intervalMs: 1000, maxChecks: 3 } }))
+  assert.ok(progressCalls >= 1, "a sample was in flight when the candidates settled")
+  assert.equal(inFlightAtSelect, 0, "select is dispatched only after the sample is cancelled (old code: queued behind it)")
+  assert.equal(inFlight, 0, "no sample outlives the run")
+  assert.equal(record.status, "completed", String(record.error))
+  assert.deepEqual(warnings.filter((scope) => scope === "progress.sample"), [], "the runner's own drain is not reported as a degradation")
+})
+
+// ---------- 4.2b: snapshots and evidence diffs ignore presentation config ----------
+
+test("R4 4.2b: a user's diff.external, color.ui=always or textconv cannot corrupt the seed patch or the evidence diff", { skip: process.platform === "win32" && "POSIX shell script as the external diff" }, async () => {
+  const base = mkdtempSync(path.join(tmpdir(), "va-r4-diffcfg-"))
+  const manager = new IsolatedWorkspaceManager(path.join(base, "ws"))
+  const dirs = []
+  try {
+    const repo = makeGitRepo(base, "source")
+    writeFileSync(path.join(repo, "data.dat"), "lower case payload\n")
+    runGit(repo, "add", "data.dat")
+    runGit(repo, "commit", "-qm", "add data")
+    // Ordinary ~/.gitconfig content, set here at repo level (which the
+    // candidate worktrees share): a diff viewer, forced colour, a textconv.
+    const ext = path.join(base, "extdiff.sh")
+    writeFileSync(ext, "#!/bin/sh\necho EXTERNAL-DIFF-OUTPUT \"$1\"\n")
+    chmodSync(ext, 0o755)
+    runGit(repo, "config", "diff.external", ext)
+    runGit(repo, "config", "color.ui", "always")
+    runGit(repo, "config", "diff.upper.textconv", "tr a-z A-Z <")
+    writeFileSync(path.join(repo, ".git", "info", "attributes"), "*.dat diff=upper\n")
+    writeFileSync(path.join(repo, "data.dat"), "lower case payload, edited\n")
+    writeFileSync(path.join(repo, "tracked.txt"), "tracked-base\nuser edit v1\n")
+
+    dirs.push(await manager.prepare({ selectionId: "sel-r4cfg", index: 0, sourceCwd: repo, strictSnapshot: true }))
+    assert.equal(read(dirs[0], "data.dat"), "lower case payload, edited\n")
+    assert.equal(read(dirs[0], "tracked.txt"), "tracked-base\nuser edit v1\n")
+
+    // The candidate's own work, as evidence and as the relay patch.
+    writeFileSync(path.join(dirs[0], "tracked.txt"), "tracked-base\ncandidate fix\n")
+    const full = await gitDiffFull(dirs[0])
+    assert.ok(full, "diff produced")
+    assert.match(full.patch, /^diff --git /, "a real unified diff (old code: external tool output or ANSI colour codes)")
+    assert.ok(!full.patch.includes("\u001b[") && !full.patch.includes("EXTERNAL-DIFF-OUTPUT"))
+    assert.match(full.patch, /\+candidate fix/)
+  } finally {
+    for (const dir of dirs) await manager.remove(dir).catch(() => {})
+    rmSync(base, { recursive: true, force: true })
+  }
+})

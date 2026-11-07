@@ -228,6 +228,53 @@ def main():
                       % (h1, h2, h3, h4, h5)))
     except Exception as exc:
         gates.append(("resilient_client", False, repr(exc)))
+    # (i) error taxonomy (review R5 5.4): typed provider classes decide
+    # retriability before any message text; "logprob" in a transient error's
+    # text must not become the permanent missing_logprobs verdict. A fake
+    # `openai` module stands in for the venv's (same class hierarchy).
+    try:
+        import json as _json
+        import types as _types
+        import llm_verifier_sidecar as _sc
+        fake = _types.ModuleType("openai")
+
+        class APIConnectionError(Exception):
+            pass
+
+        class APITimeoutError(APIConnectionError):
+            pass
+
+        class APIStatusError(Exception):
+            def __init__(self, message, status_code):
+                super().__init__(message)
+                self.status_code = status_code
+
+        fake.APIConnectionError = APIConnectionError
+        fake.APITimeoutError = APITimeoutError
+        fake.APIStatusError = APIStatusError
+        saved = sys.modules.get("openai")
+        sys.modules["openai"] = fake
+        try:
+            cases = [
+                ("503 echoing logprobs", APIStatusError("upstream overloaded; request had logprobs=true", 503), ("provider_error", True)),
+                ("429 echoing top_logprobs", APIStatusError("rate limited (top_logprobs=20)", 429), ("provider_error", True)),
+                ("timeout echoing logprobs", APITimeoutError("Request timed out (logprobs=20)"), ("timeout", True)),
+                ("400 rejecting logprobs", APIStatusError("logprobs is not supported for this model", 400), ("missing_logprobs", False)),
+                ("upstream no-logprobs", RuntimeError("DeepSeek returned no answer logprobs (finish_reason='length', reasoning consumed the 64000-token budget)"), ("missing_logprobs", False)),
+                ("undecodable reply", _json.JSONDecodeError("Expecting value", "<html>", 0), ("provider_error", True)),
+                ("library arg check", ValueError("criteria is empty"), ("invalid_request", False)),
+                ("missing key", _sc.MissingAPIKeyError("no key"), ("missing_api_key", False)),
+                ("anything else", RuntimeError("tournament exploded"), ("selection_failed", False)),
+            ]
+            wrong = ["%s -> %r (want %r)" % (name, _sc._map_exception(exc), want) for name, exc, want in cases if _sc._map_exception(exc) != want]
+        finally:
+            if saved is None:
+                sys.modules.pop("openai", None)
+            else:
+                sys.modules["openai"] = saved
+        gates.append(("error_taxonomy", not wrong, "; ".join(wrong) or "%d cases" % len(cases)))
+    except Exception as exc:
+        gates.append(("error_taxonomy", False, repr(exc)))
     ok = True
     for name, passed, note in gates:
         status = "SKIP" if passed and note.startswith("SKIP ") else ("PASS" if passed else "FAIL")

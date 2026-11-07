@@ -13,12 +13,15 @@ import sys
 PY = sys.executable
 SIDECAR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "..", "..", "bridge", "llm_verifier_sidecar.py")
-CRED = r"C:\Users\Admin\.dsh\.credentials.yaml"
+# Review R3 3.6: no machine-specific paths; env first, then ~/.dsh.
+CRED = os.environ.get("DSH_CREDENTIALS") or os.path.join(os.path.expanduser("~"), ".dsh", ".credentials.yaml")
 
-raw = open(CRED, encoding="utf-8").read()
-m = re.search(r"^KIMI_API_KEY:[ \t]*(\S+)[ \t]*$", raw, re.M)
-assert m, "KIMI_API_KEY not found"
-KEY = m.group(1)
+BASE_URL = os.environ.get("KIMI_BASE_URL") or "https://chat.holisthoom.top/v1"  # plugin default baseURL
+KEY = os.environ.get("KIMI_API_KEY")
+if not KEY and os.path.exists(CRED):
+    m = re.search(r"^KIMI_API_KEY:[ \t]*(\S+)[ \t]*$", open(CRED, encoding="utf-8").read(), re.M)
+    KEY = m.group(1) if m else None
+assert KEY, "KIMI_API_KEY not found in env or " + CRED
 
 env = dict(os.environ)
 env["KIMI_API_KEY"] = KEY
@@ -59,7 +62,7 @@ try:
                       "description": "Reward objective correctness backed by executed checks; unverified claims fail."}],
         "ground_truth_note": None, "n_evaluations": 1, "pivots": 1,
         "seed": 42, "model": "nvidia/nemotron-3-super-120b-a12b",
-        "base_url": "https://chat.holisthoom.top/v1",
+        "base_url": BASE_URL,
         "api_key_env": "KIMI_API_KEY", "cache": None, "on_error": "raise",
         "max_workers": 2, "progress": False})
 finally:

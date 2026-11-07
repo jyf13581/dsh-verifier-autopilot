@@ -136,10 +136,47 @@ All responses contain the same `id` as the request (unless the request was malfo
       "reasoning_tokens": <integer>,
       "cache_hit_rate": <float>,
       "uncached_input_tokens": <integer>
+    },
+    "extraction": {            // optional (review R3 3.5); absent on older sidecars
+      "logprobs": <integer>,   // scores read from the score-token distribution
+      "literal": <integer>,    // no usable distribution: literal letter parsed
+      "default": <integer>     // no parseable tag: upstream substituted 0.5
     }
   }
 }
 ```
+
+`extraction` counts every `extract_score` call of the request (two per
+verifier call: `score_A` and `score_B`). The upstream extractor never raises,
+so `on_error="raise"` cannot catch an unparseable reply; any `default > 0`
+means a ranking input was a substituted neutral score, not a verifier
+judgment. The host records the tally as `scoreExtraction` and names it in the
+relay. Like `usage`, a malformed tally is dropped rather than failing the
+verdict.
+
+### Health Response
+
+```json
+{
+  "id": "<same as request>",
+  "ok": true,
+  "result": {
+    "protocol": 1,  // protocol version this sidecar speaks
+    "python": "<sys.version>",
+    "llm_verifier_version": "<string or null>",
+    "select_available": <boolean>,
+    "note": "<string>",
+    "deepseek_effort": "<string or null>"
+  }
+}
+```
+
+`protocol` is the version of this document the sidecar implements (review R5
+5.4). The bridge sends a health frame first on every spawn and tears the child
+down with a non-retriable `bridge_protocol` failure when the version is absent
+or differs from its own, so a stale or foreign sidecar script fails the first
+request loudly instead of answering frames it may interpret differently.
+Bump it on any change to a request or result field's meaning.
 
 ### Failure Response
 
@@ -157,7 +194,7 @@ All responses contain the same `id` as the request (unless the request was malfo
 
 ## Preflight (caller-side note)
 
-The TS bridge offers `VerifierBridge.preflight()`: one tiny asymmetric pair must score strictly in favor of the present-output trajectory (mechanical + weak-semantic gate). Hosts memoize the pass per (baseURL, model, apiKeyEnv) and fail the selection before any candidate spend when it fails. This catches providers that return logprobs but never emit usable score tags — the residual case where scoring silently degenerates to 0.5 ties.
+The TS bridge offers `VerifierBridge.preflight()`: one tiny asymmetric pair must score strictly in favor of the present-output trajectory (mechanical + weak-semantic gate). Hosts memoize the pass per (baseURL, model, apiKeyEnv, a fingerprint of the key value, effort) for at most 30 minutes (review R4 4.5) and fail the selection before any candidate spend when it fails. This catches providers that return logprobs but never emit usable score tags — the residual case where scoring silently degenerates to 0.5 ties.
 
 ## Error Codes
 
@@ -188,7 +225,7 @@ The TS bridge offers `VerifierBridge.preflight()`: one tiny asymmetric pair must
 ```
 **Response:**
 ```
-{"id": "h1", "ok": true, "result": {"python": "3.11....", "llm_verifier_version": "0.2.0", "select_available": true, "note": "client must be deepseek-flagged: sampled score tags, no prefill support on this relay", "deepseek_effort": "off"}}
+{"id": "h1", "ok": true, "result": {"protocol": 1, "python": "3.11....", "llm_verifier_version": "0.2.0", "select_available": true, "note": "client must be deepseek-flagged: sampled score tags, no prefill support on this relay", "deepseek_effort": "off"}}
 ```
 
 **Select request (single candidate, short-circuits):**

@@ -20,19 +20,30 @@ import {
   type EventRecord,
 } from './evidence.js'
 import { appendJsonlLedger, compactJsonlLedger, ledgerExceeds, readJsonlLedger } from './ledger.js'
-import type { StateResponse, VerificationRecord, WebRoute } from './protocol.js'
+import type { AutopilotSkip, StateResponse, VerificationRecord, WebRoute } from './protocol.js'
 import { resolveKey, type Credentials } from './util.js'
 import { diagnostics as defaultDiagnostics, type Diagnostics } from './diagnostics.js'
 import { isHookSource, requireHookSource, type AgentCreate, type HookSource } from './dsh-context.js'
-import { SelectionHost } from './selection/host.js'
+import { SelectionApiError, SelectionHost } from './selection/host.js'
 import { runChecks } from './selection/checks.js'
-import { evaluateDelivery } from './selection/candidates.js'
+import { evaluateDelivery, type SelectionRecord } from './selection/candidates.js'
 import { buildAutopilotContext, buildAutopilotRelay, planAutopilotTask } from './selection/autopilot.js'
-import { gitRepoState, resolveAutopilotSourceCwd } from './selection/live.js'
+import { adoptionOf, gitDiffStat, gitRepoState, resolveAutopilotSourceCwd } from './selection/live.js'
 import { createModelProber, type ModelProber } from './selection/probe.js'
 
 export type { Credentials } from './util.js'
-export type Agent = { id: string; session: { events: readonly EventRecord[]; header?: { cwd?: string; parentSession?: string } }; ctx: Context; followup: (message: UserMessage) => void | Promise<void> }
+export type Agent = {
+  id: string
+  session: { events: readonly EventRecord[]; header?: { cwd?: string; parentSession?: string } }
+  ctx: Context
+  followup: (message: UserMessage) => void | Promise<void>
+  /** DSH mirrors every `agent/status` transition here; optional so embedded
+   *  hosts and older runtimes without it keep the idle-trigger behavior. */
+  readonly status?: string
+  /** DSH's pending-input projection (review R4 4.1): a relay still listed
+   *  here has not been consumed by any turn yet. */
+  readonly inbox?: { readonly nextTurn?: readonly { id?: unknown }[]; readonly nextStep?: readonly { id?: unknown }[] }
+}
 export type { WebRoute } from './protocol.js'
 /** What the plugin needs from DSH's agent registry: enumeration and lookup
  *  of live agents (legacy verification) plus child creation (best-of-N
@@ -158,6 +169,15 @@ export class VerifierHost {
    *  two passes raced the same post-audit (running the configured test command
    *  twice in the user's repository) and the same worktree removal. */
   private readonly autopilotCleanupInFlight = new Map<string, { promise: Promise<void>; rerun: boolean }>()
+  /** Review R4 4.1: the DSH message id of each selection's relay, so cleanup
+   *  can tell whether a turn has consumed it yet. In memory only; a reload
+   *  re-relays (recoverAutopilotRelays) and records the new id. */
+  private readonly relayMessageIds = new Map<string, string>()
+  /** Review R4 4.3: autopilot launches refused because the single selection
+   *  slot was taken. A policy outcome, not a fault — kept out of the warning
+   *  feed and surfaced as its own state instead. */
+  private autopilotSkipCount = 0
+  private readonly autopilotSkips: AutopilotSkip[] = []
 
   /** Candidate-model liveness prober, memoized per (baseURL, key) pair so
    *  config churn never keeps a stale credential around. */
@@ -199,6 +219,7 @@ export class VerifierHost {
       nEvaluationsDefault: () => this.config.selectionEvaluations,
       pivotsDefault: () => this.config.selectionPivots,
       marginThresholdDefault: () => this.config.selectionMarginThreshold,
+      uncalibratedMarginPolicyDefault: () => this.config.selectionUncalibratedMarginPolicy,
       selectTimeoutMsDefault: () => this.config.selectionSelectTimeoutMs,
       // I.5 audit pack sits next to the ledger; disabled when the ledger is.
       artifactsDir: options.selectionsFile == null ? null : path.join(path.dirname(options.selectionsFile), 'selection-artifacts'),
@@ -343,7 +364,7 @@ export class VerifierHost {
       // Detach all slow work from the pre-step promise. The source task enters
       // immediately; only a completed winner is relayed later, when the source
       // agent is still alive. Failures are observable in the selection ledger.
-      void this.selections.waitFor(selectionId).then((record) => {
+      void this.selections.waitFor(selectionId).then(async (record) => {
         const current = this.autopilotActive.get(sourceId)
         current?.delete(selectionId as string)
         if (current && current.size === 0) this.autopilotActive.delete(sourceId)
@@ -355,6 +376,10 @@ export class VerifierHost {
         if (this.ctx.agents?.get(sourceId) !== agent) return
         const retained = record.winner ?? record.fallback
         if (retained) {
+          // The audit baseline is the source as it is NOW, before the relay
+          // can influence it (review R3 3.3). Re-check liveness afterwards.
+          await this.snapshotSourceAtRelay(record)
+          if (this.disposed || this.ctx.agents?.get(sourceId) !== agent) return
           const pending = this.autopilotCleanup.get(sourceId) ?? new Set<string>()
           pending.add(selectionId as string)
           this.autopilotCleanup.set(sourceId, pending)
@@ -363,10 +388,7 @@ export class VerifierHost {
         // Ledger + artifact must see relayedAt now, not at some later discard:
         // a hot reload between relay and cleanup would otherwise erase the mark.
         this.selections.pubRecord(record)
-        void Promise.resolve(agent.followup(createUserMessage({
-          source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
-          content: [{ type: 'text', text: buildAutopilotRelay(record) }],
-        }))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId }))
+        void Promise.resolve(agent.followup(this.relayMessage(record))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId }))
       }).catch((error: unknown) => {
         const current = this.autopilotActive.get(sourceId)
         current?.delete(selectionId as string)
@@ -380,6 +402,14 @@ export class VerifierHost {
       // Once admitted, its terminal outcome is handled by the background waiter.
       payload.signal.removeEventListener('abort', cancel)
       payload.signal.throwIfAborted()
+      if (error instanceof SelectionApiError && error.code === 'selection-busy') {
+        this.autopilotSkipCount += 1
+        this.autopilotSkips.unshift({ at: Date.now(), sourceSessionId: String(agent.id), reason: 'busy', activeSelectionId: this.selections.activeSelectionId() })
+        this.autopilotSkips.length = Math.min(this.autopilotSkips.length, 20)
+        this.diagnostics.count('autopilot.skipped_busy')
+        this.emit()
+        return decision
+      }
       this.diagnostics.warn('autopilot.admission', error, { sourceSessionId: String(agent.id) })
       return decision
     }
@@ -409,16 +439,80 @@ export class VerifierHost {
     return entry.promise
   }
 
+  /** The relay followup, with its message id remembered for cleanup gating. */
+  private relayMessage(record: SelectionRecord): UserMessage {
+    const message = createUserMessage({
+      source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
+      content: [{ type: 'text', text: buildAutopilotRelay(record) }],
+    })
+    if (typeof message.id === 'string') this.relayMessageIds.set(record.selectionId, message.id)
+    return message
+  }
+
+  /** Review R4 4.1: a retained winner may be audited and removed only once
+   *  the turn that reads its relay has finished. A cleanup trigger is just an
+   *  idle that happened at some point; by the time a coalesced re-run or a
+   *  cancel-convergence idle reaches a slot, the relay may still be queued or
+   *  its turn may be running. So decide from the agent's state NOW: the
+   *  source must not be running and the relay must no longer be pending in
+   *  its inbox (consumed, or discarded by a cancel — either way final). */
+  private relayStillOutstanding(agent: Agent, selectionId: string): boolean {
+    if (agent.status === 'running') return true
+    const relayId = this.relayMessageIds.get(selectionId)
+    if (!relayId || !agent.inbox) return false
+    const queued = [...(agent.inbox.nextTurn ?? []), ...(agent.inbox.nextStep ?? [])]
+    return queued.some((message) => message?.id === relayId)
+  }
+
+  /** Review R3 3.3: capture what the delivery audit is compared against —
+   *  source HEAD, a content fingerprint of its worktree, and which of the
+   *  retained candidate's own files the source already contains. */
+  private async snapshotSourceAtRelay(record: SelectionRecord, concurrent = false): Promise<void> {
+    const cwd = typeof record.configSnapshot?.sourceCwd === 'string' ? record.configSnapshot.sourceCwd as string : undefined
+    const slot = record.winner ?? record.fallback
+    if (!cwd || !slot || record.sourceAtRelay) return
+    const at = Date.now()
+    try {
+      const [state, stat, adoption] = await Promise.all([gitRepoState(cwd), gitDiffStat(cwd), adoptionOf(slot.workspace, cwd)])
+      record.sourceAtRelay = {
+        at,
+        head: state?.head ?? null,
+        worktreeFingerprint: stat?.fingerprint ?? null,
+        adoptedPaths: adoption ? adoption.adopted : null,
+        candidateFiles: adoption ? adoption.total : null,
+        ...(concurrent ? { concurrent: true } : {}),
+      }
+    } catch (error) {
+      record.sourceAtRelay = { at, head: null, worktreeFingerprint: null, adoptedPaths: null, candidateFiles: null, error: error instanceof Error ? error.message.slice(0, 200) : String(error).slice(0, 200) }
+      this.diagnostics.warn('autopilot.relay_snapshot', error, { selectionId: record.selectionId })
+    }
+  }
+
   private async cleanupAutopilotWinnersOnce(sourceSessionId: string): Promise<void> {
     const pending = this.autopilotCleanup.get(sourceSessionId)
     if (!pending) return
+    // A source that is gone (agent/disposed, host dispose) can never read the
+    // relay: everything it retains is cleaned unconditionally.
+    // Read the agent's state after the triggering emit has fully returned:
+    // the runtime documents `status` as mirrored on each transition but not
+    // whether the mirror is written before or after the event fires.
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    const live = this.disposed ? undefined : this.agents.get(sourceSessionId)
     for (const selectionId of [...pending]) {
+      if (live && this.relayStillOutstanding(live, selectionId)) {
+        // The next idle after the relay turn retries; the slot stays retained.
+        this.diagnostics.count('autopilot.cleanup_deferred')
+        continue
+      }
       try {
         // G-4 post-audit BEFORE discard: compare the source repo state against
         // the start-time snapshot. Audited-but-unevidenced integration reports
         // 'no'; observed HEAD/dirty evidence without running tests can only be
-        // 'unknown' — 'yes' requires deterministic passing tests, which this
-        // hook intentionally never runs on the user's repository.
+        // 'unknown' — 'yes' requires deterministic passing tests. Those run
+        // ONLY when the operator configured selectionPostAuditTestCommand, and
+        // then they DO execute in the user's source repository (review R1
+        // 1.5): the field is settings-only over the unauthenticated HTTP
+        // transport, and the command runs with credential variables withheld.
         const rec = this.selections.getSelection(selectionId)
         const slot = rec ? (rec.winner ?? rec.fallback) : undefined
         if (rec && slot && slot.discardedAt === undefined && !rec.delivery) {
@@ -433,15 +527,32 @@ export class VerifierHost {
               } else {
                 const before = rec.sourceHeadAtStart ?? null
                 const headChanged = before !== null && state.head !== null ? state.head !== before : null
+                // Attributable integration (review R3 3.3): compare against the
+                // relay-time snapshot and look for the candidate's own bytes.
+                const relay = rec.sourceAtRelay && !rec.sourceAtRelay.error ? rec.sourceAtRelay : undefined
+                let attribution: { changedSinceRelay: boolean | null; adoptedNew: number | null; candidateFiles: number | null } | undefined
+                let adoptedFiles: string[] | undefined
+                if (relay) {
+                  const [nowStat, adoption] = await Promise.all([gitDiffStat(cwd), adoptionOf(slot.workspace, cwd)])
+                  const changedSinceRelay = relay.head === null || state.head === null || relay.worktreeFingerprint === null || !nowStat
+                    ? null
+                    : state.head !== relay.head || nowStat.fingerprint !== relay.worktreeFingerprint
+                  if (adoption && relay.adoptedPaths) {
+                    const already = new Set(relay.adoptedPaths)
+                    adoptedFiles = adoption.adopted.filter((file) => !already.has(file))
+                  }
+                  attribution = { changedSinceRelay, adoptedNew: adoptedFiles ? adoptedFiles.length : null, candidateFiles: adoption ? adoption.total : relay.candidateFiles }
+                }
                 // An absent/non-string command means "no test configured", never
                 // an audit failure (embedded hosts may pass a partial config).
                 const testCommand = typeof this.config.selectionPostAuditTestCommand === 'string' ? this.config.selectionPostAuditTestCommand.trim() : ''
                 let testsExit: number | null = null
                 let testsRan = false
                 let postAuditError: string | undefined
-                if (testCommand && (headChanged === true || state.dirtyEntries > 0)) {
+                const mayBeIntegrated = attribution ? (attribution.adoptedNew ?? 0) > 0 : headChanged === true || state.dirtyEntries > 0
+                if (testCommand && mayBeIntegrated) {
                   try {
-                    const results = await runChecks(cwd, [{ name: 'post-audit', command: testCommand, timeoutMs: 120000 }])
+                    const results = await runChecks(cwd, [{ name: 'post-audit', command: testCommand, timeoutMs: 120000 }], { secretEnvNames: [this.config.apiKeyEnv] })
                     testsExit = results[0]?.exitCode ?? null
                     testsRan = true
                   } catch (runError) {
@@ -454,9 +565,12 @@ export class VerifierHost {
                   dirtyEntries: state.dirtyEntries,
                   testsConfigured: testCommand.length > 0,
                   testsExit: testsRan ? testsExit : null,
+                  ...(attribution ? { attribution } : {}),
                 })
                 rec.delivery = {
                   audited: true,
+                  basis: verdict.basis,
+                  ...(attribution ? { changedSinceRelay: attribution.changedSinceRelay, adoptedFiles: (adoptedFiles ?? []).slice(0, 50), candidateFiles: attribution.candidateFiles } : {}),
                   headBefore: before,
                   headAfter: state.head,
                   headChanged,
@@ -476,7 +590,10 @@ export class VerifierHost {
         const removed = await this.selections.discardWinner(selectionId)
         const after = this.selections.getSelection(selectionId)
         const slotAfter = after ? (after.winner ?? after.fallback) : undefined
-        if (removed || !slotAfter || slotAfter.discardedAt !== undefined) pending.delete(selectionId)
+        if (removed || !slotAfter || slotAfter.discardedAt !== undefined) {
+          pending.delete(selectionId)
+          this.relayMessageIds.delete(selectionId)
+        }
       } catch (error) {
         // Keep it queued for the next idle/dispose retry — visibly.
         this.diagnostics.warn('autopilot.cleanup', error, { selectionId })
@@ -501,7 +618,7 @@ export class VerifierHost {
       ? '[Selection 结算] ' + record.selectionId + ' 已完成：outcome=' + (record.outcome ?? 'legacy')
         + '，' + (record.winner ? 'winner=c' + record.winner.index : 'fallback=c' + slot.index + '（未经候选间比较，非选优结论）')
         + (scores ? '（scores ' + scores + '，比较 ' + (record.nComparisons ?? 0) + ' 次）' : '')
-        + (record.margin !== undefined ? '（margin ' + record.margin.toFixed(4) + ' / 阈值 ' + (record.marginThreshold ?? 'n/a') + (record.marginProvisional ? '，临时' : '') + '）' : '')
+        + (record.margin !== undefined ? '（margin ' + record.margin.toFixed(4) + ' / 阈值 ' + (record.marginThreshold ?? 'n/a') + (record.marginProvisional ? '，临时' : '') + (record.marginCalibration?.status === 'uncalibrated' ? '，本条件未校准' : '') + '）' : '')
         + '。loser/淘汰候选已回收（会话与工作区均已删除）。保留对象的工作区位于 ' + slot.workspace + '，面板里可"丢弃 winner"彻底清理。此消息为结算通知，无需回复。'
       : '[Selection 结算] ' + record.selectionId + ' 结束：status=' + record.status + (record.outcome ? '，outcome=' + record.outcome : '') + (record.error ? '（' + record.error + '）' : '') + '，候选已全部回收。此消息为结算通知，无需回复。'
     const failed = (error: unknown): void => this.diagnostics.warn('selection.notice', error, { selectionId: record.selectionId })
@@ -550,13 +667,13 @@ export class VerifierHost {
       const pending = this.autopilotCleanup.get(sourceId) ?? new Set<string>()
       pending.add(record.selectionId)
       this.autopilotCleanup.set(sourceId, pending)
+      // start() is synchronous, so the recovery relay cannot wait for the
+      // audit baseline; it is captured concurrently and marked as such.
+      void this.snapshotSourceAtRelay(record, true).then(() => this.selections.pubRecord(record))
       record.timing = { ...(record.timing ?? {}), relayedAt: Date.now() }
       this.selections.pubRecord(record)
       this.diagnostics.count('autopilot.relay_recovered')
-      void Promise.resolve(agent.followup(createUserMessage({
-        source: { kind: 'plugin', plugin: PLUGIN_SOURCE_NAME + '/autopilot', form: 'relay' },
-        content: [{ type: 'text', text: buildAutopilotRelay(record) }],
-      }))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId: record.selectionId, recovered: true }))
+      void Promise.resolve(agent.followup(this.relayMessage(record))).catch((error: unknown) => this.diagnostics.warn('autopilot.relay', error, { selectionId: record.selectionId, recovered: true }))
     }
   }
 
@@ -786,7 +903,14 @@ export class VerifierHost {
   }
 
   snapshot(): StateResponse {
-    return { config: { ...this.config }, agents: this.agents.size, records: this.records.slice(0, 20), selection: this.selections.snapshot(), diagnostics: this.diagnostics.snapshot() }
+    return {
+      config: { ...this.config },
+      agents: this.agents.size,
+      records: this.records.slice(0, 20),
+      selection: this.selections.snapshot(),
+      autopilotSkipped: { count: this.autopilotSkipCount, recent: this.autopilotSkips.map((skip) => ({ ...skip })) },
+      diagnostics: this.diagnostics.snapshot(),
+    }
   }
 
   /** The degradation ledger behind `/state`, for tests and embedded hosts. */

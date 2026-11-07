@@ -5,7 +5,7 @@
 
 ## 公式（源码级依据）
 
-上游 `D:/tools/llm-as-a-verifier-main`（本机只读参考树，不是生成实现）：
+上游 [llm-as-a-verifier/llm-as-a-verifier](https://github.com/llm-as-a-verifier/llm-as-a-verifier) 的 `llm_verifier/` 包（参考实现，不是本仓库生成的代码；2026-10-09 在 `90e8fc2` 上核对过以下函数仍在原文件中：`pivot_tournament.py:74 select_best`、`fine_grained_reward.py:817 score_directed_pairs`、`__init__.py:116 select`）：
 
 - `pivot_tournament.py select_best()`：比较对 = ring（恰好 N 个有向相邻对）
   + pivot rounds（`(N-k)*k + C(k,2)` 对有向对，`k = min(pivots, N)`）。

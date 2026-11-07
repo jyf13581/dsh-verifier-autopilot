@@ -13,11 +13,14 @@
  *   handle; no orphan agents, workspaces, or sidecar processes survive.
  */
 
+import {
+  CANDIDATE_TIMEOUT_MAX_MS, CANDIDATE_TIMEOUT_MIN_MS, DEFAULT_SELECTION_TIMEOUT_MS, SELECTION_TIMEOUT_MAX_MS, SELECTION_TIMEOUT_MIN_MS,
+} from '../constants.js'
 import path from 'node:path'
-import { existsSync, mkdirSync, readdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { VerifierBridge, type BridgeSelectRequest, type BridgeSelectResult } from './bridge.js'
 import { SelectionRunner,
   MAX_CANDIDATES,
@@ -66,7 +69,7 @@ export interface SelectionHostDeps {
   verifier: () => { model: string; baseURL: string; apiKeyEnv: string; effort?: string; maxWorkers?: number; minIntervalMs?: number }
   /** Host-level default for manual /select when the request omits
    *  candidateTimeoutMs; sourced from config so strong slow models get the
-   *  same time budget as autopilot instead of the runner's 300s floor. */
+   *  same time budget as autopilot instead of the runner's built-in default. */
   candidateTimeoutMsDefault?: () => number
   /** Host-level config defaults for manual /select when the request omits
    *  them. Autopilot always passes its plan explicitly; these defaults let
@@ -75,6 +78,8 @@ export interface SelectionHostDeps {
   pivotsDefault?: () => number
   /** Provisional margin gate for the winner state machine (ruling I.1). */
   marginThresholdDefault?: () => number
+  /** Review R3 3.1: uncalibrated-condition policy for the margin gate. */
+  uncalibratedMarginPolicyDefault?: () => 'flag' | 'abstain'
   /** Config default for the selection time budget when /select omits it. */
   selectTimeoutMsDefault?: () => number
   /** Directory for the per-selection audit pack written BEFORE cleanup
@@ -138,6 +143,9 @@ export interface StartSelectionBody extends SelectionStartRequest {
   taskKind?: string
 }
 
+/** How long a successful verifier preflight is trusted (review R4 4.5). */
+export const PREFLIGHT_OK_TTL_MS = 30 * 60_000
+
 export class SelectionApiError extends Error {
   readonly status: number
   readonly code: string
@@ -152,19 +160,11 @@ export class SelectionApiError extends Error {
 export const SELECTIONS_HISTORY_LIMIT = 200
 const SELECTIONS_FILE_MAX_BYTES = 4 * 1024 * 1024
 const SEED_EVENT_CAP = 600
-const MIN_SELECTION_TIMEOUT_MS = 30_000
-// 600s ceiling (raised 2026-09-05 from 300s): at verifierEffort=max a single
-// minimax-m3 comparison runs 70..100s wall clock, so even the minimal two-beat
-// tournament needs ~300s and any deeper K/P needs real headroom. The budget
-// still must not outlive a candidate window counterpart shared with abort.
-const MAX_SELECTION_TIMEOUT_MS = 600_000
-const DEFAULT_SELECTION_TIMEOUT_MS = 180_000
 
 /** Keep every verifier phase on the same finite request budget. */
 export function normalizeSelectionTimeoutMs(value: unknown, fallback?: number): number {
-  const parsed = value === undefined ? (fallback ?? DEFAULT_SELECTION_TIMEOUT_MS) : Number(value)
-  if (!Number.isFinite(parsed)) return DEFAULT_SELECTION_TIMEOUT_MS
-  return Math.max(MIN_SELECTION_TIMEOUT_MS, Math.min(MAX_SELECTION_TIMEOUT_MS, Math.floor(parsed)))
+  const parsed = value === undefined || value === null ? (fallback ?? DEFAULT_SELECTION_TIMEOUT_MS) : finiteRequestNumber(value, 'selectTimeoutMs')
+  return Math.max(SELECTION_TIMEOUT_MIN_MS, Math.min(SELECTION_TIMEOUT_MAX_MS, Math.floor(parsed)))
 }
 
 export function normalizeMarginThreshold(value: unknown, fallback = PROVISIONAL_MARGIN_THRESHOLD): number {
@@ -178,11 +178,25 @@ export function normalizeMarginThreshold(value: unknown, fallback = PROVISIONAL_
 }
 
 /** Explicit per-request candidate timeout wins; otherwise the host-level config
- *  default applies; without either the runner keeps its 300s safety floor. */
+ *  default applies; without either the runner uses DEFAULT_CANDIDATE_TIMEOUT_MS. */
 export function normalizeCandidateTimeoutMs(value: unknown, fallback: number | undefined): number | undefined {
-  const parsed = value === undefined ? fallback : Number(value)
+  const parsed = value === undefined || value === null ? fallback : finiteRequestNumber(value, 'candidateTimeoutMs')
   if (parsed === undefined || !Number.isFinite(parsed)) return undefined
-  return Math.max(30_000, Math.min(1_800_000, Math.floor(parsed)))
+  return Math.max(CANDIDATE_TIMEOUT_MIN_MS, Math.min(CANDIDATE_TIMEOUT_MAX_MS, Math.floor(parsed)))
+}
+
+/** A numeric /select field is a JSON number or absent. Coercion used to turn
+ *  "abc" into NaN, which reached the verifier only after every candidate
+ *  agent had run and been paid for (review R6 6.4); null stays "absent". */
+export function finiteRequestNumber(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new SelectionApiError(400, 'numeric-field-invalid', field + ' must be a finite JSON number')
+  }
+  return value
+}
+
+function optionalRequestNumber(value: unknown, field: string): number | undefined {
+  return value === undefined || value === null ? undefined : finiteRequestNumber(value, field)
 }
 
 export function defaultSelectionsFile(): string {
@@ -290,8 +304,12 @@ function safeChecks(input: unknown): ObjectiveCheck[] | undefined {
     if (typeof item.command !== 'string' || !item.command.trim() || item.command.length > 2000) {
       throw new SelectionApiError(400, 'check-command-invalid', 'checks[' + i + '].command must be a non-empty string <= 2000 chars')
     }
+    // A non-numeric timeout used to become NaN and reach setTimeout (review R1 1.7).
+    if (item.timeoutMs !== undefined && (typeof item.timeoutMs !== 'number' || !Number.isFinite(item.timeoutMs))) {
+      throw new SelectionApiError(400, 'check-timeout-invalid', 'checks[' + i + '].timeoutMs must be a finite number of milliseconds')
+    }
     const timeoutMs = item.timeoutMs === undefined ? undefined
-      : Math.max(1000, Math.min(300000, Math.floor(Number(item.timeoutMs))))
+      : Math.max(1000, Math.min(300000, Math.floor(item.timeoutMs)))
     return { name: item.name.trim(), command: item.command, timeoutMs }
   })
 }
@@ -382,18 +400,80 @@ function safeCandidateInstructions(input: unknown, count: number): string[] | un
   })
 }
 
+/** Criteria reach the verifier prompt of every comparison, so their size is a
+ *  provider-spend and prompt-shape lever (review R1 1.7). */
+const MAX_CRITERIA = 8
+const MAX_CRITERION_KEY_CHARS = 80
+const MAX_CRITERION_TEXT_CHARS = 2000
+
+function criteriaTooLarge(entries: Array<[string, string]>): boolean {
+  return entries.length > MAX_CRITERIA
+    || entries.some(([key, text]) => !key.trim() || key.length > MAX_CRITERION_KEY_CHARS || !text.trim() || text.length > MAX_CRITERION_TEXT_CHARS)
+}
+
 function safeCriteria(input: unknown): BridgeSelectRequest['criteria'] {
   if (input === undefined || input === null) {
     return { correctness: 'The candidate objectively completed the task, with concrete tool or test evidence backing the claim; unverified claims fail.' }
   }
+  const bounded = (entries: Array<[string, string]>): void => {
+    if (criteriaTooLarge(entries)) {
+      throw new SelectionApiError(400, 'criteria-too-large', 'criteria allow at most ' + MAX_CRITERIA + ' entries with non-empty names <= ' + MAX_CRITERION_KEY_CHARS + ' chars and descriptions <= ' + MAX_CRITERION_TEXT_CHARS + ' chars')
+    }
+  }
   if (typeof input === 'object' && !Array.isArray(input) && Object.values(input as Record<string, unknown>).every((v) => typeof v === 'string')) {
     if (Object.keys(input as Record<string, unknown>).length === 0) throw new SelectionApiError(400, 'criteria-empty', 'criteria map must not be empty')
+    bounded(Object.entries(input as Record<string, string>))
     return input as Record<string, string>
   }
   if (Array.isArray(input) && input.length > 0 && input.every((c) => c && typeof c === 'object' && typeof c.id === 'string' && typeof c.name === 'string' && typeof c.description === 'string')) {
-    return input as Array<{ id: string; name: string; description: string }>
+    const list = input as Array<{ id: string; name: string; description: string }>
+    bounded(list.map((c) => [c.id, c.name + ' ' + c.description] as [string, string]))
+    return list
   }
   throw new SelectionApiError(400, 'criteria-invalid', 'criteria must be a {name: description} map or a list of {id,name,description}')
+}
+
+/** Review R1 (1.7): scalar /select fields that used to flow unvalidated into
+ *  the runner, the audit pack, and the sidecar. Each check fails loudly with a
+ *  stable code instead of letting a wrong type or unbounded string through. */
+const AGENT_PRESET = /^[A-Za-z0-9._-]{1,80}$/
+const MAX_GROUND_TRUTH_NOTE_CHARS = 4000
+const MAX_SOURCE_CWD_CHARS = 1024
+
+export function validateStartScalars(body: StartSelectionBody): void {
+  if (body.agentPreset !== undefined && (typeof body.agentPreset !== 'string' || !AGENT_PRESET.test(body.agentPreset))) {
+    throw new SelectionApiError(400, 'agent-preset-invalid', 'agentPreset must be 1..80 chars of [A-Za-z0-9._-]')
+  }
+  if (body.groundTruthNote !== undefined && body.groundTruthNote !== null
+    && (typeof body.groundTruthNote !== 'string' || body.groundTruthNote.length > MAX_GROUND_TRUTH_NOTE_CHARS)) {
+    throw new SelectionApiError(400, 'ground-truth-note-invalid', 'groundTruthNote must be a string <= ' + MAX_GROUND_TRUTH_NOTE_CHARS + ' chars or null')
+  }
+  if (body.algorithmSeed !== undefined && !Number.isSafeInteger(body.algorithmSeed)) {
+    throw new SelectionApiError(400, 'algorithm-seed-invalid', 'algorithmSeed must be a safe integer')
+  }
+  for (const key of ['candidateProvider', 'candidateModel'] as const) {
+    const value: unknown = body[key]
+    if (value !== undefined && (typeof value !== 'string' || !value.trim() || value.length > 160)) {
+      throw new SelectionApiError(400, 'candidate-route-invalid', key + ' must be a non-empty string <= 160 chars')
+    }
+  }
+  if (body.sourceCwd !== undefined && typeof body.sourceCwd !== 'string') {
+    throw new SelectionApiError(400, 'source-cwd-invalid', 'sourceCwd must be a string')
+  }
+}
+
+/** An operator-supplied headless sourceCwd must name an existing absolute
+ *  directory; relative paths would resolve against the HOST process cwd, the
+ *  exact tree the 2026-09-13 isolation incident damaged. */
+function safeSourceCwd(value: string): string {
+  const cwd = value.trim()
+  if (cwd.length > MAX_SOURCE_CWD_CHARS || /[\u0000-\u001f]/.test(cwd) || !path.isAbsolute(cwd)) {
+    throw new SelectionApiError(400, 'source-cwd-invalid', 'sourceCwd must be an absolute path <= ' + MAX_SOURCE_CWD_CHARS + ' chars')
+  }
+  let isDirectory = false
+  try { isDirectory = statSync(cwd).isDirectory() } catch { isDirectory = false }
+  if (!isDirectory) throw new SelectionApiError(400, 'source-cwd-invalid', 'sourceCwd must name an existing directory')
+  return cwd
 }
 
 export class SelectionHost {
@@ -461,8 +541,12 @@ export class SelectionHost {
 
   activeSelectionId(): string | null { return this.active?.selectionId ?? null }
 
-  /** Provider tuples proven ready during this host's lifetime. */
-  private readonly preflightOk = new Set<string>()
+  /** Provider tuples proven ready, with when (review R4 4.5): keyed by a
+   *  fingerprint of the key VALUE, so a rotated or revoked key re-proves
+   *  instead of riding an earlier key's success, and trusted only for
+   *  PREFLIGHT_OK_TTL_MS, so a relay that later loses logprobs or a retired
+   *  model is noticed before the next candidate spend. */
+  private readonly preflightOk = new Map<string, number>()
 
   private bridge(): { select(req: BridgeSelectRequest): Promise<BridgeSelectResult> } {
     if (this.deps.testing?.bridge) return this.deps.testing.bridge
@@ -485,8 +569,11 @@ export class SelectionHost {
     if (typeof (bridge as Partial<VerifierBridge>).preflight !== 'function') return
     // Effort changes tag-emission behavior (thinking traces shift where score
     // tokens land), so a changed thinking strength re-proves readiness.
-    const tuple = v.baseURL + '|' + v.model + '|' + v.apiKeyEnv + '|' + (v.effort ?? '')
-    if (this.preflightOk.has(tuple)) return
+    const keyFingerprint = createHash('sha256').update(key).digest('hex').slice(0, 16)
+    const tuple = v.baseURL + '|' + v.model + '|' + v.apiKeyEnv + '|' + keyFingerprint + '|' + (v.effort ?? '')
+    const provenAt = this.preflightOk.get(tuple)
+    if (provenAt !== undefined && this.now() - provenAt < PREFLIGHT_OK_TTL_MS) return
+    this.preflightOk.delete(tuple)
     const deadlineAt = this.now() + timeoutMs
     await retryTransientBridge((attempt) => (bridge as VerifierBridge).preflight({
       model: v.model,
@@ -506,7 +593,7 @@ export class SelectionHost {
       now: this.now,
       onRetry: (error, attempt) => this.diagnostics.warn('verifier.preflight_retry', error, { attempt, model: v.model }),
     })
-    this.preflightOk.add(tuple)
+    this.preflightOk.set(tuple, this.now())
   }
 
   /** Explicit operator-triggered selection. Throws SelectionApiError for the
@@ -514,6 +601,7 @@ export class SelectionHost {
    *  is the RUNNING placeholder later replaced in place in the history list. */
   async start(body: StartSelectionBody, runtime?: { sourceCwd?: string }): Promise<SelectionRecord> {
     if (this.disposed) throw new SelectionApiError(503, 'selection-host-disposed', 'selection host is disposed')
+    validateStartScalars(body)
     const sourceSessionId = typeof body.sourceSessionId === 'string' && body.sourceSessionId.trim() ? body.sourceSessionId.trim() : undefined
     let parent: ReturnType<SelectionsAgentProvider['get']>
     let problem = typeof body.problem === 'string' && body.problem.trim() ? body.problem.trim() : undefined
@@ -530,7 +618,7 @@ export class SelectionHost {
       // Explicit operator-supplied Git workspace for a headless manual run.
       // The workspace adapter still creates isolated worktrees inside it, so
       // candidates never inherit the host process directory.
-      sourceCwd = body.sourceCwd.trim()
+      sourceCwd = safeSourceCwd(body.sourceCwd)
     }
     if (!problem) throw new SelectionApiError(400, 'problem-required', 'problem is required when the source session has no direct user task')
     const hasCandidateOptions = body.candidateOptions !== undefined && body.candidateOptions !== null
@@ -564,6 +652,7 @@ export class SelectionHost {
     if (!sourceCwd && !injectedHarness) {
       throw new SelectionApiError(400, 'source-cwd-required', 'candidate selection requires a resolvable Git source session or workspace: without it candidates run in the host process directory and can overwrite host files')
     }
+    const uncalibratedMarginPolicy = this.deps.uncalibratedMarginPolicyDefault?.() === 'abstain' ? 'abstain' as const : 'flag' as const
     const marginThreshold = normalizeMarginThreshold(
       body.marginThreshold,
       this.deps.marginThresholdDefault?.() ?? PROVISIONAL_MARGIN_THRESHOLD,
@@ -617,11 +706,12 @@ export class SelectionHost {
       candidateOptions: candidateOptions
         ? candidateOptions.map((route) => ({ provider: route?.provider ?? null, model: route?.model ?? null }))
         : [{ provider: sharedRoute?.provider ?? null, model: sharedRoute?.model ?? null, shared: true }],
-      nEvaluations: body.nEvaluations ?? this.deps.nEvaluationsDefault?.() ?? null,
-      pivots: body.pivots ?? this.deps.pivotsDefault?.() ?? null,
+      nEvaluations: optionalRequestNumber(body.nEvaluations, 'nEvaluations') ?? this.deps.nEvaluationsDefault?.() ?? null,
+      pivots: optionalRequestNumber(body.pivots, 'pivots') ?? this.deps.pivotsDefault?.() ?? null,
       candidateTimeoutMs: normalizeCandidateTimeoutMs(body.candidateTimeoutMs, this.deps.candidateTimeoutMsDefault?.()),
       selectTimeoutMs,
       marginThreshold,
+      uncalibratedMarginPolicy,
       verifierModel: verifierConf.model,
       verifierEffort: verifierConf.effort ?? null,
       verifierBaseURLHost: safeHost(verifierConf.baseURL),
@@ -700,6 +790,7 @@ export class SelectionHost {
       ...(body.policy ? { policy: body.policy } : {}),
       taskKind: body.taskKind ?? body.policy?.taskKind,
       marginThreshold,
+      uncalibratedMarginPolicy,
       recordSeed: {
         configSnapshot,
         sourceModel,
@@ -778,7 +869,13 @@ export class SelectionHost {
   async waitFor(selectionId: string, signal?: AbortSignal): Promise<SelectionRecord> {
     const current = this.getSelection(selectionId)
     if (!current) throw new SelectionApiError(404, 'selection-not-found', 'selection not found: ' + selectionId)
-    if (current.status !== 'running') return current
+    // The runner's terminal onUpdate copies status onto the placeholder before
+    // finishRun swaps in the final record object. Resolving on the placeholder
+    // hands callers a detached object whose later mutations pubRecord drops
+    // (review R3: relayedAt was never persisted), so a record only counts as
+    // settled once its run has left `active`.
+    const settled = (record: SelectionRecord) => record.status !== 'running' && this.active?.selectionId !== selectionId
+    if (settled(current)) return current
     if (signal?.aborted) throw new SelectionApiError(499, 'selection-wait-aborted', 'selection wait aborted')
     return await new Promise<SelectionRecord>((resolve, reject) => {
       let unsubscribe = () => {}
@@ -789,7 +886,7 @@ export class SelectionHost {
       const check = () => {
         const record = this.getSelection(selectionId)
         if (!record) { cleanup(); reject(new SelectionApiError(404, 'selection-not-found', 'selection not found: ' + selectionId)); return }
-        if (record.status !== 'running') { cleanup(); resolve(record) }
+        if (settled(record)) { cleanup(); resolve(record) }
       }
       const onAbort = () => { cleanup(); reject(new SelectionApiError(499, 'selection-wait-aborted', 'selection wait aborted')) }
       unsubscribe = this.subscribe(check)
@@ -916,8 +1013,13 @@ export class SelectionHost {
 
   /** Audit pack (ruling I.5/G, F6): one directory per selection, written at
    *  settle BEFORE any workspace cleanup can free the evidence it holds —
-   *  record.json plus raw per-candidate materials. discard rewrites only the
-   *  record so settlement attribution stays immutable. */
+   *  record.json plus per-candidate materials (redacted at the runner, review
+   *  R5 5.1). Later writes (relay, delivery audit, discard) rewrite only
+   *  record.json and touch only lifecycle fields — timing.relayedAt/auditedAt,
+   *  sourceAtRelay, delivery, discardedAt — never the verdict, finalists,
+   *  ranking, or settlement attribution (review R5 5.2; pinned by
+   *  egress-persistence.test.mjs). The ledger is last-row-wins per
+   *  selectionId under the same rule. */
   private artifactDir(): string | null {
     return this.deps.artifactsDir ?? null
   }
@@ -942,7 +1044,8 @@ export class SelectionHost {
           if (d) {
             atomicWriteFile(
               path.join(selDir, 'diffs', 'c' + i + '.patch'),
-              d.patch + String.fromCharCode(10) + '# truncated=' + d.truncated + '; untracked=' + (d.untrackedFiles.join(' ') || 'none') + String.fromCharCode(10),
+              d.patch + String.fromCharCode(10) + '# truncated=' + d.truncated + '; untracked=' + (d.untrackedFiles.join(' ') || 'none')
+                + (d.scope ? '; scope=' + d.scope + (d.inheritedExcluded !== undefined ? '; inheritedExcluded=' + d.inheritedExcluded : '') : '') + String.fromCharCode(10),
             )
           }
         }

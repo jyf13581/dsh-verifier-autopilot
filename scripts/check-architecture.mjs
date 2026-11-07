@@ -180,11 +180,56 @@ for (const file of files) visitCycle(file)
 if (cycle) problems.push('module cycle: ' + cycle.map(relative).join(' -> '))
 for (const breach of seamBreaches) problems.push('type seam: ' + breach)
 
+// Untyped-assertion ratchet (review R6 6.4). `as X` applied to an operand
+// whose type is `unknown` or `any` (JSON.parse, response.json(), an untyped
+// ctx.get(), Array.isArray's any[]) asserts a shape nothing has checked. The
+// parse-only rules above cannot see the operand's type, so this pass builds
+// the program once and counts such assertions per file against
+// scripts/untyped-casts.json. The baseline must match exactly: a new site
+// fails (narrow with a predicate or a reader instead, or raise the baseline
+// in review on purpose), and a removed one fails until the baseline is
+// lowered, so the slack never accumulates. `--update-cast-baseline` rewrites it.
+const CAST_BASELINE_FILE = path.join(root, 'scripts', 'untyped-casts.json')
+const parsedConfig = ts.getParsedCommandLineOfConfigFile(path.join(root, 'tsconfig.json'), {}, { ...ts.sys, onUnRecoverableConfigFileDiagnostic: () => {} })
+const program = ts.createProgram(parsedConfig.fileNames, parsedConfig.options)
+const checker = program.getTypeChecker()
+const untypedSites = new Map()
+for (const sourceFile of program.getSourceFiles()) {
+  if (!fileSet.has(path.normalize(sourceFile.fileName))) continue
+  const sites = []
+  const visit = (node) => {
+    if ((ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) && !(ts.isTypeReferenceNode(node.type) && node.type.typeName.getText(sourceFile) === 'const')) {
+      const flags = checker.getTypeAtLocation(node.expression).flags
+      if (flags & (ts.TypeFlags.Unknown | ts.TypeFlags.Any)) {
+        const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
+        sites.push(line + ': ' + node.getText(sourceFile).replace(/\s+/g, ' ').slice(0, 90))
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  if (sites.length > 0) untypedSites.set(relative(sourceFile.fileName), sites)
+}
+const castCounts = Object.fromEntries([...untypedSites].sort(([a], [b]) => a.localeCompare(b)).map(([file, sites]) => [file, sites.length]))
+const untypedTotal = Object.values(castCounts).reduce((sum, n) => sum + n, 0)
+if (process.argv.includes('--update-cast-baseline')) {
+  fs.writeFileSync(CAST_BASELINE_FILE, JSON.stringify(castCounts, null, 2) + String.fromCharCode(10))
+  console.log('untyped-cast baseline written: ' + untypedTotal + ' sites in ' + Object.keys(castCounts).length + ' files')
+} else {
+  const baseline = fs.existsSync(CAST_BASELINE_FILE) ? JSON.parse(fs.readFileSync(CAST_BASELINE_FILE, 'utf8')) : {}
+  for (const file of new Set([...Object.keys(baseline), ...Object.keys(castCounts)])) {
+    const now = castCounts[file] ?? 0
+    const allowed = baseline[file] ?? 0
+    if (now > allowed) problems.push('untyped assertion: ' + file + ' has ' + now + ' (baseline ' + allowed + '); narrow with a predicate or reader:\n      ' + (untypedSites.get(file) ?? []).join('\n      '))
+    else if (now < allowed) problems.push('untyped assertion: ' + file + ' has ' + now + ', baseline still says ' + allowed + ' (run npm run check:architecture -- --update-cast-baseline)')
+  }
+}
+
 if (problems.length > 0) {
   console.error('Architecture check failed:')
   for (const problem of problems) console.error('  - ' + problem)
   process.exitCode = 1
 } else {
   const runtimeCount = [...edges.values()].filter(edge => edge.runtime).length
-  console.log('Architecture check passed: ' + files.length + ' modules, ' + runtimeCount + ' runtime edges, ' + (edges.size - runtimeCount) + ' type-only edges, 0 cycles, 0 blind casts, 0 explicit any')
+  console.log('Architecture check passed: ' + files.length + ' modules, ' + runtimeCount + ' runtime edges, ' + (edges.size - runtimeCount) + ' type-only edges, 0 cycles, 0 blind casts, 0 explicit any, ' + untypedTotal + ' untyped assertions (= baseline)')
 }

@@ -7,9 +7,10 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { VerifierHost } from "../../lib/index.js"
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import path from "node:path"
+import { createHash } from "node:crypto"
 import { makeGitRepo, runGit } from "./helpers/git.mjs"
 import { fakeBridge, makeFakeFactory, realWorkspaces, settledRecord } from "./helpers/selection.mjs"
 import { fakeContext, hostOverrides } from "./helpers/host.mjs"
@@ -24,7 +25,9 @@ test("live: projectStoreKey matches the session store's directory convention", a
 
 test("live: non-git session roots resolve only one explicitly referenced nested repository", async () => {
   const { resolveAutopilotSourceCwd } = await import("../../lib/selection/live.js")
-  const base = mkdtempSync(path.join(tmpdir(), "va-resolve-"))
+  // git prints long, resolved paths; os.tmpdir() on Windows runners is an
+  // 8.3 alias (C:\\Users\\RUNNER~1). Compare like with like (review R6 6.5).
+  const base = realpathSync.native(mkdtempSync(path.join(tmpdir(), "va-resolve-")))
   try {
     const repo = makeGitRepo(base, "primary")
     const other = makeGitRepo(base, "other")
@@ -38,7 +41,9 @@ test("live: non-git session roots resolve only one explicitly referenced nested 
 
 test("live: git workspace mirrors dirty content, removes from the source repo, and rejects path escape", async () => {
   const { IsolatedWorkspaceManager } = await import("../../lib/selection/live.js")
-  const base = mkdtempSync(path.join(tmpdir(), "va-worktree-"))
+  // git prints long, resolved paths; os.tmpdir() on Windows runners is an
+  // 8.3 alias (C:\\Users\\RUNNER~1). Compare like with like (review R6 6.5).
+  const base = realpathSync.native(mkdtempSync(path.join(tmpdir(), "va-worktree-")))
   try {
     const repo = makeGitRepo(base, "source")
     writeFileSync(path.join(repo, "tracked.txt"), "tracked-dirty\n")
@@ -62,6 +67,30 @@ test("live: git workspace mirrors dirty content, removes from the source repo, a
     await assert.rejects(manager.remove(outside), /workspace-path-outside-managed-root/)
     await assert.rejects(manager.purgeSessionRecord(outside), /workspace-path-outside-managed-root/)
     assert.equal(existsSync(outside), true, "rejected cleanup cannot delete the unrelated directory")
+  } finally { rmSync(base, { recursive: true, force: true }) }
+})
+
+test("live: candidate edits cannot forge the host-owned start baseline", async () => {
+  const { IsolatedWorkspaceManager, gitDiffStat } = await import("../../lib/selection/live.js")
+  const base = mkdtempSync(path.join(tmpdir(), "va-baseline-integrity-"))
+  try {
+    const repo = makeGitRepo(base, "source")
+    writeFileSync(path.join(repo, "tracked.txt"), "inherited-source-edit\n")
+    const manager = new IsolatedWorkspaceManager(path.join(base, "managed"), path.join(base, "store"))
+    const candidateCwd = await manager.prepare({ selectionId: "sel-baseline-integrity", index: 0, sourceCwd: repo, strictSnapshot: true })
+    const candidateRoot = candidateCwd
+    writeFileSync(path.join(candidateRoot, "tracked.txt"), "candidate-deliverable\n")
+
+    // Simulate a candidate rewriting the old on-disk baseline to claim that its
+    // deliverable was inherited. Evidence must continue using host-owned data.
+    const gitDir = runGit(candidateRoot, "rev-parse", "--absolute-git-dir")
+    const forgedDigest = "-" + createHash("sha256").update("candidate-deliverable\n").digest("hex")
+    writeFileSync(path.join(gitDir, "dsh-va-baseline.json"), JSON.stringify({ version: 1, entries: { "tracked.txt": forgedDigest } }))
+
+    const stat = await gitDiffStat(candidateRoot)
+    assert.ok(stat, "candidate diff remains inspectable")
+    assert.equal(stat.files, 1, "forged on-disk baseline cannot hide a candidate edit")
+    await manager.remove(candidateCwd)
   } finally { rmSync(base, { recursive: true, force: true }) }
 })
 

@@ -16,9 +16,10 @@ export interface TrajectoryRender {
   eventCount: number
   renderedLines: number
   toolCalls: number
-  /** Tool calls excluding catalog/meta discovery tools. The winner gate counts
-   *  only execution evidence: a candidate whose toolCalls are all tool_search
-   *  or tool_slimmer_catalog never touched the workspace (ruling K.4-1). */
+  /** Tool calls excluding catalog/meta discovery tools and read-only
+   *  workspace observation (read/grep/ls…, review R2 2.4). The winner gate
+   *  counts only execution evidence: a candidate whose toolCalls are all
+   *  tool_search or read never changed or ran anything (ruling K.4-1). */
   execToolCalls: number
   truncatedCells: number
   totalChars: number
@@ -41,6 +42,22 @@ export function boundCandidateHandoff(text: string, maxChars = 14_000): string {
   return boundText(text.trim(), maxChars)
 }
 
+/** Orchestration section headers the Host itself writes into verifier payloads,
+ *  candidate context, and the source relay. Candidate-controlled text (tool
+ *  output, assistant prose, handoff excerpts) must never be able to open one of
+ *  these sections: a forged `[DETERMINISTIC EVIDENCE ...]` block would claim
+ *  runner-collected evidence to the verifier, and a forged `[END CANDIDATE c1]`
+ *  followed by `[FINALIZER CONTRACT]` would issue instructions to the source
+ *  finalizer (review R1 1.8). */
+const CONTROL_MARKER = /\[(\s*)(DETERMINISTIC EVIDENCE|TRAJECTORY\b|END CANDIDATE|CANDIDATE\s+c\d|FINALIZER CONTRACT|AUTOPILOT\b|SINGLE-SURVIVOR|CURRENT TASK|RELEVANT RECENT CONVERSATION|DELIVERY CONTRACT|EXTRACTED TOOL EVIDENCE|VERIFIER FEEDBACK)/gi
+
+/** Defang Host control markers inside untrusted text. The content survives
+ *  verbatim for the reader, but it can no longer be mistaken for a section the
+ *  Host opened. Idempotent: the rewritten form never matches again. */
+export function neutralizeControlMarkers(text: string): string {
+  return text.replace(CONTROL_MARKER, (_match, space: string, marker: string) => '[UNTRUSTED-QUOTE:' + (space || ' ') + marker)
+}
+
 /** Meta/navigation tools that never modify the workspace or execute anything.
  *  tool_call is a dispatcher: its inner name is not visible in the event we
  *  see, so it conservatively counts as meta (never as execution evidence). */
@@ -55,6 +72,36 @@ const META_TOOLS = new Set([
 
 export function isMetaToolName(name: unknown): boolean {
   return typeof name === 'string' && META_TOOLS.has(name)
+}
+
+/** Workspace-observing tools (review R2 2.4). Reading, listing or searching
+ *  is not work: before this set, a candidate that only ran `read` passed the
+ *  has-work gate of a code task with an empty diff. Allowlist on purpose —
+ *  an unknown tool name still counts as execution (conservative: it may
+ *  write), so a new mutating tool can never be silently excluded. DSH emits
+ *  `read`/`write`/`edit`/`pwsh`/`bash`; the others are common aliases. */
+const READ_ONLY_TOOLS = new Set([
+  'read',
+  'read_file',
+  'view',
+  'grep',
+  'glob',
+  'ls',
+  'list_dir',
+  'list_files',
+  'search_files',
+  'web_search',
+  'web_fetch',
+  'fetch_page',
+])
+
+export function isReadOnlyToolName(name: unknown): boolean {
+  return typeof name === 'string' && READ_ONLY_TOOLS.has(name)
+}
+
+/** Counts toward the has-work gate: neither catalog/meta nor read-only. */
+export function isExecutionToolName(name: unknown): boolean {
+  return !isMetaToolName(name) && !isReadOnlyToolName(name)
 }
 
 function asText(content: unknown): string {
@@ -121,7 +168,7 @@ export function renderTrajectory(
     if (ev.type === 'tool/call') {
       toolCalls += 1
       const name = read(data, 'name')
-      if (!isMetaToolName(name)) execToolCalls += 1
+      if (isExecutionToolName(name)) execToolCalls += 1
       const s = summarize(read(data, 'arguments'), cellCap)
       if (s.truncated) truncatedCells += 1
       push('TOOL CALL ' + String(name ?? 'unknown') + ': ' + s.text)
@@ -135,12 +182,27 @@ export function renderTrajectory(
       continue
     }
   }
-  let text = lines.join(String.fromCharCode(10))
+  const NL = String.fromCharCode(10)
+  let text = neutralizeControlMarkers(lines.join(NL))
   if (text.length > totalCap) {
-    const keep = text.slice(text.length - totalCap)
-    const firstNl = keep.indexOf(String.fromCharCode(10))
-    text = '[... head truncated for budget: ' + (text.length - totalCap) + ' chars omitted ...]'
-      + (firstNl >= 0 ? keep.slice(firstNl) : keep)
+    // Pin the first USER line (review R2 2.7): tail-only truncation used to
+    // drop the candidate's own task statement first, leaving the verifier a
+    // trajectory of actions with no record of what they were answering. The
+    // pin is bounded to a quarter of the budget; the tail keeps the rest.
+    const firstUser = lines.findIndex((line) => /^\[E\d+\] USER: /.test(line))
+    const pinCap = Math.floor(totalCap / 4)
+    let pinned = firstUser >= 0 ? neutralizeControlMarkers(lines[firstUser]) : ''
+    if (pinned.length > pinCap) pinned = pinned.slice(0, pinCap) + ' [... task line bounded ...]'
+    const tailBudget = Math.max(0, totalCap - pinned.length)
+    const keep = text.slice(text.length - tailBudget)
+    const firstNl = keep.indexOf(NL)
+    const tail = firstNl >= 0 ? keep.slice(firstNl) : keep
+    const tag = pinned ? pinned.slice(0, pinned.indexOf(']') + 1) : ''
+    if (!pinned || tail.includes(NL + tag + ' ')) pinned = ''
+    const omitted = text.length - tail.length
+    text = (pinned ? pinned + NL : '')
+      + '[... head truncated for budget: ' + omitted + ' chars omitted' + (pinned ? '; first task line kept above' : '') + ' ...]'
+      + tail
   }
   return {
     text,

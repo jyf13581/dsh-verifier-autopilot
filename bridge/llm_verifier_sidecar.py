@@ -11,6 +11,7 @@ Protocol: see bridge/PROTOCOL.md.
 from __future__ import annotations
 
 import json
+import re
 import os
 import sys
 import tempfile
@@ -19,6 +20,10 @@ from typing import Any, Dict, List, NoReturn, Optional
 os.environ.setdefault("DEEPSEEK_EFFORT", "off")
 
 _LLM_VERIFIER_IMPORT_ERROR: Optional[ImportError] = None
+
+# Version of bridge/PROTOCOL.md this script implements; reported in health and
+# checked by the bridge on every spawn (review R5 5.4).
+PROTOCOL_VERSION = 1
 
 try:
     import llm_verifier
@@ -88,8 +93,75 @@ def _install_tolerant_tag_lookup() -> None:
     fgr._find_tag_logprobs = tolerant
 
 
+class _ExtractionCounter:
+    """Per-select tally of HOW each verifier score was read (review R3 3.5).
+
+    The upstream extractor never raises: with no score-token distribution it
+    parses the literal letter, and with no parseable tag at all it returns a
+    neutral 0.5. on_error='raise' cannot see either, so a malformed reply was
+    indistinguishable from a genuine 0.5, and a single defaulted slot next to
+    a real score manufactures a preference. The legacy TS lane stack fails
+    closed on the same inputs. Counts are returned with every select result."""
+
+    def __init__(self) -> None:
+        import threading
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self._counts = {"logprobs": 0, "literal": 0, "default": 0}
+
+    def add(self, kind: str) -> None:
+        with self._lock:
+            self._counts[kind] = self._counts.get(kind, 0) + 1
+
+    def snapshot(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._counts)
+
+
+EXTRACTION = _ExtractionCounter()
+
+
+def _install_extraction_counter() -> None:
+    """Wrap extract_score so every call is classified. The score itself is
+    the untouched upstream value; classification mirrors its branches."""
+    import re
+    from llm_verifier import fine_grained_reward as fgr
+
+    original = fgr.extract_score
+
+    def classify(text, tokens, position_logprobs, tag) -> str:
+        valid = fgr.SCALE["valid_tokens"]
+        for tok_str, _ in fgr._find_tag_logprobs(tokens, position_logprobs, tag) or []:
+            tok = tok_str.strip()
+            if tok.startswith(">"):
+                tok = tok[1:].strip()
+            if tok in valid:
+                return "logprobs"
+        name = tag.strip("<>")
+        matches = list(re.finditer(rf"<{re.escape(name)}>\s*(.+?)\s*</{re.escape(name)}>", text or "", re.IGNORECASE))
+        if matches:
+            letter = matches[-1].group(1).strip()
+            if letter in valid or any(letter.lower() == k.lower() for k in valid):
+                return "literal"
+        return "default"
+
+    def counted(text, tokens, position_logprobs, tag):
+        value = original(text, tokens, position_logprobs, tag)
+        try:
+            EXTRACTION.add(classify(text, tokens, position_logprobs, tag))
+        except Exception:
+            EXTRACTION.add("default")
+        return value
+
+    fgr.extract_score = counted
+
+
 if llm_verifier is not None:
     _install_tolerant_tag_lookup()
+    _install_extraction_counter()
 
 MAX_MSG = 500
 
@@ -188,8 +260,9 @@ class _ResilientCompletions:
 
 # Verifier thinking strength ('思考强度'). A request may pin it via its
 # per-request "effort" field; absent means the process env decides. The
-# plugin default is "max" (plugin-side config default), so this module-level
-# fallback only guards bare direct calls.
+# plugin always sends its configured level (config default "low", see
+# src/config.ts verifierEffort), so this module-level fallback only guards
+# bare direct calls.
 EFFORT_LEVELS = ("off", "low", "high", "max")
 
 
@@ -215,6 +288,7 @@ def _ok(req_id: Optional[str], result: Dict[str, Any]) -> None:
 def _handle_health(req_id: Optional[str]) -> None:
     available = llm_verifier is not None
     _ok(req_id, {
+        "protocol": PROTOCOL_VERSION,
         "python": sys.version,
         "llm_verifier_version": (getattr(llm_verifier, "__version__", "unknown")
                                  if available else None),
@@ -319,14 +393,23 @@ class _effort_scoped:
         else:
             os.environ["DEEPSEEK_EFFORT"] = self.previous
 
+# How a missing score distribution actually surfaces (review R5 5.4): the
+# upstream deepseek path raises RuntimeError("DeepSeek returned no answer
+# logprobs ..."), and relays that cannot return logprobs reject the parameter
+# with a 4xx naming it. A bare "logprob" substring is not evidence: a 429/5xx
+# body or a timeout message that echoes the request parameters mentions it too,
+# and mapping those to the non-retriable missing_logprobs turned a transient
+# outage into a permanent "this verifier cannot work" verdict.
+_MISSING_LOGPROBS = re.compile(
+    r"returned no answer logprobs|logprobs?\W+(?:is|are)?\s*(?:not supported|unsupported|not available|not enabled)"
+    r"|(?:does not|doesn't|cannot) (?:support|return) (?:top_)?logprobs", re.IGNORECASE)
+
+
 def _map_exception(exc: BaseException) -> "tuple[str, bool]":
-    """Map a library/provider failure to (code, retriable)."""
-    if isinstance(exc, ValueError):
-        return "invalid_request", False
+    """Map a library/provider failure to (code, retriable). Typed classes are
+    decided before any message text is consulted."""
     if isinstance(exc, MissingAPIKeyError):
         return "missing_api_key", False
-    if "logprob" in str(exc).lower():
-        return "missing_logprobs", False
     try:  # openai exception taxonomy (installed in the venv)
         import openai
         if isinstance(exc, openai.APITimeoutError):
@@ -337,10 +420,20 @@ def _map_exception(exc: BaseException) -> "tuple[str, bool]":
             status = getattr(exc, "status_code", None)
             if status == 429 or (isinstance(status, int) and status >= 500):
                 return "provider_error", True
+            if status in (400, 422) and ("logprob" in str(exc).lower()):
+                return "missing_logprobs", False
             return "provider_error", False
     except Exception:
         pass
-    if "timeout" in str(exc).lower():
+    if isinstance(exc, RuntimeError) and _MISSING_LOGPROBS.search(str(exc)):
+        return "missing_logprobs", False
+    # A reply the client could not decode is the provider's fault and usually
+    # transient, not a malformed request (both are ValueError subclasses).
+    if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+        return "provider_error", True
+    if isinstance(exc, ValueError):
+        return "invalid_request", False
+    if isinstance(exc, TimeoutError) or "timeout" in str(exc).lower() or "timed out" in str(exc).lower():
         return "timeout", True
     return "selection_failed", False
 
@@ -409,6 +502,7 @@ def _handle_select(req_id: Optional[str], req: Dict[str, Any]) -> None:
         cache_dir = tempfile.mkdtemp(prefix="llv-cache-")
         cache_path = os.path.join(cache_dir, "scores.json")
         USAGE.reset()
+        EXTRACTION.reset()
         try:
             with _effort_scoped(v["effort"]):
                 result = llm_verifier.select(
@@ -432,6 +526,7 @@ def _handle_select(req_id: Optional[str], req: Dict[str, Any]) -> None:
             "n_comparisons": result.n_comparisons,
             "criteria": list(result.criteria),
             "usage": USAGE.snapshot(),
+            "extraction": EXTRACTION.snapshot(),
         })
     except Exception as exc:
         code, retriable = _map_exception(exc)

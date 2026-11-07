@@ -6,7 +6,11 @@
 
 import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import z from 'schemastery'
-import { DEFAULT_SELECTION_MARGIN_THRESHOLD, SETTINGS_NAMESPACE_ID } from './constants.js'
+import {
+  CANDIDATE_TIMEOUT_MAX_MS, CANDIDATE_TIMEOUT_MIN_MS, DEFAULT_CANDIDATE_TIMEOUT_MS, DEFAULT_SELECTION_EVALUATIONS,
+  DEFAULT_SELECTION_MARGIN_THRESHOLD, DEFAULT_SELECTION_PIVOTS, DEFAULT_SELECTION_TIMEOUT_MS, SELECTION_TIMEOUT_MAX_MS,
+  SELECTION_TIMEOUT_MIN_MS, SETTINGS_NAMESPACE_ID,
+} from './constants.js'
 
 export { DEFAULT_SELECTION_MARGIN_THRESHOLD, SETTINGS_NAMESPACE_ID } from './constants.js'
 
@@ -64,6 +68,11 @@ export interface Config {
   /** Calibrated-but-provisional top-2 margin gate for the winner state machine
    *  (ruling I.1/I.4); records retain the exact threshold used. */
   selectionMarginThreshold: number
+  /** Review R3 3.1: what the margin gate does when the run's condition
+   *  (verifier, N, criteria, evaluations, pivots, inputs) has no calibrated
+   *  noise band. 'flag' (default) keeps the gate and labels the result
+   *  uncalibrated; 'abstain' refuses to name a verifier winner. */
+  selectionUncalibratedMarginPolicy: 'flag' | 'abstain'
   /** Probe candidate models for liveness before planning (default true):
    *  catalog membership is not availability (ruling 6.4 kimi-k3 window). */
   selectionProbeEnabled: boolean
@@ -88,7 +97,13 @@ export interface Config {
 }
 
 export const Config = z.object({
-  enabled: z.boolean().default(true),
+  // Review R7 (owner decision, 2026-10-09): both spending paths are opt-in.
+  // The five-lane idle verifier made 5 calls per gated turn whose result
+  // reached no agent while autoFeedback stays off, and autopilot admitted pure
+  // questions and trivial edits (2 full rollouts + 6 ranking calls each) with
+  // no measured quality gain yet. docs/reviews/R7-DOCS-PRODUCT-DIRECTION.md
+  // names the fixed-set evidence that would justify turning either back on.
+  enabled: z.boolean().default(false),
   // Feedback is opt-in by default: verifier findings are often useful only
   // after they point to independent tool evidence, while an unsolicited
   // follow-up can interrupt a perfectly good source turn.
@@ -115,7 +130,7 @@ export const Config = z.object({
   divergenceGuardMedian: z.number().min(0).max(1).default(0.75),
   skipStatusContinuation: z.boolean().default(true),
   selectionNotify: z.boolean().default(true),
-  selectionMode: z.union(['off', 'auto', 'always']).default('auto'),
+  selectionMode: z.union(['off', 'auto', 'always']).default('off'),
   selectionModelStrategy: z.union(['quality-first', 'exploration']).default('quality-first'),
   selectionProvider: z.string().default('kimi'),
   // Default candidate route: strictly protocol-proven and ~6s per call, so the
@@ -126,15 +141,18 @@ export const Config = z.object({
   // explicit operator controls for deliberate quality runs.
   selectionStandardCandidates: z.number().step(1).min(2).max(5).default(2),
   selectionDeepCandidates: z.number().step(1).min(2).max(5).default(3),
-  selectionEvaluations: z.number().step(1).min(1).max(8).default(1),
+  selectionEvaluations: z.number().step(1).min(1).max(8).default(DEFAULT_SELECTION_EVALUATIONS),
   // 枢轴迭代数 k：O(N·k) 的比较成本，下游按幸存者数自动收敛。
-  selectionPivots: z.number().step(1).min(0).max(5).default(0),
-  selectionCandidateTimeoutMs: z.number().step(1000).min(30000).max(1800000).default(600000),
-  selectionSelectTimeoutMs: z.number().step(1000).min(30000).max(600000).default(600000),
-  // 临时噪声门限（ruling I.1）：top-2 margin 低于它一律 abstain。2026-09-08
-  // 校准首轮（C0 24 次同文复跑）噪声 q95=0.0123、最大 0.0135、位置偏差≈0；
-  // 0.03 = 观测噪声上限的 2.2 倍，仍标 provisional 待多 fixture 复核。
+  selectionPivots: z.number().step(1).min(0).max(5).default(DEFAULT_SELECTION_PIVOTS),
+  selectionCandidateTimeoutMs: z.number().step(1000).min(CANDIDATE_TIMEOUT_MIN_MS).max(CANDIDATE_TIMEOUT_MAX_MS).default(DEFAULT_CANDIDATE_TIMEOUT_MS),
+  selectionSelectTimeoutMs: z.number().step(1000).min(SELECTION_TIMEOUT_MIN_MS).max(SELECTION_TIMEOUT_MAX_MS).default(DEFAULT_SELECTION_TIMEOUT_MS),
+  // 临时噪声门限（ruling I.1）：top-2 margin 低于它一律 abstain。依据是
+  // kimi-k3@low、N=2、C=1、K=1、P=0、合成短 fixture 的 C0 自比较（第 2–5 轮
+  // 共 240 帧，最大 0.01377；0.03 ≈ 2.17 倍），仍为 provisional。其它条件
+  // 都未校准，见 src/selection/calibration.ts（review R3 3.1）。
   selectionMarginThreshold: z.number().min(0).max(0.5).default(DEFAULT_SELECTION_MARGIN_THRESHOLD),
+  // 条件未校准时的处理：flag（默认，照常过门限但标注未校准）或 abstain。
+  selectionUncalibratedMarginPolicy: z.union(['flag', 'abstain']).default('flag'),
   selectionProbeEnabled: z.boolean().default(true),
   // 后置审计可选测试命令（G-4）：空 = 绝不自动跑用户仓库的测试，delivered
   // 只可能到 unknown/no。

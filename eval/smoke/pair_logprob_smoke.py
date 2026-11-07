@@ -22,15 +22,17 @@ import json, os, re, sys, math
 
 os.environ["DEEPSEEK_EFFORT"] = "off"  # keep the smoke cheap: no thinking
 
-CRED = r"C:\Users\Admin\.dsh\.credentials.yaml"
-BASE_URL = "https://chat.holisthoom.top/v1"
+# Review R3 3.6: no machine-specific paths; env first, then ~/.dsh.
+CRED = os.environ.get("DSH_CREDENTIALS") or os.path.join(os.path.expanduser("~"), ".dsh", ".credentials.yaml")
+BASE_URL = os.environ.get("KIMI_BASE_URL") or "https://chat.holisthoom.top/v1"  # plugin default baseURL
 MODEL = "nvidia/nemotron-3-super-120b-a12b"
 
-raw = open(CRED, encoding="utf-8").read()
-m = re.search(r"^KIMI_API_KEY:[ \t]*(\S+)[ \t]*$", raw, re.M)
-if not m:
-    print(json.dumps({"pass": False, "error": "KIMI_API_KEY not found"})); sys.exit(0)
-KEY = m.group(1)
+KEY = os.environ.get("KIMI_API_KEY")
+if not KEY and os.path.exists(CRED):
+    m = re.search(r"^KIMI_API_KEY:[ \t]*(\S+)[ \t]*$", open(CRED, encoding="utf-8").read(), re.M)
+    KEY = m.group(1) if m else None
+if not KEY:
+    print(json.dumps({"pass": False, "error": "KIMI_API_KEY not found in env or " + CRED})); sys.exit(0)
 
 import llm_verifier
 from llm_verifier.fine_grained_reward import (

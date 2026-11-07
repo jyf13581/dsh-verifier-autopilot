@@ -131,7 +131,9 @@ test("selhost: the running row is persisted at start, so a crash mid-run leaves 
       release()
       const settled = await waitFor(() => { const s = host.getSelection(started.selectionId); return s && s.status !== "running" ? s : null })
       assert.equal(settled.status, "completed")
-      const after = readFileSync(ledger, "utf8").trim().split("\n").map((line) => JSON.parse(line))
+      // The in-memory status flips before the ledger append lands; wait for
+      // the row instead of racing it (failed this way on windows-latest, R6).
+      const after = await waitFor(() => { const rows = readFileSync(ledger, "utf8").trim().split("\n").map((line) => JSON.parse(line)); return rows.length >= 2 ? rows : null })
       assert.equal(after.length, 2, "the settled row is appended, not rewritten in place")
       assert.equal(after[1].status, "completed")
       const reloaded = new SelectionHost({ verifier: () => ({ model: "m", baseURL: "u", apiKeyEnv: "k" }), selectionsFile: ledger })
